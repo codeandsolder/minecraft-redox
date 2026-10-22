@@ -1,6 +1,9 @@
 //! Java source inventory and expression frontend for Minecraft Redox.
 
-use std::{collections::BTreeMap, str::Utf8Error};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    str::Utf8Error,
+};
 
 use anyhow::{Context, Result};
 use minecraft_redox_core::{SourceKind, SourceOrigin};
@@ -169,6 +172,12 @@ pub struct JavaValueResolution {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct JavaTypeDeclaration {
+    pub owner: String,
+    pub direct_supertypes: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct JavaMethod {
     pub owner: String,
     pub name: String,
@@ -236,6 +245,37 @@ struct JavaCallSite<'a> {
     bindings: &'a JavaBindings,
 }
 
+#[derive(Clone, Copy)]
+enum MethodFilter {
+    Any,
+    Static,
+    Instance,
+}
+
+impl MethodFilter {
+    fn matches(self, method: &JavaMethod) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Static => method.is_static,
+            Self::Instance => !method.is_static,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct MethodQuery<'a> {
+    name: &'a str,
+    arity: usize,
+    filter: MethodFilter,
+}
+
+#[derive(Default)]
+struct HierarchyMethodState<'a> {
+    visited: BTreeSet<String>,
+    signatures: BTreeSet<String>,
+    methods: Vec<&'a JavaMethod>,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct JavaProjectIndex {
     methods: Vec<JavaMethod>,
@@ -243,6 +283,7 @@ pub struct JavaProjectIndex {
     methods_by_owner: BTreeMap<String, Vec<usize>>,
     fields: Vec<JavaField>,
     fields_by_owner: BTreeMap<String, Vec<usize>>,
+    supertypes_by_owner: BTreeMap<String, Vec<String>>,
 }
 
 impl JavaProjectIndex {
@@ -266,6 +307,12 @@ impl JavaProjectIndex {
                 .entry(field.owner.clone())
                 .or_default()
                 .push(index);
+        }
+        for declaration in &analysis.types {
+            self.supertypes_by_owner
+                .entry(declaration.owner.clone())
+                .or_default()
+                .extend(declaration.direct_supertypes.iter().cloned());
         }
     }
 
@@ -291,6 +338,12 @@ impl JavaProjectIndex {
             other.fields_by_owner,
             field_offset,
         );
+        for (owner, supertypes) in other.supertypes_by_owner {
+            self.supertypes_by_owner
+                .entry(owner)
+                .or_default()
+                .extend(supertypes);
+        }
         self
     }
 
@@ -317,7 +370,7 @@ impl JavaProjectIndex {
 
     #[must_use]
     pub fn resolve_method(&self, owner: &str, name: &str, arity: usize) -> Option<&JavaMethod> {
-        self.resolve_method_filtered(owner, name, arity, |_| true)
+        self.resolve_method_filtered(owner, name, arity, MethodFilter::Any)
     }
 
     #[must_use]
@@ -327,7 +380,7 @@ impl JavaProjectIndex {
         name: &str,
         arity: usize,
     ) -> Option<&JavaMethod> {
-        self.resolve_method_filtered(owner, name, arity, |method| method.is_static)
+        self.resolve_method_filtered(owner, name, arity, MethodFilter::Static)
     }
 
     #[must_use]
@@ -337,7 +390,7 @@ impl JavaProjectIndex {
         name: &str,
         arity: usize,
     ) -> Option<&JavaMethod> {
-        self.resolve_method_filtered(owner, name, arity, |method| !method.is_static)
+        self.resolve_method_filtered(owner, name, arity, MethodFilter::Instance)
     }
 
     fn resolve_method_filtered(
@@ -345,18 +398,62 @@ impl JavaProjectIndex {
         owner: &str,
         name: &str,
         arity: usize,
-        predicate: impl Fn(&JavaMethod) -> bool,
+        filter: MethodFilter,
     ) -> Option<&JavaMethod> {
+        let query = MethodQuery {
+            name,
+            arity,
+            filter,
+        };
+        let methods = self.methods_in_hierarchy(owner, query);
+        unique_method(methods.into_iter())
+    }
+
+    fn methods_in_hierarchy<'a>(
+        &'a self,
+        owner: &str,
+        query: MethodQuery<'_>,
+    ) -> Vec<&'a JavaMethod> {
         let owner = self.normalize_owner_name(owner, None);
-        unique_method(
-            self.methods_by_owner
-                .get(&owner)?
+        let mut state = HierarchyMethodState::default();
+        self.collect_hierarchy_methods(&owner, query, &mut state);
+        state.methods
+    }
+
+    fn collect_hierarchy_methods<'a>(
+        &'a self,
+        owner: &str,
+        query: MethodQuery<'_>,
+        state: &mut HierarchyMethodState<'a>,
+    ) {
+        if !state.visited.insert(owner.to_owned()) {
+            return;
+        }
+        if let Some(indexes) = self.methods_by_owner.get(owner) {
+            for method in indexes
                 .iter()
                 .map(|index| &self.methods[*index])
                 .filter(|method| {
-                    method.name == name && method.accepts_arity(arity) && predicate(method)
-                }),
-        )
+                    method.name == query.name
+                        && method.accepts_arity(query.arity)
+                        && query.filter.matches(method)
+                })
+            {
+                let signature = method_dispatch_signature(method);
+                if state.signatures.insert(signature) {
+                    state.methods.push(method);
+                }
+            }
+        }
+        if let Some(supertypes) = self.supertypes_by_owner.get(owner) {
+            for supertype in supertypes {
+                let normalized = self.normalize_owner_name(
+                    supertype,
+                    owner.rsplit_once('.').map(|(package, _)| package),
+                );
+                self.collect_hierarchy_methods(&normalized, query, state);
+            }
+        }
     }
 
     fn resolve_local_method_typed(
@@ -381,22 +478,15 @@ impl JavaProjectIndex {
         owner: &str,
         name: &str,
         site: JavaCallSite<'_>,
-        predicate: impl Fn(&JavaMethod) -> bool,
+        filter: MethodFilter,
     ) -> Option<&JavaMethod> {
-        let owner = self.normalize_owner_name(owner, None);
-        let methods = self
-            .methods_by_owner
-            .get(&owner)?
-            .iter()
-            .map(|index| &self.methods[*index]);
-        self.select_typed_method(
-            methods.filter(|method| {
-                method.name == name
-                    && method.accepts_arity(site.arguments.len())
-                    && predicate(method)
-            }),
-            site,
-        )
+        let query = MethodQuery {
+            name,
+            arity: site.arguments.len(),
+            filter,
+        };
+        let methods = self.methods_in_hierarchy(owner, query);
+        self.select_typed_method(methods.into_iter(), site)
     }
 
     fn select_typed_method<'a>(
@@ -572,9 +662,7 @@ impl JavaProjectIndex {
     ) -> Option<&'a JavaMethod> {
         self.resolve_instance_method(owner, method, site.arguments.len())
             .or_else(|| {
-                self.resolve_method_filtered_typed(owner, method, site, |candidate| {
-                    !candidate.is_static
-                })
+                self.resolve_method_filtered_typed(owner, method, site, MethodFilter::Instance)
             })
     }
 
@@ -586,9 +674,7 @@ impl JavaProjectIndex {
     ) -> Option<&'a JavaMethod> {
         self.resolve_static_method(owner, method, site.arguments.len())
             .or_else(|| {
-                self.resolve_method_filtered_typed(owner, method, site, |candidate| {
-                    candidate.is_static
-                })
+                self.resolve_method_filtered_typed(owner, method, site, MethodFilter::Static)
             })
     }
 
@@ -769,18 +855,19 @@ impl JavaProjectIndex {
             && let Some((owner, imported_name)) = import_path.rsplit_once('.')
             && imported_name == method_name
         {
-            return self.resolve_method_filtered_typed(owner, method_name, site, |method| {
-                method.is_static
-            });
+            return self.resolve_method_filtered_typed(
+                owner,
+                method_name,
+                site,
+                MethodFilter::Static,
+            );
         }
         let mut methods = site
             .bindings
             .static_wildcard_imports
             .iter()
             .filter_map(|owner| {
-                self.resolve_method_filtered_typed(owner, method_name, site, |method| {
-                    method.is_static
-                })
+                self.resolve_method_filtered_typed(owner, method_name, site, MethodFilter::Static)
             });
         let method = methods.next()?;
         methods.next().is_none().then_some(method)
@@ -883,7 +970,9 @@ impl JavaProjectIndex {
     }
 
     fn has_owner(&self, owner: &str) -> bool {
-        self.methods_by_owner.contains_key(owner) || self.fields_by_owner.contains_key(owner)
+        self.methods_by_owner.contains_key(owner)
+            || self.fields_by_owner.contains_key(owner)
+            || self.supertypes_by_owner.contains_key(owner)
     }
 
     #[must_use]
@@ -1080,6 +1169,22 @@ fn merge_index_map(
     }
 }
 
+fn method_dispatch_signature(method: &JavaMethod) -> String {
+    let parameters = method
+        .parameters
+        .iter()
+        .map(|parameter| {
+            if parameter.varargs {
+                format!("{}...", parameter.type_name)
+            } else {
+                parameter.type_name.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{}({parameters})", method.name)
+}
+
 fn literal_java_type(value: &str) -> &'static str {
     let value = value.trim();
     if matches!(value, "true" | "false") {
@@ -1155,6 +1260,7 @@ pub struct JavaAnalysis {
     pub inventory: JavaInventory,
     pub methods: Vec<JavaMethod>,
     pub fields: Vec<JavaField>,
+    pub types: Vec<JavaTypeDeclaration>,
     pub call_chains: Vec<JavaCallChain>,
 }
 
@@ -1193,6 +1299,8 @@ pub fn analyze_source(
         &bindings,
         &mut fields,
     );
+    let mut types = Vec::new();
+    collect_type_declarations(tree.root_node(), source, &bindings, &mut types);
     let mut call_chains = Vec::new();
     collect_outer_call_chains(
         tree.root_node(),
@@ -1207,6 +1315,7 @@ pub fn analyze_source(
         inventory,
         methods,
         fields,
+        types,
         call_chains,
     })
 }
@@ -1352,6 +1461,66 @@ fn walk_symbols(
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         walk_symbols(child, source, path, artifact, version, symbols);
+    }
+}
+
+fn collect_type_declarations(
+    node: Node<'_>,
+    source: &str,
+    bindings: &JavaBindings,
+    declarations: &mut Vec<JavaTypeDeclaration>,
+) {
+    if matches!(
+        node.kind(),
+        "class_declaration" | "interface_declaration" | "enum_declaration" | "record_declaration"
+    ) && let Some(owner) = enclosing_type_name(node, source, bindings)
+    {
+        let mut direct_supertypes = Vec::new();
+        if let Some(superclass) = node.child_by_field_name("superclass")
+            && let Some(type_node) = superclass.named_child(0)
+        {
+            direct_supertypes.push(resolve_type_reference(
+                bindings,
+                &node_source(type_node, source),
+            ));
+        }
+        if let Some(interfaces) = node.child_by_field_name("interfaces") {
+            collect_type_list(interfaces, source, bindings, &mut direct_supertypes);
+        }
+        if node.kind() == "interface_declaration" {
+            let mut cursor = node.walk();
+            for child in node
+                .named_children(&mut cursor)
+                .filter(|child| child.kind() == "extends_interfaces")
+            {
+                collect_type_list(child, source, bindings, &mut direct_supertypes);
+            }
+        }
+        declarations.push(JavaTypeDeclaration {
+            owner,
+            direct_supertypes,
+        });
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_type_declarations(child, source, bindings, declarations);
+    }
+}
+
+fn collect_type_list(
+    node: Node<'_>,
+    source: &str,
+    bindings: &JavaBindings,
+    output: &mut Vec<String>,
+) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "type_list" {
+            let mut type_cursor = child.walk();
+            output.extend(child.named_children(&mut type_cursor).map(|type_node| {
+                resolve_type_reference(bindings, &node_source(type_node, source))
+            }));
+        }
     }
 }
 
@@ -1542,7 +1711,7 @@ fn spread_parameter(
 
 fn enclosing_type_name(node: Node<'_>, source: &str, bindings: &JavaBindings) -> Option<String> {
     let mut names = Vec::new();
-    let mut current = node.parent();
+    let mut current = Some(node);
     while let Some(parent) = current {
         if matches!(
             parent.kind(),
@@ -2709,6 +2878,41 @@ mod tests {
     }
 
     #[test]
+    fn resolves_inherited_instance_method() -> anyhow::Result<()> {
+        let source = r"
+            package demo;
+            class ItemStack {}
+            class BaseTool { ItemStack build(int amount) { return null; } }
+            class Tool extends BaseTool {}
+            class Recipe { void run(Tool tool) { sink(tool.build(4)); } }
+        ";
+        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
+        let mut index = super::JavaProjectIndex::default();
+        index.add_analysis(&analysis);
+        let sink = analysis
+            .call_chains
+            .iter()
+            .flat_map(|chain| &chain.calls)
+            .find(|call| call.name == "sink")
+            .ok_or_else(|| anyhow::anyhow!("sink call missing"))?;
+        let expression = sink
+            .argument_expressions
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("sink argument missing"))?;
+        let (resolved, receiver_type) = index
+            .resolve_call_at(
+                "Recipe.java",
+                sink.byte_start,
+                expression,
+                &analysis.bindings,
+            )
+            .ok_or_else(|| anyhow::anyhow!("inherited method was not resolved"))?;
+        assert_eq!(resolved.owner, "demo.BaseTool");
+        assert_eq!(receiver_type.as_deref(), Some("demo.Tool"));
+        Ok(())
+    }
+
+    #[test]
     fn resolves_static_varargs_overload_with_type_evidence() -> anyhow::Result<()> {
         let source = r"
             package demo;
@@ -2819,7 +3023,7 @@ mod tests {
                 expression,
                 &analysis.bindings
             ),
-            Some(String::from("ItemStack"))
+            Some(String::from("demo.ItemStack"))
         );
         Ok(())
     }
