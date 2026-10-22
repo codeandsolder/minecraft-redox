@@ -122,3 +122,22 @@ Ordinary Java value lookup now also checks fields on the enclosing owner after l
 Java array creation and array access are now structural expression IR. GTNH lowering assigns extra meaning only at the `itemInputs` boundary where `GTRecipeBuilder` itself defines the grammar: a two-element `Object[]` is an ore-dictionary alternative key plus amount, while an `ItemStack[]` is an explicit set of alternative stacks. The same array expressions outside recipe-input context remain plain Java arrays.
 
 A pre-pass census found 210 unresolved raw item expressions, of which 137 were `new Object[]` alternative records and 24 were `new ItemStack[]` alternative arrays. After structural array lowering, direct item semantics rise from 14,679 to **14,840**, method links rise from 1,752 to **1,759** (array-access typing exposes a few more receivers), and total item accounting reaches **16,599 / 17,310 (95.9%)**. Fluid and duration accounting are unchanged. The completely unresolved tail falls to **711 expressions**: 405 plain references, 235 calls, 30 still-raw expressions, 19 array accesses, 18 field accesses and 4 parenthesized forms. At this point the dominant missing capability is value/dataflow recovery rather than syntax recognition.
+
+### Parameterized recipe values and parser hygiene
+
+Unresolved bare references are now linked to lexical Java values when the declaration proves an `ItemStack`-typed parameter, local or field. The resulting `LinkedValue` record carries a stable value ID, value kind and declared type; it is counted separately from both concrete item semantics and linked method results. This represents recipe templates such as `registerOre(..., ItemStack aStack)` without pretending `aStack` is a concrete item identity.
+
+The Java frontend also now excludes line/block comments from argument lists and array initializers. Tree-sitter exposes comments as named children, so the earlier generic argument collector had counted 16 comments as item expressions and 2 as fluid expressions. Correcting that bookkeeping changes the GT5 denominators without changing any real recipe semantics.
+
+Latest corrected GT5 measurement:
+
+- item expressions: **17,294 total**
+- direct item semantics: **14,840**
+- unambiguous item method links: **1,759**
+- parameter/local/field item value links: **341**
+- total item accounting: **16,940 / 17,294 (98.0%)**
+- fluid expressions: **6,582 total**; 6,249 direct + 208 method-linked
+- recipe durations: 5,748 total; 5,428 exactly reduced to ticks
+- release two-pass scan: **2.94 s**, ~807% CPU, ~193 MB RSS on Acer
+
+Only **354 item expressions** remain completely unexplained after this pass. The remaining tail is now dominated by calls whose semantics/types require more than owner/name/arity, plus a small number of non-`ItemStack` references, array accesses, field accesses and conditional expressions.

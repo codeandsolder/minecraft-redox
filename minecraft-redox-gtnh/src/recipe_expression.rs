@@ -1,4 +1,6 @@
-use minecraft_redox_java::{JavaBindings, JavaExpression, JavaProjectIndex, substitute_references};
+use minecraft_redox_java::{
+    JavaBindings, JavaExpression, JavaProjectIndex, JavaValueKind, substitute_references,
+};
 use serde::Serialize;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -62,6 +64,12 @@ pub enum ItemSemantic {
         return_type: String,
         receiver_type: Option<String>,
         arguments: Vec<JavaExpression>,
+    },
+    LinkedValue {
+        value_id: String,
+        value_kind: JavaValueKind,
+        name: String,
+        declared_type: String,
     },
     InlinedMethod {
         method_id: String,
@@ -260,18 +268,37 @@ fn project_item_semantic(
     source_path: &str,
     byte_position: usize,
 ) -> Option<ItemSemantic> {
-    let JavaExpression::Call {
-        receiver: _,
-        method: _,
-        arguments,
-    } = expression
-    else {
-        return None;
-    };
+    match expression {
+        JavaExpression::Reference(reference) => {
+            let value =
+                project.resolve_value_at(source_path, byte_position, reference, bindings)?;
+            if !is_item_value_type(&value.type_name) {
+                return None;
+            }
+            Some(ItemSemantic::LinkedValue {
+                value_id: value.value_id,
+                value_kind: value.kind,
+                name: value.name,
+                declared_type: value.type_name,
+            })
+        }
+        JavaExpression::Call { arguments, .. } => {
+            let (resolved, receiver_type) =
+                project.resolve_call_at(source_path, byte_position, expression, bindings)?;
+            linked_method_semantic(resolved, arguments, bindings, receiver_type)
+        }
+        JavaExpression::Parenthesized(inner) => {
+            project_item_semantic(inner, bindings, project, source_path, byte_position)
+        }
+        _ => None,
+    }
+}
 
-    let (resolved, receiver_type) =
-        project.resolve_call_at(source_path, byte_position, expression, bindings)?;
-    linked_method_semantic(resolved, arguments, bindings, receiver_type)
+fn is_item_value_type(type_name: &str) -> bool {
+    type_name
+        .trim()
+        .trim_end_matches("[]")
+        .ends_with("ItemStack")
 }
 
 fn linked_method_semantic(
@@ -634,7 +661,8 @@ fn known_integer_constant(reference: &str) -> Option<i64> {
 mod tests {
     use super::{
         FluidSemantic, ItemSemantic, duration_ticks, parse_integer_literal, recover_fluids,
-        recover_fluids_with_project, recover_item_inputs, recover_items,
+        recover_fluids_with_project, recover_item_inputs, recover_item_inputs_with_project,
+        recover_items,
     };
     use minecraft_redox_java::{JavaExpression, analyze_source};
 
@@ -845,6 +873,50 @@ mod tests {
             recovered[0].semantic,
             Some(ItemSemantic::OreDictStack { .. })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn links_parameterized_item_values_without_calling_them_concrete() -> anyhow::Result<()> {
+        let source = r"
+            import net.minecraft.item.ItemStack;
+            class R {
+                ItemStack member;
+                void run(ItemStack parameter) {
+                    ItemStack local = parameter;
+                    builder.itemInputs(parameter, local, member);
+                }
+            }
+        ";
+        let analysis = analyze_source("R.java", "gt5", None, source)?;
+        let mut project = minecraft_redox_java::JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let inputs = recipe_call(&analysis, "itemInputs")?;
+        let recovered = recover_item_inputs_with_project(
+            &inputs.arguments,
+            &inputs.argument_expressions,
+            &analysis.bindings,
+            &project,
+            "R.java",
+            inputs.byte_start,
+        );
+        let expected = [
+            minecraft_redox_java::JavaValueKind::Parameter,
+            minecraft_redox_java::JavaValueKind::Local,
+            minecraft_redox_java::JavaValueKind::Field,
+        ];
+        for (value, expected_kind) in recovered.iter().zip(expected) {
+            let Some(ItemSemantic::LinkedValue {
+                value_kind,
+                declared_type,
+                ..
+            }) = &value.semantic
+            else {
+                return Err(anyhow::anyhow!("recipe value was not linked"));
+            };
+            assert_eq!(*value_kind, expected_kind);
+            assert_eq!(declared_type, "net.minecraft.item.ItemStack");
+        }
         Ok(())
     }
 

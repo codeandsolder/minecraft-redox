@@ -146,6 +146,23 @@ pub struct JavaField {
     pub origin: SourceOrigin,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JavaValueKind {
+    Local,
+    Parameter,
+    Field,
+    StaticImportedField,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct JavaValueResolution {
+    pub kind: JavaValueKind,
+    pub name: String,
+    pub type_name: String,
+    pub value_id: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct JavaMethod {
     pub owner: String,
@@ -495,14 +512,22 @@ impl JavaProjectIndex {
         bindings: &JavaBindings,
         reference: &str,
     ) -> Option<String> {
+        let field = self.imported_static_field(bindings, reference)?;
+        Some(self.normalize_type_name(
+            &field.type_name,
+            field.owner.rsplit_once('.').map(|(package, _)| package),
+        ))
+    }
+
+    fn imported_static_field<'a>(
+        &'a self,
+        bindings: &JavaBindings,
+        reference: &str,
+    ) -> Option<&'a JavaField> {
         if let Some(path) = bindings.static_imports.get(reference)
             && let Some((owner, field_name)) = path.rsplit_once('.')
         {
-            let field = self.resolve_field(owner, field_name, Some(true))?;
-            return Some(self.normalize_type_name(
-                &field.type_name,
-                field.owner.rsplit_once('.').map(|(package, _)| package),
-            ));
+            return self.resolve_field(owner, field_name, Some(true));
         }
 
         let mut fields = bindings
@@ -513,10 +538,7 @@ impl JavaProjectIndex {
         if fields.next().is_some() {
             return None;
         }
-        Some(self.normalize_type_name(
-            &field.type_name,
-            field.owner.rsplit_once('.').map(|(package, _)| package),
-        ))
+        Some(field)
     }
 
     fn class_owner_for_reference(
@@ -586,6 +608,78 @@ impl JavaProjectIndex {
                     .unwrap_or(usize::MAX)
                     .saturating_sub(method.origin.byte_start.unwrap_or(0))
             })
+    }
+
+    #[must_use]
+    pub fn resolve_value_at(
+        &self,
+        path: &str,
+        byte_position: usize,
+        reference_name: &str,
+        bindings: &JavaBindings,
+    ) -> Option<JavaValueResolution> {
+        let method = self.enclosing_method(path, byte_position)?;
+        if let Some(local) = method
+            .local_variables
+            .iter()
+            .filter(|local| {
+                local.name == reference_name
+                    && local.declaration_byte <= byte_position
+                    && byte_position < local.scope_end_byte
+            })
+            .max_by_key(|local| local.declaration_byte)
+        {
+            return Some(JavaValueResolution {
+                kind: JavaValueKind::Local,
+                name: local.name.clone(),
+                type_name: self.normalize_type_name(
+                    &local.type_name,
+                    method.owner.rsplit_once('.').map(|(package, _)| package),
+                ),
+                value_id: format!(
+                    "{}::local:{}@{}",
+                    method.stable_id(),
+                    local.name,
+                    local.declaration_byte
+                ),
+            });
+        }
+        if let Some(parameter) = method
+            .parameters
+            .iter()
+            .find(|parameter| parameter.name == reference_name)
+        {
+            return Some(JavaValueResolution {
+                kind: JavaValueKind::Parameter,
+                name: parameter.name.clone(),
+                type_name: self.normalize_type_name(
+                    &parameter.type_name,
+                    method.owner.rsplit_once('.').map(|(package, _)| package),
+                ),
+                value_id: format!("{}::param:{}", method.stable_id(), parameter.name),
+            });
+        }
+        if let Some(field) = self.resolve_field(&method.owner, reference_name, None) {
+            return Some(JavaValueResolution {
+                kind: JavaValueKind::Field,
+                name: field.name.clone(),
+                type_name: self.normalize_type_name(
+                    &field.type_name,
+                    field.owner.rsplit_once('.').map(|(package, _)| package),
+                ),
+                value_id: format!("{}::field:{}", field.owner, field.name),
+            });
+        }
+        let field = self.imported_static_field(bindings, reference_name)?;
+        Some(JavaValueResolution {
+            kind: JavaValueKind::StaticImportedField,
+            name: field.name.clone(),
+            type_name: self.normalize_type_name(
+                &field.type_name,
+                field.owner.rsplit_once('.').map(|(package, _)| package),
+            ),
+            value_id: format!("{}::field:{}", field.owner, field.name),
+        })
     }
 
     #[must_use]
@@ -1354,7 +1448,10 @@ fn call_chain_inner(node: Node<'_>, source: &str, calls: &mut Vec<JavaCall>) -> 
 
 fn argument_data(arguments: Node<'_>, source: &str) -> (Vec<String>, Vec<JavaExpression>) {
     let mut cursor = arguments.walk();
-    let nodes: Vec<Node<'_>> = arguments.named_children(&mut cursor).collect();
+    let nodes: Vec<Node<'_>> = arguments
+        .named_children(&mut cursor)
+        .filter(|node| !is_comment_node(*node))
+        .collect();
     let texts = nodes
         .iter()
         .filter_map(|argument| node_text(*argument, source).ok())
@@ -1420,6 +1517,7 @@ fn expression_array_initializer(
         element_type,
         elements: node
             .named_children(&mut cursor)
+            .filter(|child| !is_comment_node(*child))
             .map(|child| expression(child, source))
             .collect(),
     }
@@ -1498,6 +1596,10 @@ fn expression_binary(node: Node<'_>, source: &str) -> JavaExpression {
         operator,
         right: Box::new(expression(right, source)),
     }
+}
+
+fn is_comment_node(node: Node<'_>) -> bool {
+    matches!(node.kind(), "line_comment" | "block_comment")
 }
 
 fn node_source(node: Node<'_>, source: &str) -> String {
@@ -1730,7 +1832,9 @@ mod tests {
             class Recipe {
                 static final ItemStack[] ITEMS = new ItemStack[4];
                 void run() {
-                    sink(new Object[] { "dustIron", 4 });
+                    sink(
+                        // recipe-key comment is not an argument
+                        new Object[] { "dustIron", /* amount */ 4 });
                     sink(new ItemStack[] { ITEMS[0], ITEMS[1] });
                 }
             }
@@ -1743,6 +1847,7 @@ mod tests {
             .filter(|call| call.name == "sink")
             .collect();
         assert_eq!(sink_calls.len(), 2);
+        assert_eq!(sink_calls[0].arguments.len(), 1);
         let Some(super::JavaExpression::Array {
             element_type: Some(element_type),
             elements,
@@ -1777,6 +1882,59 @@ mod tests {
             ),
             Some(String::from("net.minecraft.item.ItemStack"))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_recipe_value_provenance() -> anyhow::Result<()> {
+        let source = r"
+            package demo;
+            import static demo.Registry.IMPORTED;
+            import net.minecraft.item.ItemStack;
+            class Registry { static ItemStack IMPORTED; }
+            class Recipe {
+                ItemStack member;
+                void run(ItemStack parameter) {
+                    ItemStack local = parameter;
+                    sink(parameter);
+                    sink(local);
+                    sink(member);
+                    sink(IMPORTED);
+                }
+            }
+        ";
+        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
+        let mut index = super::JavaProjectIndex::default();
+        index.add_analysis(&analysis);
+        let sink_calls: Vec<_> = analysis
+            .call_chains
+            .iter()
+            .flat_map(|chain| &chain.calls)
+            .filter(|call| call.name == "sink")
+            .collect();
+        let expected = [
+            super::JavaValueKind::Parameter,
+            super::JavaValueKind::Local,
+            super::JavaValueKind::Field,
+            super::JavaValueKind::StaticImportedField,
+        ];
+        for (call, expected_kind) in sink_calls.iter().zip(expected) {
+            let Some(super::JavaExpression::Reference(reference)) =
+                call.argument_expressions.first()
+            else {
+                return Err(anyhow::anyhow!("sink argument was not a reference"));
+            };
+            let value = index
+                .resolve_value_at(
+                    "Recipe.java",
+                    call.byte_start,
+                    reference,
+                    &analysis.bindings,
+                )
+                .ok_or_else(|| anyhow::anyhow!("value was not resolved"))?;
+            assert_eq!(value.kind, expected_kind);
+            assert_eq!(value.type_name, "net.minecraft.item.ItemStack");
+        }
         Ok(())
     }
 
