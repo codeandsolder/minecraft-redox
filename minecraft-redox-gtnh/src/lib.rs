@@ -2,14 +2,17 @@
 
 mod recipe_expression;
 
-pub use recipe_expression::{FluidSemantic, ItemSemantic, NumericSemantic, RecoveredExpression};
+pub use recipe_expression::{
+    ExpressionSemantic, FluidSemantic, ItemSemantic, NumericSemantic, RecoveredExpression,
+};
 
 use minecraft_redox_core::SourceOrigin;
 use minecraft_redox_java::{
     JavaAnalysis, JavaBindings, JavaCall, JavaCallChain, JavaExpression, JavaProjectIndex,
+    generic_type_argument,
 };
 use recipe_expression::{
-    recover_fluids, recover_fluids_with_project, recover_item_inputs,
+    recover_expression, recover_fluids, recover_fluids_with_project, recover_item_inputs,
     recover_item_inputs_with_project, recover_items, recover_items_with_project,
     recover_numeric_expression,
 };
@@ -32,6 +35,18 @@ impl From<&JavaCall> for BuilderCall {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RecipeMetadataDefinition {
+    pub key_source: String,
+    pub key_expression: JavaExpression,
+    pub key_type: Option<String>,
+    pub expected_value_type: Option<String>,
+    pub value_source: String,
+    pub value_expression: JavaExpression,
+    pub value_type: Option<String>,
+    pub value_semantic: ExpressionSemantic,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct RecipeDefinition {
     pub origin: SourceOrigin,
     pub builder_root: String,
@@ -45,7 +60,9 @@ pub struct RecipeDefinition {
     pub fluid_outputs: Vec<String>,
     pub fluid_output_semantics: Vec<RecoveredExpression<FluidSemantic>>,
     pub input_chances: Vec<String>,
+    pub input_chance_semantics: Vec<RecoveredExpression<NumericSemantic>>,
     pub output_chances: Vec<String>,
+    pub output_chance_semantics: Vec<RecoveredExpression<NumericSemantic>>,
     pub duration: Option<String>,
     pub duration_expression: Option<JavaExpression>,
     pub duration_semantic: Option<NumericSemantic>,
@@ -59,7 +76,11 @@ pub struct RecipeDefinition {
     pub special_value_semantic: Option<NumericSemantic>,
     pub special_value_exact: Option<i64>,
     pub special: Option<String>,
+    pub special_expression: Option<JavaExpression>,
+    pub special_semantic: Option<ExpressionSemantic>,
     pub metadata: Vec<BuilderCall>,
+    pub metadata_semantics: Vec<RecipeMetadataDefinition>,
+    pub recipe_categories: Vec<RecoveredExpression<ExpressionSemantic>>,
     pub modifiers: Vec<BuilderCall>,
     pub post_add_calls: Vec<BuilderCall>,
     pub unhandled_calls: Vec<BuilderCall>,
@@ -127,6 +148,27 @@ pub struct GtnhSummary {
     pub recipe_special_value_typed_expressions: usize,
     pub recipe_special_value_structured_expressions: usize,
     pub recipe_special_value_opaque_expressions: usize,
+    pub recipe_metadata_entries: usize,
+    pub recipe_metadata_expected_types: usize,
+    pub recipe_metadata_value_method_links: usize,
+    pub recipe_metadata_value_links: usize,
+    pub recipe_metadata_typed_values: usize,
+    pub recipe_metadata_structured_values: usize,
+    pub recipe_metadata_opaque_values: usize,
+    pub recipe_categories: usize,
+    pub recipe_specials: usize,
+    pub recipe_special_method_links: usize,
+    pub recipe_special_value_links: usize,
+    pub recipe_special_typed_expressions: usize,
+    pub recipe_special_structured_expressions: usize,
+    pub recipe_special_opaque_expressions: usize,
+    pub recipe_chance_expressions: usize,
+    pub recipe_chances_exact: usize,
+    pub recipe_chance_method_links: usize,
+    pub recipe_chance_value_links: usize,
+    pub recipe_chance_typed_expressions: usize,
+    pub recipe_chance_structured_expressions: usize,
+    pub recipe_chance_opaque_expressions: usize,
 }
 
 impl GtnhSummary {
@@ -173,6 +215,27 @@ impl GtnhSummary {
             other.recipe_special_value_structured_expressions;
         self.recipe_special_value_opaque_expressions +=
             other.recipe_special_value_opaque_expressions;
+        self.recipe_metadata_entries += other.recipe_metadata_entries;
+        self.recipe_metadata_expected_types += other.recipe_metadata_expected_types;
+        self.recipe_metadata_value_method_links += other.recipe_metadata_value_method_links;
+        self.recipe_metadata_value_links += other.recipe_metadata_value_links;
+        self.recipe_metadata_typed_values += other.recipe_metadata_typed_values;
+        self.recipe_metadata_structured_values += other.recipe_metadata_structured_values;
+        self.recipe_metadata_opaque_values += other.recipe_metadata_opaque_values;
+        self.recipe_categories += other.recipe_categories;
+        self.recipe_specials += other.recipe_specials;
+        self.recipe_special_method_links += other.recipe_special_method_links;
+        self.recipe_special_value_links += other.recipe_special_value_links;
+        self.recipe_special_typed_expressions += other.recipe_special_typed_expressions;
+        self.recipe_special_structured_expressions += other.recipe_special_structured_expressions;
+        self.recipe_special_opaque_expressions += other.recipe_special_opaque_expressions;
+        self.recipe_chance_expressions += other.recipe_chance_expressions;
+        self.recipe_chances_exact += other.recipe_chances_exact;
+        self.recipe_chance_method_links += other.recipe_chance_method_links;
+        self.recipe_chance_value_links += other.recipe_chance_value_links;
+        self.recipe_chance_typed_expressions += other.recipe_chance_typed_expressions;
+        self.recipe_chance_structured_expressions += other.recipe_chance_structured_expressions;
+        self.recipe_chance_opaque_expressions += other.recipe_chance_opaque_expressions;
         merge_counts(
             &mut self.recipe_unhandled_methods,
             other.recipe_unhandled_methods,
@@ -249,6 +312,9 @@ impl GtnhSummary {
             self.absorb_duration(recipe);
             self.absorb_eut(recipe);
             self.absorb_special_value(recipe);
+            self.absorb_metadata(recipe);
+            self.absorb_special(recipe);
+            self.absorb_chances(recipe);
         }
         for call in recovery
             .recipes
@@ -330,6 +396,77 @@ impl GtnhSummary {
             }
         }
     }
+
+    fn absorb_metadata(&mut self, recipe: &RecipeDefinition) {
+        self.recipe_metadata_entries += recipe.metadata_semantics.len();
+        self.recipe_categories += recipe.recipe_categories.len();
+        for metadata in &recipe.metadata_semantics {
+            self.recipe_metadata_expected_types +=
+                usize::from(metadata.expected_value_type.is_some());
+            match metadata.value_semantic {
+                ExpressionSemantic::LinkedMethod { .. } => {
+                    self.recipe_metadata_value_method_links += 1;
+                }
+                ExpressionSemantic::LinkedValue { .. } => self.recipe_metadata_value_links += 1,
+                ExpressionSemantic::TypedExpression { .. } => {
+                    self.recipe_metadata_typed_values += 1;
+                }
+                ExpressionSemantic::StructuredExpression { .. } => {
+                    self.recipe_metadata_structured_values += 1;
+                }
+                ExpressionSemantic::OpaqueExpression { .. } => {
+                    self.recipe_metadata_opaque_values += 1;
+                }
+            }
+        }
+    }
+
+    fn absorb_special(&mut self, recipe: &RecipeDefinition) {
+        self.recipe_specials += usize::from(recipe.special.is_some());
+        let Some(value) = &recipe.special_semantic else {
+            return;
+        };
+        match value {
+            ExpressionSemantic::LinkedMethod { .. } => self.recipe_special_method_links += 1,
+            ExpressionSemantic::LinkedValue { .. } => self.recipe_special_value_links += 1,
+            ExpressionSemantic::TypedExpression { .. } => {
+                self.recipe_special_typed_expressions += 1;
+            }
+            ExpressionSemantic::StructuredExpression { .. } => {
+                self.recipe_special_structured_expressions += 1;
+            }
+            ExpressionSemantic::OpaqueExpression { .. } => {
+                self.recipe_special_opaque_expressions += 1;
+            }
+        }
+    }
+
+    fn absorb_chances(&mut self, recipe: &RecipeDefinition) {
+        for chance in recipe
+            .input_chance_semantics
+            .iter()
+            .chain(&recipe.output_chance_semantics)
+        {
+            self.recipe_chance_expressions += 1;
+            let Some(value) = &chance.semantic else {
+                continue;
+            };
+            match value {
+                NumericSemantic::ExactValue { .. } => self.recipe_chances_exact += 1,
+                NumericSemantic::LinkedMethod { .. } => self.recipe_chance_method_links += 1,
+                NumericSemantic::LinkedValue { .. } => self.recipe_chance_value_links += 1,
+                NumericSemantic::TypedExpression { .. } => {
+                    self.recipe_chance_typed_expressions += 1;
+                }
+                NumericSemantic::StructuredExpression { .. } => {
+                    self.recipe_chance_structured_expressions += 1;
+                }
+                NumericSemantic::OpaqueExpression { .. } => {
+                    self.recipe_chance_opaque_expressions += 1;
+                }
+            }
+        }
+    }
 }
 
 fn merge_counts(target: &mut BTreeMap<String, usize>, source: BTreeMap<String, usize>) {
@@ -363,17 +500,12 @@ fn recover_internal(analysis: &JavaAnalysis, project: Option<&JavaProjectIndex>)
     }
 }
 
-fn recognize_recipe(
+fn new_recipe_definition(
     chain: &JavaCallChain,
     bindings: &JavaBindings,
-    project: Option<&JavaProjectIndex>,
-) -> Option<RecipeDefinition> {
-    if chain.calls.first()?.name != "stdBuilder" {
-        return None;
-    }
-    let add_to = chain.calls.iter().rfind(|call| call.name == "addTo")?;
-    let recipe_map = bindings.resolve_reference(add_to.arguments.first()?);
-    let mut recipe = RecipeDefinition {
+    recipe_map: String,
+) -> RecipeDefinition {
+    RecipeDefinition {
         origin: chain.origin.clone(),
         builder_root: bindings.resolve_reference(&chain.root),
         recipe_map,
@@ -386,7 +518,9 @@ fn recognize_recipe(
         fluid_outputs: Vec::new(),
         fluid_output_semantics: Vec::new(),
         input_chances: Vec::new(),
+        input_chance_semantics: Vec::new(),
         output_chances: Vec::new(),
+        output_chance_semantics: Vec::new(),
         duration: None,
         duration_expression: None,
         duration_semantic: None,
@@ -400,11 +534,28 @@ fn recognize_recipe(
         special_value_semantic: None,
         special_value_exact: None,
         special: None,
+        special_expression: None,
+        special_semantic: None,
         metadata: Vec::new(),
+        metadata_semantics: Vec::new(),
+        recipe_categories: Vec::new(),
         modifiers: Vec::new(),
         post_add_calls: Vec::new(),
         unhandled_calls: Vec::new(),
-    };
+    }
+}
+
+fn recognize_recipe(
+    chain: &JavaCallChain,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+) -> Option<RecipeDefinition> {
+    if chain.calls.first()?.name != "stdBuilder" {
+        return None;
+    }
+    let add_to = chain.calls.iter().rfind(|call| call.name == "addTo")?;
+    let recipe_map = bindings.resolve_reference(add_to.arguments.first()?);
+    let mut recipe = new_recipe_definition(chain, bindings, recipe_map);
 
     let mut after_add = false;
     for call in chain.calls.iter().skip(1) {
@@ -448,21 +599,48 @@ fn recognize_recipe(
                 project,
                 &chain.origin.path,
             ),
-            "inputChances" => recipe.input_chances.extend(call.arguments.clone()),
-            "outputChances" => recipe.output_chances.extend(call.arguments.clone()),
+            "inputChances" | "outputChances" => {
+                add_recipe_chance_call(&mut recipe, call, bindings, project, &chain.origin.path);
+            }
             "duration" => set_duration(&mut recipe, call, bindings, project, &chain.origin.path),
             "eut" => set_eut(&mut recipe, call, bindings, project, &chain.origin.path),
             "specialValue" => {
                 set_special_value(&mut recipe, call, bindings, project, &chain.origin.path);
             }
-            "special" => recipe.special = one_argument(call),
-            "metadata" | "recipeCategory" => recipe.metadata.push(call.into()),
+            "special" => set_special(&mut recipe, call, bindings, project, &chain.origin.path),
+            "metadata" | "recipeCategory" => {
+                add_recipe_metadata_call(&mut recipe, call, bindings, project, &chain.origin.path);
+            }
             name if is_recipe_modifier(name) => recipe.modifiers.push(call.into()),
             "addTo" => after_add = true,
             _ => recipe.unhandled_calls.push(call.into()),
         }
     }
     Some(recipe)
+}
+
+fn set_special(
+    recipe: &mut RecipeDefinition,
+    call: &JavaCall,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+    source_path: &str,
+) {
+    let (Some(source), Some(expression)) = (one_argument(call), one_expression(call).cloned())
+    else {
+        return;
+    };
+    let semantic = recover_expression(
+        &source,
+        &expression,
+        bindings,
+        project,
+        source_path,
+        call.byte_start,
+    );
+    recipe.special = Some(source);
+    recipe.special_expression = Some(expression);
+    recipe.special_semantic = Some(semantic);
 }
 
 struct NumericCallRecovery {
@@ -498,6 +676,98 @@ fn recover_numeric_call(
         semantic,
         exact_value,
     })
+}
+
+fn add_recipe_metadata_call(
+    recipe: &mut RecipeDefinition,
+    call: &JavaCall,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+    source_path: &str,
+) {
+    match call.name.as_str() {
+        "metadata" => add_recipe_metadata(recipe, call, bindings, project, source_path),
+        "recipeCategory" => add_recipe_category(recipe, call, bindings, project, source_path),
+        _ => unreachable!("metadata dispatcher received unexpected builder call"),
+    }
+}
+
+fn add_recipe_metadata(
+    recipe: &mut RecipeDefinition,
+    call: &JavaCall,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+    source_path: &str,
+) {
+    recipe.metadata.push(call.into());
+    let (Some(key_source), Some(value_source), Some(key_expression), Some(value_expression)) = (
+        call.arguments.first(),
+        call.arguments.get(1),
+        call.argument_expressions.first(),
+        call.argument_expressions.get(1),
+    ) else {
+        return;
+    };
+    let key_type = project.and_then(|project| {
+        project.expression_type_at(source_path, call.byte_start, key_expression, bindings)
+    });
+    let expected_value_type = key_type.as_deref().and_then(|type_name| {
+        generic_type_argument(type_name, 0)
+            .map(str::to_owned)
+            .or_else(|| {
+                project.and_then(|project| {
+                    project.generic_supertype_argument(type_name, "RecipeMetadataKey", 0)
+                })
+            })
+    });
+    let value_type = project.and_then(|project| {
+        project.expression_type_at(source_path, call.byte_start, value_expression, bindings)
+    });
+    let value_semantic = recover_expression(
+        value_source,
+        value_expression,
+        bindings,
+        project,
+        source_path,
+        call.byte_start,
+    );
+    recipe.metadata_semantics.push(RecipeMetadataDefinition {
+        key_source: key_source.clone(),
+        key_expression: key_expression.clone(),
+        key_type,
+        expected_value_type,
+        value_source: value_source.clone(),
+        value_expression: value_expression.clone(),
+        value_type,
+        value_semantic,
+    });
+}
+
+fn add_recipe_category(
+    recipe: &mut RecipeDefinition,
+    call: &JavaCall,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+    source_path: &str,
+) {
+    recipe.metadata.push(call.into());
+    let (Some(source), Some(expression)) =
+        (call.arguments.first(), call.argument_expressions.first())
+    else {
+        return;
+    };
+    recipe.recipe_categories.push(RecoveredExpression {
+        source: source.clone(),
+        expression: expression.clone(),
+        semantic: Some(recover_expression(
+            source,
+            expression,
+            bindings,
+            project,
+            source_path,
+            call.byte_start,
+        )),
+    });
 }
 
 fn add_unsafe_recipe_inputs(
@@ -612,6 +882,85 @@ fn recognize_material(chain: &JavaCallChain) -> Option<MaterialDefinition> {
     Some(material)
 }
 
+struct ChanceTarget<'a> {
+    raw: &'a mut Vec<String>,
+    semantics: &'a mut Vec<RecoveredExpression<NumericSemantic>>,
+}
+
+#[derive(Clone, Copy)]
+struct RecoverySite<'a> {
+    source_path: &'a str,
+    byte_position: usize,
+}
+
+fn add_recipe_chance_call(
+    recipe: &mut RecipeDefinition,
+    call: &JavaCall,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+    source_path: &str,
+) {
+    let target = if call.name == "inputChances" {
+        ChanceTarget {
+            raw: &mut recipe.input_chances,
+            semantics: &mut recipe.input_chance_semantics,
+        }
+    } else {
+        ChanceTarget {
+            raw: &mut recipe.output_chances,
+            semantics: &mut recipe.output_chance_semantics,
+        }
+    };
+    add_chances(target, call, bindings, project, source_path);
+}
+
+fn add_chances(
+    mut target: ChanceTarget<'_>,
+    call: &JavaCall,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+    source_path: &str,
+) {
+    let site = RecoverySite {
+        source_path,
+        byte_position: call.byte_start,
+    };
+    for (source, expression) in call.arguments.iter().zip(&call.argument_expressions) {
+        add_chance_value(
+            &mut target,
+            source.clone(),
+            expression.clone(),
+            bindings,
+            project,
+            site,
+        );
+    }
+}
+
+fn add_chance_value(
+    target: &mut ChanceTarget<'_>,
+    source: String,
+    expression: JavaExpression,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+    site: RecoverySite<'_>,
+) {
+    let semantic = recover_numeric_expression(
+        &source,
+        &expression,
+        bindings,
+        project,
+        site.source_path,
+        site.byte_position,
+    );
+    target.raw.push(source.clone());
+    target.semantics.push(RecoveredExpression {
+        source,
+        expression,
+        semantic: Some(semantic),
+    });
+}
+
 fn add_recipe_items(
     recipe: &mut RecipeDefinition,
     call: &JavaCall,
@@ -625,14 +974,31 @@ fn add_recipe_items(
         is_item_chance_overload(call, bindings, project, source_path, input_context)
     });
     if chance_overload {
-        let chance = item_call.arguments.pop();
-        item_call.argument_expressions.pop();
-        if let Some(chance) = chance {
-            if input_context {
-                recipe.input_chances.push(chance);
+        let chance_source = item_call.arguments.pop();
+        let chance_expression = item_call.argument_expressions.pop();
+        if let (Some(source), Some(expression)) = (chance_source, chance_expression) {
+            let mut target = if input_context {
+                ChanceTarget {
+                    raw: &mut recipe.input_chances,
+                    semantics: &mut recipe.input_chance_semantics,
+                }
             } else {
-                recipe.output_chances.push(chance);
-            }
+                ChanceTarget {
+                    raw: &mut recipe.output_chances,
+                    semantics: &mut recipe.output_chance_semantics,
+                }
+            };
+            add_chance_value(
+                &mut target,
+                source,
+                expression,
+                bindings,
+                project,
+                RecoverySite {
+                    source_path,
+                    byte_position: call.byte_start,
+                },
+            );
         }
     }
     if input_context {
@@ -836,7 +1202,7 @@ fn is_known_material_property(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{recover, recover_with_project};
+    use super::{NumericSemantic, recover, recover_with_project};
     use minecraft_redox_java::{JavaProjectIndex, analyze_source};
 
     #[test]
@@ -888,6 +1254,47 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
         assert_eq!(recipe.item_output_semantics.len(), 1);
         assert_eq!(recipe.output_chances, vec![String::from("chances")]);
+        assert_eq!(recipe.output_chance_semantics.len(), 1);
+        assert!(matches!(
+            recipe.output_chance_semantics[0].semantic,
+            Some(NumericSemantic::LinkedValue { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn recovers_typed_recipe_metadata() -> anyhow::Result<()> {
+        let source = r"
+            import net.minecraft.item.ItemStack;
+            class RecipeMetadataKey<T> {}
+            class R {
+                static RecipeMetadataKey<ItemStack> RESEARCH = new RecipeMetadataKey<>();
+                void run(ItemStack item) {
+                    GTValues.RA.stdBuilder()
+                        .metadata(RESEARCH, item)
+                        .duration(1)
+                        .eut(1)
+                        .addTo(assemblerRecipes);
+                }
+            }
+        ";
+        let analysis = analyze_source("R.java", "gt5", None, source)?;
+        let mut project = JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let recovery = super::recover_with_project(&analysis, &project);
+        let metadata = recovery
+            .recipes
+            .first()
+            .and_then(|recipe| recipe.metadata_semantics.first())
+            .ok_or_else(|| anyhow::anyhow!("metadata was not recovered"))?;
+        assert_eq!(
+            metadata.expected_value_type.as_deref(),
+            Some("net.minecraft.item.ItemStack")
+        );
+        assert!(matches!(
+            metadata.value_semantic,
+            super::ExpressionSemantic::LinkedValue { .. }
+        ));
         Ok(())
     }
 
