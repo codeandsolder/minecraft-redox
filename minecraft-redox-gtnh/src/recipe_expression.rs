@@ -28,6 +28,11 @@ pub enum ItemSemantic {
         accessor: String,
         arguments: Vec<JavaExpression>,
     },
+    DynamicItemList {
+        receiver: JavaExpression,
+        accessor: String,
+        arguments: Vec<JavaExpression>,
+    },
     MaterialItem {
         material: String,
         accessor: String,
@@ -348,6 +353,15 @@ fn project_item_semantic(
             })
         }
         JavaExpression::Call { arguments, .. } => {
+            if let Some(semantic) = project_dynamic_item_list_semantic(
+                expression,
+                project,
+                source_path,
+                byte_position,
+                bindings,
+            ) {
+                return Some(semantic);
+            }
             if let Some(semantic) = project_copy_item_semantic(
                 expression,
                 bindings,
@@ -371,6 +385,36 @@ fn project_item_semantic(
         }
         _ => typed_item_expression(expression, bindings, project, source_path, byte_position),
     }
+}
+
+fn project_dynamic_item_list_semantic(
+    expression: &JavaExpression,
+    project: &JavaProjectIndex,
+    source_path: &str,
+    byte_position: usize,
+    bindings: &JavaBindings,
+) -> Option<ItemSemantic> {
+    let JavaExpression::Call {
+        receiver: Some(receiver),
+        method,
+        arguments,
+    } = expression
+    else {
+        return None;
+    };
+    if !is_item_list_accessor(method) {
+        return None;
+    }
+    let receiver_type =
+        project.expression_type_at(source_path, byte_position, receiver, bindings)?;
+    if !receiver_type.trim().ends_with("ItemList") {
+        return None;
+    }
+    Some(ItemSemantic::DynamicItemList {
+        receiver: receiver.as_ref().clone(),
+        accessor: method.clone(),
+        arguments: arguments.clone(),
+    })
 }
 
 fn project_copy_item_semantic(
@@ -957,6 +1001,46 @@ mod tests {
         };
         assert_eq!(receiver_type.as_deref(), Some("Widget"));
         assert_eq!(method_id, "Widget#get(int)");
+        Ok(())
+    }
+
+    #[test]
+    fn recognizes_dynamic_item_list_accessor() -> anyhow::Result<()> {
+        let source = r"
+            import gregtech.api.enums.ItemList;
+            class ComponentType {
+                ItemList getComponent(int tier) { return null; }
+            }
+            class R {
+                void run(ComponentType component, int tier) {
+                    builder.itemInputs(component.getComponent(tier).get(8));
+                }
+            }
+        ";
+        let analysis = analyze_source("R.java", "gt5", None, source)?;
+        let mut project = minecraft_redox_java::JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let items = recipe_call(&analysis, "itemInputs")?;
+        let recovered = super::recover_items_with_project(
+            &items.arguments,
+            &items.argument_expressions,
+            &analysis.bindings,
+            &project,
+            "R.java",
+            items.byte_start,
+        );
+        let Some(ItemSemantic::DynamicItemList {
+            accessor,
+            arguments,
+            ..
+        }) = &recovered[0].semantic
+        else {
+            return Err(anyhow::anyhow!(
+                "dynamic ItemList accessor was not recovered"
+            ));
+        };
+        assert_eq!(accessor, "get");
+        assert_eq!(arguments.len(), 1);
         Ok(())
     }
 
