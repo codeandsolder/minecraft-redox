@@ -1,13 +1,17 @@
 use minecraft_redox_core::{
     SourceOrigin,
-    content::{ContentId, ContentRecipe, ItemInputSpec, ItemSelector, ItemStackSpec},
+    content::{
+        ContentId, ContentRecipe, FluidSelector, FluidStackSpec, ItemInputSpec, ItemSelector,
+        ItemStackSpec,
+    },
 };
-use minecraft_redox_java::{JavaBindings, JavaExpression};
+use minecraft_redox_java::{JavaBindings, JavaExpression, JavaProjectIndex};
 use serde::Serialize;
 
 use crate::{
-    ItemSemantic, RecipeDefinition, RecoveredExpression,
+    FluidSemantic, ItemSemantic, RecipeDefinition, RecoveredExpression,
     recipe_expression::{literal_i64, resolved_reference_name},
+    scalar_expression::scalar_i64,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -69,6 +73,22 @@ pub fn lower_recipe(
     recipe: &RecipeDefinition,
     bindings: &JavaBindings,
 ) -> Result<ContentRecipe, Box<RecipeLoweringFailure>> {
+    lower_recipe_internal(recipe, bindings, None)
+}
+
+pub(crate) fn lower_recipe_with_project(
+    recipe: &RecipeDefinition,
+    bindings: &JavaBindings,
+    project: &JavaProjectIndex,
+) -> Result<ContentRecipe, Box<RecipeLoweringFailure>> {
+    lower_recipe_internal(recipe, bindings, Some(project))
+}
+
+fn lower_recipe_internal(
+    recipe: &RecipeDefinition,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+) -> Result<ContentRecipe, Box<RecipeLoweringFailure>> {
     let mut blockers = structural_blockers(recipe);
 
     let duration_ticks = match recipe.duration_ticks {
@@ -119,6 +139,20 @@ pub fn lower_recipe(
 
     let item_inputs = lower_inputs(recipe, bindings, &mut blockers);
     let item_outputs = lower_outputs(recipe, bindings, &mut blockers);
+    let fluid_inputs = lower_fluids(
+        &recipe.fluid_input_semantics,
+        bindings,
+        project,
+        "input",
+        &mut blockers,
+    );
+    let fluid_outputs = lower_fluids(
+        &recipe.fluid_output_semantics,
+        bindings,
+        project,
+        "output",
+        &mut blockers,
+    );
 
     if blockers.is_empty()
         && let (Some(duration_ticks), Some(eut)) = (duration_ticks, eut)
@@ -128,6 +162,8 @@ pub fn lower_recipe(
             recipe_map: ContentId::new(recipe.recipe_map.clone()),
             item_inputs,
             item_outputs,
+            fluid_inputs,
+            fluid_outputs,
             duration_ticks,
             eut,
         });
@@ -141,13 +177,6 @@ pub fn lower_recipe(
 
 fn structural_blockers(recipe: &RecipeDefinition) -> Vec<RecipeLoweringBlocker> {
     let mut blockers = Vec::new();
-    if !recipe.fluid_inputs.is_empty() || !recipe.fluid_outputs.is_empty() {
-        push_blocker(
-            &mut blockers,
-            RecipeLoweringBlockerKind::Fluids,
-            "fluid inputs/outputs are not in target recipe IR v1",
-        );
-    }
     if !recipe.input_chances.is_empty() || !recipe.output_chances.is_empty() {
         push_blocker(
             &mut blockers,
@@ -303,6 +332,94 @@ fn lower_item_semantic(semantic: &ItemSemantic, bindings: &JavaBindings) -> Opti
     }
 }
 
+fn lower_fluids(
+    recovered: &[RecoveredExpression<FluidSemantic>],
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+    direction: &str,
+    blockers: &mut Vec<RecipeLoweringBlocker>,
+) -> Vec<FluidStackSpec> {
+    recovered
+        .iter()
+        .enumerate()
+        .filter_map(|(index, recovered)| {
+            recovered
+                .semantic
+                .as_ref()
+                .and_then(|semantic| lower_fluid_semantic(semantic, bindings, project))
+                .or_else(|| {
+                    push_blocker(
+                        blockers,
+                        RecipeLoweringBlockerKind::Fluids,
+                        format!("fluid {direction} {index}: {}", recovered.source),
+                    );
+                    None
+                })
+        })
+        .collect()
+}
+
+fn lower_fluid_semantic(
+    semantic: &FluidSemantic,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+) -> Option<FluidStackSpec> {
+    match semantic {
+        FluidSemantic::FluidAccessor {
+            source_ref,
+            accessor,
+            amount,
+        } => Some(FluidStackSpec {
+            selector: FluidSelector::MaterialForm {
+                material: ContentId::new(source_ref.clone()),
+                form: ContentId::new(fluid_form(accessor)?),
+            },
+            amount: scalar_amount_u64(amount, bindings, project)?,
+        }),
+        FluidSemantic::FluidStack { fluid, amount } => Some(FluidStackSpec {
+            selector: FluidSelector::Named {
+                id: ContentId::new(resolved_reference_name(fluid, bindings)?),
+            },
+            amount: scalar_amount_u64(amount, bindings, project)?,
+        }),
+        FluidSemantic::RegistryFluid {
+            provider,
+            arguments,
+        } if provider.ends_with("FluidRegistry.getFluidStack") && arguments.len() >= 2 => {
+            Some(FluidStackSpec {
+                selector: FluidSelector::Named {
+                    id: ContentId::new(simple_string_literal(arguments.first()?)?),
+                },
+                amount: scalar_amount_u64(arguments.get(1)?, bindings, project)?,
+            })
+        }
+        FluidSemantic::RegistryFluid { .. } | FluidSemantic::LinkedMethod { .. } => None,
+    }
+}
+
+fn fluid_form(accessor: &str) -> Option<&'static str> {
+    match accessor {
+        "getFluid" | "getFluidStack" => Some("fluid"),
+        "getMolten" => Some("molten"),
+        "getGas" => Some("gas"),
+        "getFluidOrGas" => Some("fluid_or_gas"),
+        "getPlasma" => Some("plasma"),
+        _ => None,
+    }
+}
+
+fn scalar_amount_u64(
+    expression: &JavaExpression,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+) -> Option<u64> {
+    let value = project.map_or_else(
+        || literal_i64(expression),
+        |project| scalar_i64(expression, bindings, project),
+    )?;
+    u64::try_from(value).ok()
+}
+
 fn amount_u64(expression: &JavaExpression) -> Option<u64> {
     u64::try_from(literal_i64(expression)?).ok()
 }
@@ -328,10 +445,10 @@ fn push_blocker(
 
 #[cfg(test)]
 mod tests {
-    use minecraft_redox_core::content::{ItemInputSpec, ItemSelector};
-    use minecraft_redox_java::analyze_source;
+    use minecraft_redox_core::content::{FluidSelector, ItemInputSpec, ItemSelector};
+    use minecraft_redox_java::{JavaProjectIndex, analyze_source};
 
-    use super::{RecipeLoweringBlockerKind, lower_recipe};
+    use super::lower_recipe;
     use crate::recover;
 
     #[test]
@@ -391,33 +508,56 @@ mod tests {
     }
 
     #[test]
-    fn refuses_to_drop_fluid_semantics() -> anyhow::Result<()> {
-        let source = r"
+    fn lowers_material_and_registry_fluids_with_project_amounts() -> anyhow::Result<()> {
+        let constants = analyze_source(
+            "GTRecipeBuilder.java",
+            "gt5",
+            None,
+            r"
+                package gregtech.api.util;
+                class GTRecipeBuilder { static final int INGOTS = 144; }
+            ",
+        )?;
+        let source = r#"
             import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
-            import static gregtech.api.util.GTRecipeBuilder.SECONDS;
+            import static gregtech.api.util.GTRecipeBuilder.INGOTS;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            import net.minecraftforge.fluids.FluidRegistry;
             class Recipes { void run() {
                 GTValues.RA.stdBuilder()
-                    .fluidInputs(Materials.Water.getFluid(1000))
-                    .duration(5 * SECONDS)
+                    .fluidInputs(Materials.Iron.getMolten(2 * INGOTS))
+                    .fluidOutputs(FluidRegistry.getFluidStack("steam", 1_000))
+                    .duration(20)
                     .eut(2)
                     .addTo(compressorRecipes);
             }}
-        ";
+        "#;
         let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
-        let recovery = recover(&analysis);
+        let mut project = JavaProjectIndex::default();
+        project.add_analysis(&constants);
+        project.add_analysis(&analysis);
+        let recovery = crate::recover_with_project(&analysis, &project);
         let recipe = recovery
             .recipes
             .first()
             .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
-        let Err(failure) = lower_recipe(recipe, &analysis.bindings) else {
-            return Err(anyhow::anyhow!("fluid recipe unexpectedly lowered"));
-        };
-        assert!(
-            failure
-                .blockers
-                .iter()
-                .any(|blocker| blocker.kind == RecipeLoweringBlockerKind::Fluids)
-        );
+        let lowered = super::lower_recipe_with_project(recipe, &analysis.bindings, &project)
+            .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
+        assert_eq!(lowered.fluid_inputs.len(), 1);
+        assert_eq!(lowered.fluid_inputs[0].amount, 288);
+        assert!(matches!(
+            &lowered.fluid_inputs[0].selector,
+            FluidSelector::MaterialForm { material, form }
+                if material.as_str() == "gregtech.api.enums.Materials.Iron"
+                    && form.as_str() == "molten"
+        ));
+        assert_eq!(lowered.fluid_outputs.len(), 1);
+        assert_eq!(lowered.fluid_outputs[0].amount, 1_000);
+        assert!(matches!(
+            &lowered.fluid_outputs[0].selector,
+            FluidSelector::Named { id } if id.as_str() == "steam"
+        ));
         Ok(())
     }
 }

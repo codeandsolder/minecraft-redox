@@ -147,6 +147,56 @@ impl GtnhSummary {
     }
 
     pub fn absorb(&mut self, analysis: &JavaAnalysis, recovery: &GtnhRecovery) {
+        self.absorb_internal(analysis, recovery, None);
+    }
+
+    pub fn absorb_with_project(
+        &mut self,
+        analysis: &JavaAnalysis,
+        recovery: &GtnhRecovery,
+        project: &JavaProjectIndex,
+    ) {
+        self.absorb_internal(analysis, recovery, Some(project));
+    }
+
+    fn absorb_recipe_lowering(
+        &mut self,
+        analysis: &JavaAnalysis,
+        recovery: &GtnhRecovery,
+        project: Option<&JavaProjectIndex>,
+    ) {
+        for recipe in &recovery.recipes {
+            let lowered = project.map_or_else(
+                || target_recipe::lower_recipe(recipe, &analysis.bindings),
+                |project| {
+                    target_recipe::lower_recipe_with_project(recipe, &analysis.bindings, project)
+                },
+            );
+            match lowered {
+                Ok(_) => self.recipes_lowered += 1,
+                Err(failure) => {
+                    let kinds: BTreeSet<_> = failure
+                        .blockers
+                        .iter()
+                        .map(|blocker| blocker.kind)
+                        .collect();
+                    for kind in kinds {
+                        *self
+                            .recipe_lowering_blockers
+                            .entry(kind.as_str().to_owned())
+                            .or_default() += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    fn absorb_internal(
+        &mut self,
+        analysis: &JavaAnalysis,
+        recovery: &GtnhRecovery,
+        project: Option<&JavaProjectIndex>,
+    ) {
         self.files += 1;
         self.parse_error_files += usize::from(analysis.inventory.has_parse_errors);
         if analysis.inventory.has_parse_errors {
@@ -165,24 +215,7 @@ impl GtnhSummary {
             .iter()
             .filter(|material| material.unhandled_calls.is_empty())
             .count();
-        for recipe in &recovery.recipes {
-            match target_recipe::lower_recipe(recipe, &analysis.bindings) {
-                Ok(_) => self.recipes_lowered += 1,
-                Err(failure) => {
-                    let kinds: BTreeSet<_> = failure
-                        .blockers
-                        .iter()
-                        .map(|blocker| blocker.kind)
-                        .collect();
-                    for kind in kinds {
-                        *self
-                            .recipe_lowering_blockers
-                            .entry(kind.as_str().to_owned())
-                            .or_default() += 1;
-                    }
-                }
-            }
-        }
+        self.absorb_recipe_lowering(analysis, recovery, project);
         for recipe in &recovery.recipes {
             self.recipe_item_expressions +=
                 recipe.item_input_semantics.len() + recipe.item_output_semantics.len();

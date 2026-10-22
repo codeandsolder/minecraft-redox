@@ -215,3 +215,28 @@ Full GT5 result after this pass:
 - the stricter recipe count rises by 226 because many recipes whose EU/t is now known still have independent blockers.
 
 The dominant target-v1 blocker is now fluids at 3,558 recipes, followed by item inputs (2,992), modifiers (2,496), item outputs (2,379), and metadata (1,156). This makes explicit fluid content IR the next high-leverage target feature; chasing the remaining 417 dynamic/non-constant EU/t cases is lower value.
+
+### Fluid target IR
+
+Target content now includes source-independent `FluidSelector` and `FluidStackSpec` types plus fluid inputs/outputs on `ContentRecipe`. The core model has no Forge `FluidStack`, registry object, or Java accessor representation: fluids are either named logical IDs or material+fluid-form selectors.
+
+The GTNH adapter lowers the dominant direct fluid families:
+
+- material accessors such as `getFluid`, `getMolten`, `getGas`, `getFluidOrGas`, `getFluidStack`, and `getPlasma` to semantic forms (`fluid`, `molten`, `gas`, `fluid_or_gas`, `plasma`);
+- direct `new FluidStack(...)` when the fluid identity is statically nameable;
+- `FluidRegistry.getFluidStack("name", amount)` to named fluid content;
+- fluid amounts through the same source-backed scalar evaluator, so expressions such as `2 * INGOTS` derive `288` from `GTRecipeBuilder.INGOTS` instead of hard-coded units.
+
+Fluid lowering is still fail-closed: unresolved fluid expressions and linked methods remain explicit `fluids` blockers. The recovery pass also now recognizes explicit `FluidRegistry.getFluidStack(...)` receiver calls, fixing a previously unresolved family, and lowerers report a blocker rather than silently dropping a fluid whose semantic recovery is absent.
+
+Scalar field evaluation was tightened at the same time: Java fields now record `final`, and project constant evaluation follows only `static final` fields (enum constants remain intrinsically fixed). This removes the possibility of folding a mutable static from its initializer.
+
+Full GT5 result:
+
+- direct fluid semantics: **6,291 / 6,582**, up from 6,249 after explicit registry-call recovery;
+- linked fluid methods: 208;
+- recipes blocked by fluids: **460**, down from 3,558;
+- target recipes lowered: **886 / 5,791 (15.30%)**, up from 387 / 5,791 (6.68%);
+- debug full-corpus scan after the change: **16.03 s**, ~594% CPU, ~246 MiB RSS on Acer.
+
+The dominant remaining target-content blockers are now item inputs (2,992 recipes), modifiers (2,496), item outputs (2,379), and metadata (1,156). The largest directly understood item family not yet represented in target lowering is material-item access (`MaterialItem`), so item selector normalization is the next content milestone.

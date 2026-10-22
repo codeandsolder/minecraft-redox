@@ -133,18 +133,23 @@ fn resolve_static_field<'a>(
     if !reference.contains('.')
         && let Some(owner) = current_owner
         && let Some(field) = project.resolve_field(owner, reference, Some(true))
+        && field.is_final
     {
         return Some(field);
     }
 
     let (owner, field_name) = reference.rsplit_once('.')?;
     let resolved_owner = bindings.resolve_reference(owner);
-    if let Some(field) = project.resolve_field(&resolved_owner, field_name, Some(true)) {
+    if let Some(field) = project.resolve_field(&resolved_owner, field_name, Some(true))
+        && field.is_final
+    {
         return Some(field);
     }
     if let Some(package) = bindings.package.as_deref() {
         let owner = format!("{package}.{resolved_owner}");
-        if let Some(field) = project.resolve_field(&owner, field_name, Some(true)) {
+        if let Some(field) = project.resolve_field(&owner, field_name, Some(true))
+            && field.is_final
+        {
             return Some(field);
         }
     }

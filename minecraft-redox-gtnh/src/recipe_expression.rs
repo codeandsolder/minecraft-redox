@@ -563,6 +563,20 @@ fn fluid_semantic(expression: &JavaExpression, bindings: &JavaBindings) -> Optio
             receiver: Some(receiver),
             method,
             arguments,
+        } if matches!(method.as_str(), "getFluidStack" | "getFluidStackFromName")
+            && arguments.len() >= 2
+            && reference_name(receiver, bindings)?.ends_with("FluidRegistry") =>
+        {
+            let provider = format!("{}.{}", reference_name(receiver, bindings)?, method);
+            Some(FluidSemantic::RegistryFluid {
+                provider,
+                arguments: arguments.clone(),
+            })
+        }
+        JavaExpression::Call {
+            receiver: Some(receiver),
+            method,
+            arguments,
         } if is_fluid_accessor(method) && arguments.len() == 1 => {
             let material = reference_name(receiver, bindings)?;
             Some(FluidSemantic::FluidAccessor {

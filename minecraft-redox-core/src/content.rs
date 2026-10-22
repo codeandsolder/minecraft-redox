@@ -40,6 +40,26 @@ pub enum ItemSelector {
     },
 }
 
+/// A target-level fluid identity independent of Forge registry objects.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FluidSelector {
+    Named {
+        id: ContentId,
+    },
+    MaterialForm {
+        material: ContentId,
+        form: ContentId,
+    },
+}
+
+/// One concrete fluid stack in normalized content.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FluidStackSpec {
+    pub selector: FluidSelector,
+    pub amount: u64,
+}
+
 /// One concrete item stack in normalized content.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ItemStackSpec {
@@ -66,6 +86,8 @@ pub struct ContentRecipe {
     pub recipe_map: ContentId,
     pub item_inputs: Vec<ItemInputSpec>,
     pub item_outputs: Vec<ItemStackSpec>,
+    pub fluid_inputs: Vec<FluidStackSpec>,
+    pub fluid_outputs: Vec<FluidStackSpec>,
     pub duration_ticks: u64,
     pub eut: i64,
 }

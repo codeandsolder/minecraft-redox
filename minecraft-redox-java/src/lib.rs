@@ -147,6 +147,7 @@ pub struct JavaField {
     pub name: String,
     pub type_name: String,
     pub is_static: bool,
+    pub is_final: bool,
     pub initializer: Option<JavaExpression>,
     pub initializer_source: Option<String>,
     pub origin: SourceOrigin,
@@ -1082,6 +1083,7 @@ fn collect_fields(
                 name: name.to_owned(),
                 type_name: owner,
                 is_static: true,
+                is_final: true,
                 initializer: None,
                 initializer_source: None,
                 origin: origin_for(node, Some(name), path, artifact, version),
@@ -1096,6 +1098,7 @@ fn collect_fields(
         {
             let type_name = resolve_type_reference(bindings, type_name.trim());
             let is_static = declaration_is_static(node, source);
+            let is_final = declaration_is_final(node, source);
             let mut cursor = node.walk();
             for declarator in node
                 .named_children(&mut cursor)
@@ -1110,6 +1113,7 @@ fn collect_fields(
                         name: name.to_owned(),
                         type_name: type_name.clone(),
                         is_static,
+                        is_final,
                         initializer: value.map(|value| expression(value, source)),
                         initializer_source: value.map(|value| node_source(value, source)),
                         origin: origin_for(declarator, Some(name), path, artifact, version),
@@ -1288,11 +1292,19 @@ fn method_is_static(node: Node<'_>, source: &str) -> bool {
 }
 
 fn declaration_is_static(node: Node<'_>, source: &str) -> bool {
+    declaration_has_modifier(node, source, "static")
+}
+
+fn declaration_is_final(node: Node<'_>, source: &str) -> bool {
+    declaration_has_modifier(node, source, "final")
+}
+
+fn declaration_has_modifier(node: Node<'_>, source: &str, expected: &str) -> bool {
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
         .find(|child| child.kind() == "modifiers")
         .and_then(|modifiers| node_text(modifiers, source).ok())
-        .is_some_and(|modifiers| modifiers.split_whitespace().any(|token| token == "static"))
+        .is_some_and(|modifiers| modifiers.split_whitespace().any(|token| token == expected))
 }
 
 fn collect_local_variables(
@@ -2452,6 +2464,8 @@ mod tests {
         let base = index
             .resolve_field("demo.Constants", "BASE", Some(true))
             .ok_or_else(|| anyhow::anyhow!("BASE field missing"))?;
+        assert!(base.is_static);
+        assert!(base.is_final);
         assert!(matches!(
             base.initializer,
             Some(super::JavaExpression::Literal(ref value)) if value == "32"

@@ -96,7 +96,7 @@ fn summarize_gtnh(paths: &[PathBuf], project: &JavaProjectIndex) -> Result<GtnhS
             let analysis = analyze_source(&display, "GTNH", None, &source)?;
             let recovery = recover_with_project(&analysis, project);
             let mut summary = GtnhSummary::default();
-            summary.absorb(&analysis, &recovery);
+            summary.absorb_with_project(&analysis, &recovery, project);
             Ok(summary)
         })
         .try_reduce(GtnhSummary::default, |left, right| Ok(left.merged(right)))
