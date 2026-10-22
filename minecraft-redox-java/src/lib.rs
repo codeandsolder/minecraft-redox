@@ -841,9 +841,23 @@ impl JavaProjectIndex {
         }
         let receiver_type = self.expression_type_at(path, byte_position, receiver, bindings)?;
         let raw_receiver = erase_java_type_syntax(&receiver_type);
-        if method == "get" && arguments.is_empty() && is_optional_type(&raw_receiver) {
+        if method == "get"
+            && arguments.is_empty()
+            && (is_optional_type(&raw_receiver) || is_supplier_type(&raw_receiver))
+        {
             let value_type = generic_type_argument(&receiver_type, 0)?;
             return Some(self.normalize_type_name(value_type, bindings.package.as_deref()));
+        }
+        if arguments.is_empty() && raw_receiver == "org.apache.commons.lang3.tuple.Pair" {
+            let index = match method {
+                "getLeft" => 0,
+                "getRight" => 1,
+                _ => usize::MAX,
+            };
+            if index != usize::MAX {
+                let value_type = generic_type_argument(&receiver_type, index)?;
+                return Some(self.normalize_type_name(value_type, bindings.package.as_deref()));
+            }
         }
         if method == "get" && arguments.len() == 1 {
             if is_java_list_type(&raw_receiver) {
@@ -1193,6 +1207,11 @@ impl JavaProjectIndex {
         byte_position: usize,
         reference_name: &str,
     ) -> Option<&str> {
+        if reference_name == "this" {
+            return self
+                .enclosing_method(path, byte_position)
+                .map(|method| method.owner.as_str());
+        }
         if let Some(local) = self.local_variable_at(path, byte_position, reference_name) {
             return Some(local.type_name.as_str());
         }
@@ -1248,15 +1267,63 @@ fn resolve_type_reference(bindings: &JavaBindings, type_name: &str) -> String {
         dimensions += 1;
         base = stripped.trim_end();
     }
-    let (raw_type, generic_suffix) = base
-        .find('<')
-        .map_or((base, ""), |index| (&base[..index], &base[index..]));
-    let mut resolved = bindings.resolve_reference(raw_type.trim());
-    resolved.push_str(generic_suffix);
+
+    let mut resolved = if let Some(generic_start) = base.find('<') {
+        let generic_end = base.rfind('>').unwrap_or(base.len());
+        let raw_type = base.get(..generic_start).unwrap_or(base).trim();
+        let arguments = base
+            .get(generic_start + 1..generic_end)
+            .map(|text| resolve_generic_arguments(bindings, text))
+            .unwrap_or_default();
+        format!("{}<{arguments}>", bindings.resolve_reference(raw_type))
+    } else {
+        bindings.resolve_reference(base)
+    };
+
     for _ in 0..dimensions {
         resolved.push_str("[]");
     }
     resolved
+}
+
+fn resolve_generic_arguments(bindings: &JavaBindings, arguments: &str) -> String {
+    split_top_level_generic_arguments(arguments)
+        .into_iter()
+        .map(|argument| resolve_generic_argument(bindings, argument))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn split_top_level_generic_arguments(arguments: &str) -> Vec<&str> {
+    let mut result = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (index, character) in arguments.char_indices() {
+        match character {
+            '<' => depth += 1,
+            '>' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                result.push(arguments.get(start..index).unwrap_or_default().trim());
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    result.push(arguments.get(start..).unwrap_or_default().trim());
+    result
+}
+
+fn resolve_generic_argument(bindings: &JavaBindings, argument: &str) -> String {
+    let argument = argument.trim();
+    if argument == "?" {
+        return String::from("?");
+    }
+    for prefix in ["? extends ", "? super "] {
+        if let Some(bound) = argument.strip_prefix(prefix) {
+            return format!("{prefix}{}", resolve_type_reference(bindings, bound));
+        }
+    }
+    resolve_type_reference(bindings, argument)
 }
 
 fn is_java_collection_type(type_name: &str) -> bool {
@@ -1309,6 +1376,10 @@ fn is_optional_type(type_name: &str) -> bool {
         type_name,
         "java.util.Optional" | "com.google.common.base.Optional"
     )
+}
+
+fn is_supplier_type(type_name: &str) -> bool {
+    type_name == "java.util.function.Supplier"
 }
 
 fn resolved_reference_name(expression: &JavaExpression, bindings: &JavaBindings) -> Option<String> {
@@ -2384,7 +2455,9 @@ fn argument_data(arguments: Node<'_>, source: &str) -> (Vec<String>, Vec<JavaExp
 
 fn expression(node: Node<'_>, source: &str) -> JavaExpression {
     match node.kind() {
-        "identifier" | "scoped_identifier" => JavaExpression::Reference(node_source(node, source)),
+        "identifier" | "scoped_identifier" | "this" => {
+            JavaExpression::Reference(node_source(node, source))
+        }
         "field_access" => expression_field_access(node, source),
         "array_creation_expression" => expression_array_creation(node, source),
         "array_initializer" => expression_array_initializer(node, source, None),
@@ -2887,7 +2960,7 @@ mod tests {
                 expression,
                 &analysis.bindings
             ),
-            Some(String::from("ItemStack"))
+            Some(String::from("net.minecraft.item.ItemStack"))
         );
         Ok(())
     }
@@ -2923,6 +2996,76 @@ mod tests {
                 &analysis.bindings
             ),
             Some(String::from("demo.ItemStack"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn infers_apache_pair_side_types() -> anyhow::Result<()> {
+        let source = r"
+            package demo;
+            import net.minecraft.item.ItemStack;
+            import org.apache.commons.lang3.tuple.Pair;
+            class Recipe {
+                void run(Pair<ItemStack, Integer> pair) { sink(pair.getLeft()); }
+            }
+        ";
+        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
+        let mut index = super::JavaProjectIndex::default();
+        index.add_analysis(&analysis);
+        let sink = analysis
+            .call_chains
+            .iter()
+            .flat_map(|chain| &chain.calls)
+            .find(|call| call.name == "sink")
+            .ok_or_else(|| anyhow::anyhow!("sink call missing"))?;
+        let expression = sink
+            .argument_expressions
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("sink argument missing"))?;
+        assert_eq!(
+            index.expression_type_at(
+                "Recipe.java",
+                sink.byte_start,
+                expression,
+                &analysis.bindings,
+            ),
+            Some(String::from("net.minecraft.item.ItemStack"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn infers_supplier_get_type() -> anyhow::Result<()> {
+        let source = r"
+            package demo;
+            import java.util.function.Supplier;
+            import net.minecraft.item.ItemStack;
+            class Recipe {
+                void run(Supplier<ItemStack> item) { sink(item.get()); }
+            }
+        ";
+        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
+        let mut index = super::JavaProjectIndex::default();
+        index.add_analysis(&analysis);
+        let sink = analysis
+            .call_chains
+            .iter()
+            .flat_map(|chain| &chain.calls)
+            .find(|call| call.name == "sink")
+            .ok_or_else(|| anyhow::anyhow!("sink call missing"))?;
+        let expression = sink
+            .argument_expressions
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("sink argument missing"))?;
+        assert_eq!(
+            index.expression_type_at(
+                "Recipe.java",
+                sink.byte_start,
+                expression,
+                &analysis.bindings,
+            ),
+            Some(String::from("net.minecraft.item.ItemStack"))
         );
         Ok(())
     }
@@ -3137,6 +3280,41 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("enum receiver was not resolved"))?;
         assert_eq!(resolved.owner, "demo.Component");
         assert_eq!(receiver_type.as_deref(), Some("demo.Component"));
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_this_field_receiver_type() -> anyhow::Result<()> {
+        let source = r"
+            package demo;
+            class ItemStack { ItemStack copy() { return this; } }
+            class Recipe {
+                ItemStack output = new ItemStack();
+                void run() { sink(this.output.copy()); }
+            }
+        ";
+        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
+        let mut index = super::JavaProjectIndex::default();
+        index.add_analysis(&analysis);
+        let sink = analysis
+            .call_chains
+            .iter()
+            .flat_map(|chain| &chain.calls)
+            .find(|call| call.name == "sink")
+            .ok_or_else(|| anyhow::anyhow!("sink call missing"))?;
+        let expression = sink
+            .argument_expressions
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("sink argument missing"))?;
+        assert_eq!(
+            index.expression_type_at(
+                "Recipe.java",
+                sink.byte_start,
+                expression,
+                &analysis.bindings,
+            ),
+            Some(String::from("demo.ItemStack"))
+        );
         Ok(())
     }
 
