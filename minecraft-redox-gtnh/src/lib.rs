@@ -9,7 +9,8 @@ use minecraft_redox_java::{
     JavaAnalysis, JavaBindings, JavaCall, JavaCallChain, JavaExpression, JavaProjectIndex,
 };
 use recipe_expression::{
-    duration_ticks, recover_fluids, recover_items, recover_items_with_project,
+    duration_ticks, recover_fluids, recover_fluids_with_project, recover_items,
+    recover_items_with_project,
 };
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -88,9 +89,10 @@ pub struct GtnhSummary {
     pub material_unhandled_methods: BTreeMap<String, usize>,
     pub recipe_item_expressions: usize,
     pub recipe_item_semantics_resolved: usize,
-    pub recipe_item_local_method_links: usize,
+    pub recipe_item_method_links: usize,
     pub recipe_fluid_expressions: usize,
     pub recipe_fluid_semantics_resolved: usize,
+    pub recipe_fluid_method_links: usize,
     pub recipe_durations: usize,
     pub recipe_durations_resolved_to_ticks: usize,
 }
@@ -108,9 +110,10 @@ impl GtnhSummary {
         self.materials_builder_fully_normalized += other.materials_builder_fully_normalized;
         self.recipe_item_expressions += other.recipe_item_expressions;
         self.recipe_item_semantics_resolved += other.recipe_item_semantics_resolved;
-        self.recipe_item_local_method_links += other.recipe_item_local_method_links;
+        self.recipe_item_method_links += other.recipe_item_method_links;
         self.recipe_fluid_expressions += other.recipe_fluid_expressions;
         self.recipe_fluid_semantics_resolved += other.recipe_fluid_semantics_resolved;
+        self.recipe_fluid_method_links += other.recipe_fluid_method_links;
         self.recipe_durations += other.recipe_durations;
         self.recipe_durations_resolved_to_ticks += other.recipe_durations_resolved_to_ticks;
         merge_counts(
@@ -152,8 +155,8 @@ impl GtnhSummary {
                 .chain(&recipe.item_output_semantics)
             {
                 match value.semantic {
-                    Some(ItemSemantic::LocalMethod { .. }) => {
-                        self.recipe_item_local_method_links += 1;
+                    Some(ItemSemantic::LinkedMethod { .. }) => {
+                        self.recipe_item_method_links += 1;
                     }
                     Some(_) => self.recipe_item_semantics_resolved += 1,
                     None => {}
@@ -161,12 +164,19 @@ impl GtnhSummary {
             }
             self.recipe_fluid_expressions +=
                 recipe.fluid_input_semantics.len() + recipe.fluid_output_semantics.len();
-            self.recipe_fluid_semantics_resolved += recipe
+            for value in recipe
                 .fluid_input_semantics
                 .iter()
                 .chain(&recipe.fluid_output_semantics)
-                .filter(|value| value.semantic.is_some())
-                .count();
+            {
+                match value.semantic {
+                    Some(FluidSemantic::LinkedMethod { .. }) => {
+                        self.recipe_fluid_method_links += 1;
+                    }
+                    Some(_) => self.recipe_fluid_semantics_resolved += 1,
+                    None => {}
+                }
+            }
             self.recipe_durations += usize::from(recipe.duration.is_some());
             self.recipe_durations_resolved_to_ticks += usize::from(recipe.duration_ticks.is_some());
         }
@@ -298,12 +308,16 @@ fn recognize_recipe(
                 &mut recipe.fluid_input_semantics,
                 call,
                 bindings,
+                project,
+                &chain.origin.path,
             ),
             "fluidOutputs" => add_fluids(
                 &mut recipe.fluid_outputs,
                 &mut recipe.fluid_output_semantics,
                 call,
                 bindings,
+                project,
+                &chain.origin.path,
             ),
             "inputChances" => recipe.input_chances.extend(call.arguments.clone()),
             "outputChances" => recipe.output_chances.extend(call.arguments.clone()),
@@ -378,6 +392,7 @@ fn add_items(
                 bindings,
                 project,
                 source_path,
+                call.byte_start,
             )
         },
     );
@@ -389,13 +404,24 @@ fn add_fluids(
     semantics: &mut Vec<RecoveredExpression<FluidSemantic>>,
     call: &JavaCall,
     bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+    source_path: &str,
 ) {
     raw.extend(call.arguments.clone());
-    semantics.extend(recover_fluids(
-        &call.arguments,
-        &call.argument_expressions,
-        bindings,
-    ));
+    let recovered = project.map_or_else(
+        || recover_fluids(&call.arguments, &call.argument_expressions, bindings),
+        |project| {
+            recover_fluids_with_project(
+                &call.arguments,
+                &call.argument_expressions,
+                bindings,
+                project,
+                source_path,
+                call.byte_start,
+            )
+        },
+    );
+    semantics.extend(recovered);
 }
 
 fn one_expression(call: &JavaCall) -> Option<&JavaExpression> {

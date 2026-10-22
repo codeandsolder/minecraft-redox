@@ -74,7 +74,7 @@ The next layer keeps every original Java expression and its generic Java express
 
 Duration arithmetic is evaluated only through exact integer operations and known **time-domain** constants (`GTRecipeBuilder` and `TickTime`). Volume constants such as `INGOTS` are deliberately not accepted as time merely because they are integers.
 
-On the same full GT5 source scan:
+On the initial expression-only pass, before project-level method/type linkage:
 
 - item expressions: 17,310 total; **14,546 semantically recognized (84.0%)**
 - fluid expressions: 6,584 total; **6,266 semantically recognized (95.2%)**
@@ -86,7 +86,7 @@ The unresolved tail is intentionally preserved. A major remaining item family is
 
 The Java frontend now inventories method owners, return types, parameters, varargs/static status and exact provenance, and builds a compact project index. GTNH lowering runs as two parallel passes: one builds the method index; the second performs semantic recovery with that index available.
 
-Local calls are linked only when `(source file, method name, arity)` identifies exactly one compatible method. Ambiguous overloads remain unresolved. A linked method returning `ItemStack` is recorded as a `LocalMethod` semantic with its stable signature, but is **not** counted as a fully resolved item meaning until its body is understood.
+Local calls are linked only when `(source file, method name, arity)` identifies exactly one compatible method. Ambiguous overloads remain unresolved. A linked method returning `ItemStack` is recorded as a `LinkedMethod` semantic with its stable signature, but is **not** counted as a fully resolved item meaning until its body is understood.
 
 On GT5 this links 431 recipe item expressions while preserving the previous 14,546 directly understood item semantics. `ComponentAssemblyLineLoader` accounts for 421 of those links: 299 calls to `get(OrePrefixes,Object,int)` and 122 calls to `get(ItemList,int)`. This is the intended handoff to method-body lowering rather than another name heuristic.
 
@@ -95,3 +95,22 @@ On GT5 this links 431 recipe item expressions while preserving the previous 14,5
 Indexed Java methods now retain generic IR for their return expressions. For an unambiguous local call with exactly one return, minecraft-redox binds actual arguments to formal parameters, substitutes those references in the return expression, and feeds the substituted expression back through the ordinary semantic recognizers.
 
 This is deliberately much weaker than arbitrary Java inlining: nested lambda/type returns are excluded, varargs are not substituted, and multi-return methods remain linked rather than guessed. On GT5 this converts 132 of the 431 linked item helpers into directly recovered semantics. The remaining 299 links are the branchy `ComponentAssemblyLineLoader#get(OrePrefixes,Object,int)` calls and stay explicit until control-flow/type evidence can determine their outcomes.
+
+### Receiver type linkage
+
+The project index now has owner and source-path method indexes over one shared method store, plus lexical receiver typing for method parameters and local variables. An unresolved call such as `werkstoff.get(...)` can therefore be linked through the enclosing method's declared parameter type to the actual overload, with ambiguity still causing a clean refusal.
+
+Field access is now structural Java IR rather than a flattened source string. Field declarations are indexed with owner, declared type, static/instance status and provenance. Call resolution can therefore walk chains such as `MaterialsElements.getInstance().RUTHENIUM.getDust(64)` as: unique static method -> declared return type -> unique instance field -> declared field type -> unique instance method. Direct class calls such as `Particle.getBaseParticle(...)` are linked through imports and static method ownership. Static/instance mismatches and same-arity overload ambiguity remain hard failures rather than guesses.
+
+The index stores each method/field once and keeps integer secondary indexes by source path and owner. After removing the earlier duplicated method storage, the two-pass GT5 scan remains fast enough to use interactively.
+
+Latest GT5 measurement after receiver/field linkage:
+
+- item expressions: 17,310 total; **14,679 directly recognized (84.8%) + 1,507 unambiguous method links = 16,186 accounted (93.5%)**
+- fluid expressions: 6,584 total; **6,249 directly recognized (94.9%) + 208 unambiguous method links = 6,457 accounted (98.1%)**
+- recipe durations: 5,748 total; **5,428 exactly reduced to integer ticks (94.4%)**
+- release-mode two-pass scan: **2.92 s**, ~811% CPU, ~187 MB RSS on the Acer development host
+
+The lower direct-fluid count versus the earlier 6,266 is an intentional accounting correction, not lost coverage: 17 dynamic `getInstance().FIELD.getFluid*` expressions had previously been accepted merely because their method names looked fluid-like. They are now part of the method-link bucket, backed by actual owner/field/return-type evidence. The link bucket also captures 78 `GTModHandler#getDistilledWater(long)`, 56 `SubstituteFluidStack#soldering(long)`, 28 `GTModHandler#getIC2Coolant(long)`, and 17 `Material#getFluidStack(int)` calls.
+
+The largest item-link families are currently the branchy Component Assembly Line helper (299 calls), `Werkstoff#get(prefix, amount)` (260), `ItemRefer#get(int)` (255), `Werkstoff#get(prefix)` (155), `Material#getDust(int)` (97), `Particle#getBaseParticle(Particle)` (71), and `Particle#getIon(String,int)` (20). The completely unresolved item tail is down to 1,124 expressions (6.5%) and is now dominated by runtime `ItemStack` variables, Java arrays/alternative-input records, and a much smaller set of non-indexed or still-ambiguous calls rather than generic recipe-builder syntax.

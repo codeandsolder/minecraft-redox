@@ -50,12 +50,13 @@ pub enum ItemSemantic {
     OreDictStack {
         arguments: Vec<JavaExpression>,
     },
-    LocalMethod {
+    LinkedMethod {
         method_id: String,
         return_type: String,
+        receiver_type: Option<String>,
         arguments: Vec<JavaExpression>,
     },
-    InlinedLocalMethod {
+    InlinedMethod {
         method_id: String,
         result: Box<ItemSemantic>,
     },
@@ -75,6 +76,12 @@ pub enum FluidSemantic {
     },
     RegistryFluid {
         provider: String,
+        arguments: Vec<JavaExpression>,
+    },
+    LinkedMethod {
+        method_id: String,
+        return_type: String,
+        receiver_type: Option<String>,
         arguments: Vec<JavaExpression>,
     },
 }
@@ -104,10 +111,12 @@ pub fn recover_items_with_project(
     bindings: &JavaBindings,
     project: &JavaProjectIndex,
     source_path: &str,
+    byte_position: usize,
 ) -> Vec<RecoveredExpression<ItemSemantic>> {
     recover_values(sources, expressions, |expression| {
-        item_semantic(expression, bindings)
-            .or_else(|| local_item_semantic(expression, bindings, project, source_path))
+        item_semantic(expression, bindings).or_else(|| {
+            project_item_semantic(expression, bindings, project, source_path, byte_position)
+        })
     })
 }
 
@@ -119,6 +128,22 @@ pub fn recover_fluids(
 ) -> Vec<RecoveredExpression<FluidSemantic>> {
     recover_values(sources, expressions, |expression| {
         fluid_semantic(expression, bindings)
+    })
+}
+
+#[must_use]
+pub fn recover_fluids_with_project(
+    sources: &[String],
+    expressions: &[JavaExpression],
+    bindings: &JavaBindings,
+    project: &JavaProjectIndex,
+    source_path: &str,
+    byte_position: usize,
+) -> Vec<RecoveredExpression<FluidSemantic>> {
+    recover_values(sources, expressions, |expression| {
+        fluid_semantic(expression, bindings).or_else(|| {
+            project_fluid_semantic(expression, bindings, project, source_path, byte_position)
+        })
     })
 }
 
@@ -167,39 +192,76 @@ fn item_semantic(expression: &JavaExpression, bindings: &JavaBindings) -> Option
     }
 }
 
-fn local_item_semantic(
+fn project_item_semantic(
     expression: &JavaExpression,
     bindings: &JavaBindings,
     project: &JavaProjectIndex,
     source_path: &str,
+    byte_position: usize,
 ) -> Option<ItemSemantic> {
     let JavaExpression::Call {
-        receiver: None,
-        method,
+        receiver: _,
+        method: _,
         arguments,
     } = expression
     else {
         return None;
     };
-    let resolved = project.resolve_local_method(source_path, method, arguments.len())?;
+
+    let (resolved, receiver_type) =
+        project.resolve_call_at(source_path, byte_position, expression, bindings)?;
+    linked_method_semantic(resolved, arguments, bindings, receiver_type)
+}
+
+fn linked_method_semantic(
+    resolved: &minecraft_redox_java::JavaMethod,
+    arguments: &[JavaExpression],
+    bindings: &JavaBindings,
+    receiver_type: Option<String>,
+) -> Option<ItemSemantic> {
     if !resolved.return_type.ends_with("ItemStack") {
         return None;
     }
     let method_id = resolved.stable_id();
-    if resolved.returns.len() == 1
+    if receiver_type.is_none()
+        && resolved.returns.len() == 1
         && let Some(replacements) = resolved.argument_bindings(arguments)
     {
         let substituted = substitute_references(&resolved.returns[0].expression, &replacements);
         if let Some(result) = item_semantic(&substituted, bindings) {
-            return Some(ItemSemantic::InlinedLocalMethod {
+            return Some(ItemSemantic::InlinedMethod {
                 method_id,
                 result: Box::new(result),
             });
         }
     }
-    Some(ItemSemantic::LocalMethod {
+    Some(ItemSemantic::LinkedMethod {
         method_id,
         return_type: resolved.return_type.clone(),
+        receiver_type,
+        arguments: arguments.to_vec(),
+    })
+}
+
+fn project_fluid_semantic(
+    expression: &JavaExpression,
+    bindings: &JavaBindings,
+    project: &JavaProjectIndex,
+    source_path: &str,
+    byte_position: usize,
+) -> Option<FluidSemantic> {
+    let JavaExpression::Call { arguments, .. } = expression else {
+        return None;
+    };
+    let (resolved, receiver_type) =
+        project.resolve_call_at(source_path, byte_position, expression, bindings)?;
+    if !resolved.return_type.ends_with("FluidStack") {
+        return None;
+    }
+    Some(FluidSemantic::LinkedMethod {
+        method_id: resolved.stable_id(),
+        return_type: resolved.return_type.clone(),
+        receiver_type,
         arguments: arguments.clone(),
     })
 }
@@ -378,6 +440,9 @@ fn fluid_semantic(expression: &JavaExpression, bindings: &JavaBindings) -> Optio
 fn reference_name(expression: &JavaExpression, bindings: &JavaBindings) -> Option<String> {
     match expression {
         JavaExpression::Reference(reference) => Some(bindings.resolve_reference(reference)),
+        JavaExpression::FieldAccess { receiver, field } => {
+            Some(format!("{}.{}", reference_name(receiver, bindings)?, field))
+        }
         JavaExpression::Parenthesized(inner) => reference_name(inner, bindings),
         _ => None,
     }
@@ -431,6 +496,8 @@ fn eval_i64(expression: &JavaExpression, bindings: &JavaBindings) -> Option<i64>
         JavaExpression::Reference(reference) => {
             known_integer_constant(&bindings.resolve_reference(reference))
         }
+        JavaExpression::FieldAccess { .. } => reference_name(expression, bindings)
+            .and_then(|reference| known_integer_constant(&reference)),
         JavaExpression::Binary {
             left,
             operator,
@@ -506,7 +573,7 @@ fn known_integer_constant(reference: &str) -> Option<i64> {
 mod tests {
     use super::{
         FluidSemantic, ItemSemantic, duration_ticks, parse_integer_literal, recover_fluids,
-        recover_items,
+        recover_fluids_with_project, recover_items,
     };
     use minecraft_redox_java::{JavaExpression, analyze_source};
 
@@ -592,8 +659,9 @@ mod tests {
             &analysis.bindings,
             &project,
             "R.java",
+            items.byte_start,
         );
-        let Some(ItemSemantic::LocalMethod { method_id, .. }) = &recovered[0].semantic else {
+        let Some(ItemSemantic::LinkedMethod { method_id, .. }) = &recovered[0].semantic else {
             return Err(anyhow::anyhow!("local method was not linked"));
         };
         assert_eq!(method_id, "R#get(String,int)");
@@ -623,11 +691,48 @@ mod tests {
             &analysis.bindings,
             &project,
             "R.java",
+            items.byte_start,
         );
-        let Some(ItemSemantic::InlinedLocalMethod { result, .. }) = &recovered[0].semantic else {
+        let Some(ItemSemantic::InlinedMethod { result, .. }) = &recovered[0].semantic else {
             return Err(anyhow::anyhow!("local method body was not inlined"));
         };
         assert!(matches!(result.as_ref(), ItemSemantic::CopyAmount { .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn links_method_on_typed_parameter_receiver() -> anyhow::Result<()> {
+        let source = r"
+            import net.minecraft.item.ItemStack;
+            class Widget {
+                ItemStack get(int amount) { return null; }
+            }
+            class R {
+                void run(Widget widget) { builder.itemInputs(widget.get(4)); }
+            }
+        ";
+        let analysis = analyze_source("R.java", "gt5", None, source)?;
+        let mut project = minecraft_redox_java::JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let items = recipe_call(&analysis, "itemInputs")?;
+        let recovered = super::recover_items_with_project(
+            &items.arguments,
+            &items.argument_expressions,
+            &analysis.bindings,
+            &project,
+            "R.java",
+            items.byte_start,
+        );
+        let Some(ItemSemantic::LinkedMethod {
+            receiver_type,
+            method_id,
+            ..
+        }) = &recovered[0].semantic
+        else {
+            return Err(anyhow::anyhow!("typed receiver method was not linked"));
+        };
+        assert_eq!(receiver_type.as_deref(), Some("Widget"));
+        assert_eq!(method_id, "Widget#get(int)");
         Ok(())
     }
 
@@ -683,6 +788,41 @@ mod tests {
     }
 
     #[test]
+    fn links_typed_fluid_field_chain() -> anyhow::Result<()> {
+        let source = r"
+            package demo;
+            import net.minecraftforge.fluids.FluidStack;
+            class Material { FluidStack getFluidStack(int amount) { return null; } }
+            class Materials {
+                public final Material WATER = new Material();
+                public static Materials getInstance() { return null; }
+            }
+            class R {
+                void run() {
+                    builder.fluidInputs(Materials.getInstance().WATER.getFluidStack(1000));
+                }
+            }
+        ";
+        let analysis = analyze_source("R.java", "gt5", None, source)?;
+        let mut project = minecraft_redox_java::JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let fluids = recipe_call(&analysis, "fluidInputs")?;
+        let recovered = recover_fluids_with_project(
+            &fluids.arguments,
+            &fluids.argument_expressions,
+            &analysis.bindings,
+            &project,
+            "R.java",
+            fluids.byte_start,
+        );
+        assert!(matches!(
+            recovered[0].semantic,
+            Some(FluidSemantic::LinkedMethod { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn does_not_treat_volume_constants_as_time() -> anyhow::Result<()> {
         let source = r"
             import static gregtech.api.util.GTRecipeBuilder.INGOTS;
@@ -695,6 +835,21 @@ mod tests {
             .first()
             .ok_or_else(|| anyhow::anyhow!("missing duration expression"))?;
         assert_eq!(duration_ticks(expression, &analysis.bindings), None);
+        Ok(())
+    }
+
+    #[test]
+    fn evaluates_qualified_gt_duration_units() -> anyhow::Result<()> {
+        let source = r"
+            class R { void run() { builder.duration(60 * GTRecipeBuilder.SECONDS); } }
+        ";
+        let analysis = analyze_source("R.java", "gt5", None, source)?;
+        let call = recipe_call(&analysis, "duration")?;
+        let expression = call
+            .argument_expressions
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("missing duration expression"))?;
+        assert_eq!(duration_ticks(expression, &analysis.bindings), Some(1200));
         Ok(())
     }
 
