@@ -393,7 +393,10 @@ fn lower_fluid_semantic(
                 amount: scalar_amount_u64(arguments.get(1)?, bindings, project)?,
             })
         }
-        FluidSemantic::RegistryFluid { .. } | FluidSemantic::LinkedMethod { .. } => None,
+        FluidSemantic::RegistryFluid { .. }
+        | FluidSemantic::LinkedMethod { .. }
+        | FluidSemantic::LinkedValue { .. }
+        | FluidSemantic::TypedExpression { .. } => None,
     }
 }
 

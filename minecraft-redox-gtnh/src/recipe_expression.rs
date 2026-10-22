@@ -28,6 +28,11 @@ pub enum ItemSemantic {
         accessor: String,
         arguments: Vec<JavaExpression>,
     },
+    DynamicItemList {
+        receiver: JavaExpression,
+        accessor: String,
+        arguments: Vec<JavaExpression>,
+    },
     MaterialItem {
         material: String,
         accessor: String,
@@ -44,6 +49,21 @@ pub enum ItemSemantic {
         inner: Option<Box<ItemSemantic>>,
         unsafe_copy: bool,
     },
+    CopyItem {
+        item: JavaExpression,
+        inner: Option<Box<ItemSemantic>>,
+        nullable: bool,
+    },
+    SplitStack {
+        item: JavaExpression,
+        amount: JavaExpression,
+        inner: Option<Box<ItemSemantic>>,
+    },
+    WithDisplayName {
+        item: JavaExpression,
+        name: JavaExpression,
+        inner: Option<Box<ItemSemantic>>,
+    },
     ItemStack {
         item: JavaExpression,
         amount: Option<JavaExpression>,
@@ -58,6 +78,9 @@ pub enum ItemSemantic {
     },
     ExplicitAlternatives {
         alternatives: Vec<JavaExpression>,
+    },
+    TypedInputContainer {
+        expression_type: String,
     },
     LinkedMethod {
         method_id: String,
@@ -102,6 +125,15 @@ pub enum FluidSemantic {
         receiver_type: Option<String>,
         arguments: Vec<JavaExpression>,
     },
+    LinkedValue {
+        value_id: String,
+        value_kind: JavaValueKind,
+        name: String,
+        declared_type: String,
+    },
+    TypedExpression {
+        expression_type: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -109,6 +141,61 @@ pub struct RecoveredExpression<T> {
     pub source: String,
     pub expression: JavaExpression,
     pub semantic: Option<T>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ExpressionSemantic {
+    LinkedMethod {
+        method_id: String,
+        return_type: String,
+        receiver_type: Option<String>,
+        arguments: Vec<JavaExpression>,
+    },
+    LinkedValue {
+        value_id: String,
+        value_kind: JavaValueKind,
+        name: String,
+        declared_type: String,
+    },
+    TypedExpression {
+        expression_type: String,
+    },
+    StructuredExpression {
+        expression: JavaExpression,
+    },
+    OpaqueExpression {
+        source: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum NumericSemantic {
+    ExactValue {
+        value: i64,
+    },
+    LinkedMethod {
+        method_id: String,
+        return_type: String,
+        receiver_type: Option<String>,
+        arguments: Vec<JavaExpression>,
+    },
+    LinkedValue {
+        value_id: String,
+        value_kind: JavaValueKind,
+        name: String,
+        declared_type: String,
+    },
+    TypedExpression {
+        expression_type: String,
+    },
+    StructuredExpression {
+        expression: JavaExpression,
+    },
+    OpaqueExpression {
+        source: String,
+    },
 }
 
 #[must_use]
@@ -205,6 +292,108 @@ pub fn recover_fluids_with_project(
 }
 
 #[must_use]
+pub fn recover_expression(
+    source: &str,
+    expression: &JavaExpression,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+    source_path: &str,
+    byte_position: usize,
+) -> ExpressionSemantic {
+    if let Some(project) = project {
+        if let JavaExpression::Reference(reference) = expression
+            && let Some(value) =
+                project.resolve_value_at(source_path, byte_position, reference, bindings)
+        {
+            return ExpressionSemantic::LinkedValue {
+                value_id: value.value_id,
+                value_kind: value.kind,
+                name: value.name,
+                declared_type: value.type_name,
+            };
+        }
+        if let JavaExpression::Call { arguments, .. } = expression
+            && let Some((resolved, receiver_type)) =
+                project.resolve_call_at(source_path, byte_position, expression, bindings)
+        {
+            return ExpressionSemantic::LinkedMethod {
+                method_id: resolved.stable_id(),
+                return_type: resolved.return_type.clone(),
+                receiver_type,
+                arguments: arguments.clone(),
+            };
+        }
+        if let Some(expression_type) =
+            project.expression_type_at(source_path, byte_position, expression, bindings)
+        {
+            return ExpressionSemantic::TypedExpression { expression_type };
+        }
+    }
+    match expression {
+        JavaExpression::Raw(_) => ExpressionSemantic::OpaqueExpression {
+            source: source.to_owned(),
+        },
+        _ => ExpressionSemantic::StructuredExpression {
+            expression: expression.clone(),
+        },
+    }
+}
+
+#[must_use]
+pub fn recover_numeric_expression(
+    source: &str,
+    expression: &JavaExpression,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+    source_path: &str,
+    byte_position: usize,
+) -> NumericSemantic {
+    if let Some(ticks) = duration_ticks(expression, bindings) {
+        return NumericSemantic::ExactValue { value: ticks };
+    }
+    match recover_expression(
+        source,
+        expression,
+        bindings,
+        project,
+        source_path,
+        byte_position,
+    ) {
+        ExpressionSemantic::LinkedMethod {
+            method_id,
+            return_type,
+            receiver_type,
+            arguments,
+        } => NumericSemantic::LinkedMethod {
+            method_id,
+            return_type,
+            receiver_type,
+            arguments,
+        },
+        ExpressionSemantic::LinkedValue {
+            value_id,
+            value_kind,
+            name,
+            declared_type,
+        } => NumericSemantic::LinkedValue {
+            value_id,
+            value_kind,
+            name,
+            declared_type,
+        },
+        ExpressionSemantic::TypedExpression { expression_type } => {
+            NumericSemantic::TypedExpression { expression_type }
+        }
+        ExpressionSemantic::StructuredExpression { expression } => {
+            NumericSemantic::StructuredExpression { expression }
+        }
+        ExpressionSemantic::OpaqueExpression { source } => {
+            NumericSemantic::OpaqueExpression { source }
+        }
+    }
+}
+
+#[must_use]
 pub fn duration_ticks(expression: &JavaExpression, bindings: &JavaBindings) -> Option<i64> {
     eval_i64(expression, bindings)
 }
@@ -286,6 +475,13 @@ fn project_input_item_semantic(
     byte_position: usize,
     nested_array_is_slot: bool,
 ) -> Option<ItemSemantic> {
+    if !matches!(expression, JavaExpression::Call { .. })
+        && let Some(expression_type) =
+            project.expression_type_at(source_path, byte_position, expression, bindings)
+        && is_recipe_input_container_type(&expression_type)
+    {
+        return Some(ItemSemantic::TypedInputContainer { expression_type });
+    }
     if nested_array_is_slot
         && let JavaExpression::Call { arguments, .. } = expression
         && let Some((resolved, receiver_type)) =
@@ -343,6 +539,24 @@ fn project_item_semantic(
             })
         }
         JavaExpression::Call { arguments, .. } => {
+            if let Some(semantic) = project_dynamic_item_list_semantic(
+                expression,
+                project,
+                source_path,
+                byte_position,
+                bindings,
+            ) {
+                return Some(semantic);
+            }
+            if let Some(semantic) = project_item_stack_transform_semantic(
+                expression,
+                bindings,
+                project,
+                source_path,
+                byte_position,
+            ) {
+                return Some(semantic);
+            }
             if let Some((resolved, receiver_type)) =
                 project.resolve_call_at(source_path, byte_position, expression, bindings)
                 && let Some(semantic) =
@@ -357,6 +571,92 @@ fn project_item_semantic(
         }
         _ => typed_item_expression(expression, bindings, project, source_path, byte_position),
     }
+}
+
+fn project_dynamic_item_list_semantic(
+    expression: &JavaExpression,
+    project: &JavaProjectIndex,
+    source_path: &str,
+    byte_position: usize,
+    bindings: &JavaBindings,
+) -> Option<ItemSemantic> {
+    let JavaExpression::Call {
+        receiver: Some(receiver),
+        method,
+        arguments,
+    } = expression
+    else {
+        return None;
+    };
+    if !is_item_list_accessor(method) {
+        return None;
+    }
+    let receiver_type =
+        project.expression_type_at(source_path, byte_position, receiver, bindings)?;
+    if !receiver_type.trim().ends_with("ItemList") {
+        return None;
+    }
+    Some(ItemSemantic::DynamicItemList {
+        receiver: receiver.as_ref().clone(),
+        accessor: method.clone(),
+        arguments: arguments.clone(),
+    })
+}
+
+fn project_item_stack_transform_semantic(
+    expression: &JavaExpression,
+    bindings: &JavaBindings,
+    project: &JavaProjectIndex,
+    source_path: &str,
+    byte_position: usize,
+) -> Option<ItemSemantic> {
+    let JavaExpression::Call {
+        receiver: Some(receiver),
+        method,
+        arguments,
+    } = expression
+    else {
+        return None;
+    };
+    let item = receiver.as_ref().clone();
+    let inner = receiver_item_semantic(&item, bindings, project, source_path, byte_position);
+    let receiver_is_item = inner.is_some()
+        || project
+            .expression_type_at(source_path, byte_position, receiver, bindings)
+            .is_some_and(|type_name| type_name.trim().ends_with("ItemStack"));
+    if !receiver_is_item {
+        return None;
+    }
+    match (method.as_str(), arguments.as_slice()) {
+        ("copy", []) => Some(ItemSemantic::CopyItem {
+            item,
+            inner: inner.map(Box::new),
+            nullable: false,
+        }),
+        ("splitStack", [amount]) => Some(ItemSemantic::SplitStack {
+            item,
+            amount: amount.clone(),
+            inner: inner.map(Box::new),
+        }),
+        ("setStackDisplayName", [name]) => Some(ItemSemantic::WithDisplayName {
+            item,
+            name: name.clone(),
+            inner: inner.map(Box::new),
+        }),
+        _ => None,
+    }
+}
+
+fn receiver_item_semantic(
+    expression: &JavaExpression,
+    bindings: &JavaBindings,
+    project: &JavaProjectIndex,
+    source_path: &str,
+    byte_position: usize,
+) -> Option<ItemSemantic> {
+    item_semantic(expression, bindings).or_else(|| {
+        project_item_semantic(expression, bindings, project, source_path, byte_position)
+    })
 }
 
 fn typed_item_expression(
@@ -416,20 +716,59 @@ fn project_fluid_semantic(
     source_path: &str,
     byte_position: usize,
 ) -> Option<FluidSemantic> {
-    let JavaExpression::Call { arguments, .. } = expression else {
-        return None;
-    };
-    let (resolved, receiver_type) =
-        project.resolve_call_at(source_path, byte_position, expression, bindings)?;
-    if !resolved.return_type.ends_with("FluidStack") {
-        return None;
+    match expression {
+        JavaExpression::Reference(reference) => {
+            let value =
+                project.resolve_value_at(source_path, byte_position, reference, bindings)?;
+            if !is_fluid_value_type(&value.type_name) {
+                return None;
+            }
+            Some(FluidSemantic::LinkedValue {
+                value_id: value.value_id,
+                value_kind: value.kind,
+                name: value.name,
+                declared_type: value.type_name,
+            })
+        }
+        JavaExpression::Call { arguments, .. } => {
+            if let Some((resolved, receiver_type)) =
+                project.resolve_call_at(source_path, byte_position, expression, bindings)
+                && is_fluid_value_type(&resolved.return_type)
+            {
+                return Some(FluidSemantic::LinkedMethod {
+                    method_id: resolved.stable_id(),
+                    return_type: resolved.return_type.clone(),
+                    receiver_type,
+                    arguments: arguments.clone(),
+                });
+            }
+            typed_fluid_expression(expression, bindings, project, source_path, byte_position)
+        }
+        JavaExpression::Parenthesized(inner) => {
+            project_fluid_semantic(inner, bindings, project, source_path, byte_position)
+        }
+        _ => typed_fluid_expression(expression, bindings, project, source_path, byte_position),
     }
-    Some(FluidSemantic::LinkedMethod {
-        method_id: resolved.stable_id(),
-        return_type: resolved.return_type.clone(),
-        receiver_type,
-        arguments: arguments.clone(),
-    })
+}
+
+fn typed_fluid_expression(
+    expression: &JavaExpression,
+    bindings: &JavaBindings,
+    project: &JavaProjectIndex,
+    source_path: &str,
+    byte_position: usize,
+) -> Option<FluidSemantic> {
+    let expression_type =
+        project.expression_type_at(source_path, byte_position, expression, bindings)?;
+    is_fluid_value_type(&expression_type)
+        .then_some(FluidSemantic::TypedExpression { expression_type })
+}
+
+fn is_fluid_value_type(type_name: &str) -> bool {
+    type_name
+        .trim()
+        .trim_end_matches("[]")
+        .ends_with("FluidStack")
 }
 
 fn classify_item_call(
@@ -470,6 +809,15 @@ fn classify_item_call(
     }
 
     if resolved_receiver.ends_with("GTUtility") {
+        if method == "copyOrNull" && arguments.len() == 1 {
+            let item = arguments.first()?.clone();
+            let inner = item_semantic(&item, bindings).map(Box::new);
+            return Some(ItemSemantic::CopyItem {
+                item,
+                inner,
+                nullable: true,
+            });
+        }
         if matches!(method, "copyAmount" | "copyAmountUnsafe") && arguments.len() >= 2 {
             let item = arguments.get(1)?.clone();
             let inner = item_semantic(&item, bindings).map(Box::new);
@@ -565,11 +913,12 @@ fn fluid_semantic(expression: &JavaExpression, bindings: &JavaBindings) -> Optio
             arguments,
         } if matches!(method.as_str(), "getFluidStack" | "getFluidStackFromName")
             && arguments.len() >= 2
-            && reference_name(receiver, bindings)?.ends_with("FluidRegistry") =>
+            && reference_name(receiver, bindings).is_some_and(|name| {
+                bindings.resolve_reference(&name).ends_with("FluidRegistry")
+            }) =>
         {
-            let provider = format!("{}.{}", reference_name(receiver, bindings)?, method);
             Some(FluidSemantic::RegistryFluid {
-                provider,
+                provider: format!("{}.{}", reference_name(receiver, bindings)?, method),
                 arguments: arguments.clone(),
             })
         }
@@ -722,6 +1071,16 @@ fn eval_i64(expression: &JavaExpression, bindings: &JavaBindings) -> Option<i64>
                 "*" => left.checked_mul(right),
                 "/" if right != 0 => left.checked_div(right),
                 "%" if right != 0 => left.checked_rem(right),
+                _ => None,
+            }
+        }
+        JavaExpression::Cast { value, .. } => eval_i64(value, bindings),
+        JavaExpression::Unary { operator, operand } => {
+            let value = eval_i64(operand, bindings)?;
+            match operator.as_str() {
+                "+" => Some(value),
+                "-" => value.checked_neg(),
+                "~" => Some(!value),
                 _ => None,
             }
         }
@@ -949,6 +1308,118 @@ mod tests {
     }
 
     #[test]
+    fn recognizes_dynamic_item_list_accessor() -> anyhow::Result<()> {
+        let source = r"
+            import gregtech.api.enums.ItemList;
+            class ComponentType {
+                ItemList getComponent(int tier) { return null; }
+            }
+            class R {
+                void run(ComponentType component, int tier) {
+                    builder.itemInputs(component.getComponent(tier).get(8));
+                }
+            }
+        ";
+        let analysis = analyze_source("R.java", "gt5", None, source)?;
+        let mut project = minecraft_redox_java::JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let items = recipe_call(&analysis, "itemInputs")?;
+        let recovered = super::recover_items_with_project(
+            &items.arguments,
+            &items.argument_expressions,
+            &analysis.bindings,
+            &project,
+            "R.java",
+            items.byte_start,
+        );
+        let Some(ItemSemantic::DynamicItemList {
+            accessor,
+            arguments,
+            ..
+        }) = &recovered[0].semantic
+        else {
+            return Err(anyhow::anyhow!(
+                "dynamic ItemList accessor was not recovered"
+            ));
+        };
+        assert_eq!(accessor, "get");
+        assert_eq!(arguments.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn recognizes_item_stack_mutating_transforms() -> anyhow::Result<()> {
+        let source = r#"
+            class ItemStack {}
+            class R {
+                void run(ItemStack input) {
+                    builder.itemInputs(
+                        input.splitStack(3),
+                        input.setStackDisplayName("Named"));
+                }
+            }
+        "#;
+        let analysis = analyze_source("R.java", "gt5", None, source)?;
+        let mut project = minecraft_redox_java::JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let items = recipe_call(&analysis, "itemInputs")?;
+        let recovered = super::recover_items_with_project(
+            &items.arguments,
+            &items.argument_expressions,
+            &analysis.bindings,
+            &project,
+            "R.java",
+            items.byte_start,
+        );
+        assert!(matches!(
+            recovered[0].semantic,
+            Some(ItemSemantic::SplitStack { .. })
+        ));
+        assert!(matches!(
+            recovered[1].semantic,
+            Some(ItemSemantic::WithDisplayName { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn recognizes_item_copy_operations() -> anyhow::Result<()> {
+        let source = r"
+            import gregtech.api.util.GTUtility;
+            class ItemStack { ItemStack copy() { return this; } }
+            class R {
+                void run(ItemStack input) {
+                    builder.itemInputs(input.copy(), GTUtility.copyOrNull(input));
+                }
+            }
+        ";
+        let analysis = analyze_source("R.java", "gt5", None, source)?;
+        let mut project = minecraft_redox_java::JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let items = recipe_call(&analysis, "itemInputs")?;
+        let recovered = super::recover_items_with_project(
+            &items.arguments,
+            &items.argument_expressions,
+            &analysis.bindings,
+            &project,
+            "R.java",
+            items.byte_start,
+        );
+        assert!(matches!(
+            recovered[0].semantic,
+            Some(ItemSemantic::CopyItem {
+                nullable: false,
+                ..
+            })
+        ));
+        assert!(matches!(
+            recovered[1].semantic,
+            Some(ItemSemantic::CopyItem { nullable: true, .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn recognizes_copy_amount_and_ore_dict_overloads() -> anyhow::Result<()> {
         let source = r#"
             import gregtech.api.enums.Materials;
@@ -995,6 +1466,33 @@ mod tests {
         assert!(matches!(
             recovered[0].semantic,
             Some(ItemSemantic::OreDictStack { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn links_typed_dynamic_input_container() -> anyhow::Result<()> {
+        let source = r"
+            class R {
+                void run(Object[] inputs) { builder.itemInputs(inputs); }
+            }
+        ";
+        let analysis = analyze_source("R.java", "gt5", None, source)?;
+        let mut project = minecraft_redox_java::JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let inputs = recipe_call(&analysis, "itemInputs")?;
+        let recovered = recover_item_inputs_with_project(
+            &inputs.arguments,
+            &inputs.argument_expressions,
+            &analysis.bindings,
+            &project,
+            "R.java",
+            inputs.byte_start,
+        );
+        assert!(matches!(
+            &recovered[0].semantic,
+            Some(ItemSemantic::TypedInputContainer { expression_type })
+                if expression_type == "Object[]"
         ));
         Ok(())
     }
@@ -1145,6 +1643,53 @@ mod tests {
     }
 
     #[test]
+    fn recognizes_forge_fluid_registry_and_typed_values() -> anyhow::Result<()> {
+        let source = r#"
+            import java.util.List;
+            import net.minecraftforge.fluids.FluidRegistry;
+            import net.minecraftforge.fluids.FluidStack;
+            class R {
+                void run(FluidStack local, FluidStack[] array, List<FluidStack> list) {
+                    builder.fluidInputs(
+                        FluidRegistry.getFluidStack("water", 1000),
+                        local,
+                        array[0],
+                        list.toArray(new FluidStack[0]));
+                }
+            }
+        "#;
+        let analysis = analyze_source("R.java", "gt5", None, source)?;
+        let mut project = minecraft_redox_java::JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let fluids = recipe_call(&analysis, "fluidInputs")?;
+        let recovered = recover_fluids_with_project(
+            &fluids.arguments,
+            &fluids.argument_expressions,
+            &analysis.bindings,
+            &project,
+            "R.java",
+            fluids.byte_start,
+        );
+        assert!(matches!(
+            recovered[0].semantic,
+            Some(FluidSemantic::RegistryFluid { .. })
+        ));
+        assert!(matches!(
+            recovered[1].semantic,
+            Some(FluidSemantic::LinkedValue { .. })
+        ));
+        assert!(matches!(
+            recovered[2].semantic,
+            Some(FluidSemantic::TypedExpression { .. })
+        ));
+        assert!(matches!(
+            recovered[3].semantic,
+            Some(FluidSemantic::TypedExpression { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn links_typed_fluid_field_chain() -> anyhow::Result<()> {
         let source = r"
             package demo;
@@ -1216,6 +1761,22 @@ mod tests {
         assert_eq!(parse_integer_literal("0x10"), Some(16));
         assert_eq!(parse_integer_literal("0b1010"), Some(10));
         assert_eq!(parse_integer_literal("077"), Some(63));
+    }
+
+    #[test]
+    fn evaluates_cast_and_unary_duration_constants() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.util.GTRecipeBuilder.SECONDS;
+            class R { void run() { builder.duration((int) +(2 * SECONDS)); } }
+        ";
+        let analysis = analyze_source("R.java", "gt5", None, source)?;
+        let call = recipe_call(&analysis, "duration")?;
+        let expression = call
+            .argument_expressions
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("missing duration expression"))?;
+        assert_eq!(duration_ticks(expression, &analysis.bindings), Some(40));
+        Ok(())
     }
 
     #[test]

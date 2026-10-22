@@ -49,6 +49,38 @@ fn eval_i64(
             let value = eval_i64(value, bindings, project, current_owner, depth + 1, seen)?;
             numeric_cast(type_name, value)
         }
+        JavaExpression::Unary { operator, operand } => {
+            let value = eval_i64(operand, bindings, project, current_owner, depth + 1, seen)?;
+            match operator.as_str() {
+                "+" => Some(value),
+                "-" => value.checked_neg(),
+                "~" => Some(!value),
+                _ => None,
+            }
+        }
+        JavaExpression::Ternary {
+            consequence,
+            alternative,
+            ..
+        } => {
+            let consequence = eval_i64(
+                consequence,
+                bindings,
+                project,
+                current_owner,
+                depth + 1,
+                seen,
+            )?;
+            let alternative = eval_i64(
+                alternative,
+                bindings,
+                project,
+                current_owner,
+                depth + 1,
+                seen,
+            )?;
+            (consequence == alternative).then_some(consequence)
+        }
         JavaExpression::Binary {
             left,
             operator,
