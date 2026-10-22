@@ -200,3 +200,18 @@ Per-recipe blocker counts (a recipe may have more than one blocker):
 The important result is not that v1 lowers only 161 recipes; it is that those 161 are the first recipes for which the compiler can make a much stronger claim: the output is a typed, source-language-independent content record and no unsupported source behavior was knowingly dropped.
 
 The largest artificial blocker is now scalar evaluation rather than recipe syntax: 4,634 recipes use symbolic EU/t expressions such as tier constants instead of literal integers. Resolving statically provable GT tier constants is therefore the next high-leverage lowering pass, followed by explicit fluid IR rather than another round of syntax-percentage chasing.
+
+### Source-backed scalar constant evaluation
+
+EU/t lowering now runs through project-level Java constant evidence before target lowering. Static field declarations retain initializer IR and source provenance, source-path bindings are indexed once per file, numeric casts are structural expressions, and scalar evaluation follows static-final references, arithmetic, array access and standard integer extrema with cycle/depth guards.
+
+`GTValues.VP` is the one GT-specific scalar transform in this pass. It is not a hard-coded voltage table: the evaluator only treats it as the practical-voltage array when the indexed `VP` initializer matches GT5's source pipeline `Arrays.stream(V).map(... * 30 / 32 ...).toArray()`. It then evaluates the sibling `V` array and `VoltageIndex` constants from source. Thus expressions such as `TierEU.RECIPE_HV / 2` derive their values through the declaration graph rather than by recipe-name heuristics.
+
+Full GT5 result after this pass:
+
+- target recipes lowered: **387 / 5,791 (6.68%)**, up from 161;
+- non-constant EU/t blockers: **417**, down from 4,634;
+- therefore **4,217** previously non-constant EU/t expressions are now statically resolved;
+- the stricter recipe count rises by 226 because many recipes whose EU/t is now known still have independent blockers.
+
+The dominant target-v1 blocker is now fluids at 3,558 recipes, followed by item inputs (2,992), modifiers (2,496), item outputs (2,379), and metadata (1,156). This makes explicit fluid content IR the next high-leverage target feature; chasing the remaining 417 dynamic/non-constant EU/t cases is lower value.

@@ -94,8 +94,8 @@ pub fn lower_recipe(
         }
     };
 
-    let eut = match recipe.eut_expression.as_ref() {
-        None => {
+    let eut = match (recipe.eut_expression.as_ref(), recipe.eut_value) {
+        (None, _) => {
             push_blocker(
                 &mut blockers,
                 RecipeLoweringBlockerKind::MissingEut,
@@ -103,20 +103,17 @@ pub fn lower_recipe(
             );
             None
         }
-        Some(expression) => {
-            if let Some(value) = literal_i64(expression) {
-                Some(value)
-            } else {
-                push_blocker(
-                    &mut blockers,
-                    RecipeLoweringBlockerKind::NonConstantEut,
-                    recipe
-                        .eut
-                        .clone()
-                        .unwrap_or_else(|| String::from("<missing source>")),
-                );
-                None
-            }
+        (Some(_), Some(value)) => Some(value),
+        (Some(_), None) => {
+            push_blocker(
+                &mut blockers,
+                RecipeLoweringBlockerKind::NonConstantEut,
+                recipe
+                    .eut
+                    .clone()
+                    .unwrap_or_else(|| String::from("<missing source>")),
+            );
+            None
         }
     };
 

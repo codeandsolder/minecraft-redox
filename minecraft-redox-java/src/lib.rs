@@ -48,6 +48,10 @@ pub enum JavaExpression {
         array: Box<JavaExpression>,
         index: Box<JavaExpression>,
     },
+    Cast {
+        type_name: String,
+        value: Box<JavaExpression>,
+    },
     Literal(String),
     Call {
         receiver: Option<Box<JavaExpression>>,
@@ -143,6 +147,8 @@ pub struct JavaField {
     pub name: String,
     pub type_name: String,
     pub is_static: bool,
+    pub initializer: Option<JavaExpression>,
+    pub initializer_source: Option<String>,
     pub origin: SourceOrigin,
 }
 
@@ -230,10 +236,13 @@ pub struct JavaProjectIndex {
     methods_by_owner: BTreeMap<String, Vec<usize>>,
     fields: Vec<JavaField>,
     fields_by_owner: BTreeMap<String, Vec<usize>>,
+    bindings_by_path: BTreeMap<String, JavaBindings>,
 }
 
 impl JavaProjectIndex {
     pub fn add_analysis(&mut self, analysis: &JavaAnalysis) {
+        self.bindings_by_path
+            .insert(analysis.inventory.path.clone(), analysis.bindings.clone());
         for method in &analysis.methods {
             let index = self.methods.len();
             self.methods.push(method.clone());
@@ -278,7 +287,13 @@ impl JavaProjectIndex {
             other.fields_by_owner,
             field_offset,
         );
+        self.bindings_by_path.extend(other.bindings_by_path);
         self
+    }
+
+    #[must_use]
+    pub fn bindings_for_path(&self, path: &str) -> Option<&JavaBindings> {
+        self.bindings_by_path.get(path)
     }
 
     #[must_use]
@@ -488,10 +503,12 @@ impl JavaProjectIndex {
                             )
                         })
                 }),
-            JavaExpression::New { type_name, .. } => Some(self.normalize_type_name(
-                &resolve_type_reference(bindings, type_name),
-                bindings.package.as_deref(),
-            )),
+            JavaExpression::Cast { type_name, .. } | JavaExpression::New { type_name, .. } => {
+                Some(self.normalize_type_name(
+                    &resolve_type_reference(bindings, type_name),
+                    bindings.package.as_deref(),
+                ))
+            }
             JavaExpression::Parenthesized(inner) => {
                 self.expression_type_at(path, byte_position, inner, bindings)
             }
@@ -1065,6 +1082,8 @@ fn collect_fields(
                 name: name.to_owned(),
                 type_name: owner,
                 is_static: true,
+                initializer: None,
+                initializer_source: None,
                 origin: origin_for(node, Some(name), path, artifact, version),
             });
         }
@@ -1085,11 +1104,14 @@ fn collect_fields(
                 if let Some(name_node) = declarator.child_by_field_name("name")
                     && let Ok(name) = node_text(name_node, source)
                 {
+                    let value = declarator.child_by_field_name("value");
                     fields.push(JavaField {
                         owner: owner.clone(),
                         name: name.to_owned(),
                         type_name: type_name.clone(),
                         is_static,
+                        initializer: value.map(|value| expression(value, source)),
+                        initializer_source: value.map(|value| node_source(value, source)),
                         origin: origin_for(declarator, Some(name), path, artifact, version),
                     });
                 }
@@ -1460,6 +1482,10 @@ pub fn substitute_references(
             array: Box::new(substitute_references(array, replacements)),
             index: Box::new(substitute_references(index, replacements)),
         },
+        JavaExpression::Cast { type_name, value } => JavaExpression::Cast {
+            type_name: type_name.clone(),
+            value: Box::new(substitute_references(value, replacements)),
+        },
         JavaExpression::Call {
             receiver,
             method,
@@ -1603,6 +1629,7 @@ fn expression(node: Node<'_>, source: &str) -> JavaExpression {
         "array_creation_expression" => expression_array_creation(node, source),
         "array_initializer" => expression_array_initializer(node, source, None),
         "array_access" => expression_array_access(node, source),
+        "cast_expression" => expression_cast(node, source),
         "decimal_integer_literal"
         | "hex_integer_literal"
         | "octal_integer_literal"
@@ -1652,6 +1679,19 @@ fn expression_array_initializer(
             .filter(|child| !is_comment_node(*child))
             .map(|child| expression(child, source))
             .collect(),
+    }
+}
+
+fn expression_cast(node: Node<'_>, source: &str) -> JavaExpression {
+    let (Some(type_node), Some(value)) = (
+        node.child_by_field_name("type"),
+        node.child_by_field_name("value"),
+    ) else {
+        return JavaExpression::Raw(node_source(node, source));
+    };
+    JavaExpression::Cast {
+        type_name: node_source(type_node, source),
+        value: Box::new(expression(value, source)),
     }
 }
 
@@ -2394,6 +2434,40 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("argument binding failed"))?;
         let substituted = super::substitute_references(&method.returns[0].expression, &bindings);
         assert!(matches!(substituted, super::JavaExpression::Binary { .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn retains_static_field_initializer_and_cast_ir() -> anyhow::Result<()> {
+        let source = r"
+            package demo;
+            class Constants {
+                static final int BASE = 32;
+                static final int HALF = (int) BASE / 2;
+            }
+        ";
+        let analysis = analyze_source("Constants.java", "demo", None, source)?;
+        let mut index = super::JavaProjectIndex::default();
+        index.add_analysis(&analysis);
+        let base = index
+            .resolve_field("demo.Constants", "BASE", Some(true))
+            .ok_or_else(|| anyhow::anyhow!("BASE field missing"))?;
+        assert!(matches!(
+            base.initializer,
+            Some(super::JavaExpression::Literal(ref value)) if value == "32"
+        ));
+        let half = index
+            .resolve_field("demo.Constants", "HALF", Some(true))
+            .ok_or_else(|| anyhow::anyhow!("HALF field missing"))?;
+        assert!(matches!(
+            half.initializer,
+            Some(super::JavaExpression::Binary { .. })
+        ));
+        assert!(
+            half.initializer_source
+                .as_deref()
+                .is_some_and(|source| source.contains("(int) BASE"))
+        );
         Ok(())
     }
 

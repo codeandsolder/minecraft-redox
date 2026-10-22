@@ -1,6 +1,7 @@
 //! GTNH-specific semantic recognizers built on Minecraft Redox Java structure.
 
 mod recipe_expression;
+mod scalar_expression;
 mod target_recipe;
 
 pub use recipe_expression::{FluidSemantic, ItemSemantic, RecoveredExpression};
@@ -13,9 +14,10 @@ use minecraft_redox_java::{
     JavaAnalysis, JavaBindings, JavaCall, JavaCallChain, JavaExpression, JavaProjectIndex,
 };
 use recipe_expression::{
-    duration_ticks, recover_fluids, recover_fluids_with_project, recover_item_inputs,
+    duration_ticks, literal_i64, recover_fluids, recover_fluids_with_project, recover_item_inputs,
     recover_item_inputs_with_project, recover_items, recover_items_with_project,
 };
+use scalar_expression::scalar_i64;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -53,6 +55,7 @@ pub struct RecipeDefinition {
     pub duration_ticks: Option<i64>,
     pub eut: Option<String>,
     pub eut_expression: Option<JavaExpression>,
+    pub eut_value: Option<i64>,
     pub special_value: Option<String>,
     pub special: Option<String>,
     pub metadata: Vec<BuilderCall>,
@@ -302,6 +305,7 @@ fn recognize_recipe(
         duration_ticks: None,
         eut: None,
         eut_expression: None,
+        eut_value: None,
         special_value: None,
         special: None,
         metadata: Vec::new(),
@@ -366,7 +370,7 @@ fn recognize_recipe(
             "inputChances" => recipe.input_chances.extend(call.arguments.clone()),
             "outputChances" => recipe.output_chances.extend(call.arguments.clone()),
             "duration" => set_duration(&mut recipe, call, bindings),
-            "eut" => set_eut(&mut recipe, call),
+            "eut" => set_eut(&mut recipe, call, bindings, project),
             "specialValue" => recipe.special_value = one_argument(call),
             "special" => recipe.special = one_argument(call),
             "metadata" | "recipeCategory" => recipe.metadata.push(call.into()),
@@ -386,9 +390,20 @@ fn set_duration(recipe: &mut RecipeDefinition, call: &JavaCall, bindings: &JavaB
         one_expression(call).and_then(|expression| duration_ticks(expression, bindings));
 }
 
-fn set_eut(recipe: &mut RecipeDefinition, call: &JavaCall) {
+fn set_eut(
+    recipe: &mut RecipeDefinition,
+    call: &JavaCall,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+) {
     recipe.eut = one_argument(call);
     recipe.eut_expression = one_expression(call).cloned();
+    recipe.eut_value = one_expression(call).and_then(|expression| {
+        project.map_or_else(
+            || literal_i64(expression),
+            |project| scalar_i64(expression, bindings, project),
+        )
+    });
 }
 
 fn recognize_material(chain: &JavaCallChain) -> Option<MaterialDefinition> {
