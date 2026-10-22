@@ -112,12 +112,19 @@ pub struct JavaParameter {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct JavaReturn {
+    pub expression: JavaExpression,
+    pub origin: SourceOrigin,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct JavaMethod {
     pub owner: String,
     pub name: String,
     pub return_type: String,
     pub parameters: Vec<JavaParameter>,
     pub is_static: bool,
+    pub returns: Vec<JavaReturn>,
     pub origin: SourceOrigin,
 }
 
@@ -147,6 +154,25 @@ impl JavaMethod {
             }
             _ => arity == self.parameters.len(),
         }
+    }
+
+    #[must_use]
+    pub fn argument_bindings(
+        &self,
+        arguments: &[JavaExpression],
+    ) -> Option<BTreeMap<String, JavaExpression>> {
+        if self.parameters.iter().any(|parameter| parameter.varargs)
+            || self.parameters.len() != arguments.len()
+        {
+            return None;
+        }
+        Some(
+            self.parameters
+                .iter()
+                .zip(arguments)
+                .map(|(parameter, argument)| (parameter.name.clone(), argument.clone()))
+                .collect(),
+        )
     }
 }
 
@@ -420,12 +446,17 @@ fn method_from_node(
     let owner = enclosing_type_name(node, source, bindings)?;
     let parameters = method_parameters(parameters_node, source, bindings);
     let is_static = method_is_static(node, source);
+    let mut returns = Vec::new();
+    if let Some(body) = node.child_by_field_name("body") {
+        collect_returns(body, source, path, artifact, version, &name, &mut returns);
+    }
     Some(JavaMethod {
         owner,
         name: name.clone(),
         return_type,
         parameters,
         is_static,
+        returns,
         origin: origin_for(node, Some(&name), path, artifact, version),
     })
 }
@@ -516,6 +547,96 @@ fn method_is_static(node: Node<'_>, source: &str) -> bool {
         .find(|child| child.kind() == "modifiers")
         .and_then(|modifiers| node_text(modifiers, source).ok())
         .is_some_and(|modifiers| modifiers.split_whitespace().any(|token| token == "static"))
+}
+
+fn collect_returns(
+    node: Node<'_>,
+    source: &str,
+    path: &str,
+    artifact: &str,
+    version: Option<&str>,
+    symbol: &str,
+    returns: &mut Vec<JavaReturn>,
+) {
+    if node.kind() == "return_statement" {
+        if let Some(value) = node.named_child(0) {
+            returns.push(JavaReturn {
+                expression: expression(value, source),
+                origin: origin_for(node, Some(symbol), path, artifact, version),
+            });
+        }
+        return;
+    }
+    if matches!(
+        node.kind(),
+        "lambda_expression"
+            | "class_declaration"
+            | "interface_declaration"
+            | "enum_declaration"
+            | "record_declaration"
+            | "method_declaration"
+            | "constructor_declaration"
+    ) {
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_returns(child, source, path, artifact, version, symbol, returns);
+    }
+}
+
+/// Replace syntactic reference expressions that match supplied bindings.
+///
+/// This is deliberately not name resolution. It is used after a call target has
+/// already been linked to substitute formal parameters with actual arguments.
+#[must_use]
+pub fn substitute_references(
+    expression: &JavaExpression,
+    replacements: &BTreeMap<String, JavaExpression>,
+) -> JavaExpression {
+    match expression {
+        JavaExpression::Reference(reference) => replacements
+            .get(reference)
+            .cloned()
+            .unwrap_or_else(|| expression.clone()),
+        JavaExpression::Call {
+            receiver,
+            method,
+            arguments,
+        } => JavaExpression::Call {
+            receiver: receiver
+                .as_ref()
+                .map(|value| Box::new(substitute_references(value, replacements))),
+            method: method.clone(),
+            arguments: arguments
+                .iter()
+                .map(|value| substitute_references(value, replacements))
+                .collect(),
+        },
+        JavaExpression::New {
+            type_name,
+            arguments,
+        } => JavaExpression::New {
+            type_name: type_name.clone(),
+            arguments: arguments
+                .iter()
+                .map(|value| substitute_references(value, replacements))
+                .collect(),
+        },
+        JavaExpression::Binary {
+            left,
+            operator,
+            right,
+        } => JavaExpression::Binary {
+            left: Box::new(substitute_references(left, replacements)),
+            operator: operator.clone(),
+            right: Box::new(substitute_references(right, replacements)),
+        },
+        JavaExpression::Parenthesized(inner) => {
+            JavaExpression::Parenthesized(Box::new(substitute_references(inner, replacements)))
+        }
+        JavaExpression::Literal(_) | JavaExpression::Raw(_) => expression.clone(),
+    }
 }
 
 fn collect_outer_call_chains(
@@ -830,6 +951,7 @@ mod tests {
             "net.minecraft.item.ItemStack"
         );
         assert!(analysis.methods[0].is_static);
+        assert_eq!(analysis.methods[0].returns.len(), 1);
         assert_eq!(
             analysis.methods[0].stable_id(),
             "demo.Factory#get(String,int)"
@@ -843,6 +965,27 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("two-argument overload not resolved"))?;
         assert_eq!(method.parameters.len(), 2);
         assert_eq!(method.return_type, "net.minecraft.item.ItemStack");
+        Ok(())
+    }
+
+    #[test]
+    fn substitutes_method_parameters_in_return_expression() -> anyhow::Result<()> {
+        let source = r"
+            class Factory {
+                static int twice(int amount) { return amount * 2; }
+            }
+        ";
+        let analysis = analyze_source("Factory.java", "demo", None, source)?;
+        let method = analysis
+            .methods
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("method missing"))?;
+        let arguments = [super::JavaExpression::Literal(String::from("7"))];
+        let bindings = method
+            .argument_bindings(&arguments)
+            .ok_or_else(|| anyhow::anyhow!("argument binding failed"))?;
+        let substituted = super::substitute_references(&method.returns[0].expression, &bindings);
+        assert!(matches!(substituted, super::JavaExpression::Binary { .. }));
         Ok(())
     }
 

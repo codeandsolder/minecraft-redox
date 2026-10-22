@@ -89,3 +89,9 @@ The Java frontend now inventories method owners, return types, parameters, varar
 Local calls are linked only when `(source file, method name, arity)` identifies exactly one compatible method. Ambiguous overloads remain unresolved. A linked method returning `ItemStack` is recorded as a `LocalMethod` semantic with its stable signature, but is **not** counted as a fully resolved item meaning until its body is understood.
 
 On GT5 this links 431 recipe item expressions while preserving the previous 14,546 directly understood item semantics. `ComponentAssemblyLineLoader` accounts for 421 of those links: 299 calls to `get(OrePrefixes,Object,int)` and 122 calls to `get(ItemList,int)`. This is the intended handoff to method-body lowering rather than another name heuristic.
+
+### Method return IR and safe inlining
+
+Indexed Java methods now retain generic IR for their return expressions. For an unambiguous local call with exactly one return, minecraft-redox binds actual arguments to formal parameters, substitutes those references in the return expression, and feeds the substituted expression back through the ordinary semantic recognizers.
+
+This is deliberately much weaker than arbitrary Java inlining: nested lambda/type returns are excluded, varargs are not substituted, and multi-return methods remain linked rather than guessed. On GT5 this converts 132 of the 431 linked item helpers into directly recovered semantics. The remaining 299 links are the branchy `ComponentAssemblyLineLoader#get(OrePrefixes,Object,int)` calls and stay explicit until control-flow/type evidence can determine their outcomes.

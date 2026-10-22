@@ -1,4 +1,4 @@
-use minecraft_redox_java::{JavaBindings, JavaExpression, JavaProjectIndex};
+use minecraft_redox_java::{JavaBindings, JavaExpression, JavaProjectIndex, substitute_references};
 use serde::Serialize;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -55,6 +55,10 @@ pub enum ItemSemantic {
         return_type: String,
         arguments: Vec<JavaExpression>,
     },
+    InlinedLocalMethod {
+        method_id: String,
+        result: Box<ItemSemantic>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -103,7 +107,7 @@ pub fn recover_items_with_project(
 ) -> Vec<RecoveredExpression<ItemSemantic>> {
     recover_values(sources, expressions, |expression| {
         item_semantic(expression, bindings)
-            .or_else(|| local_item_semantic(expression, project, source_path))
+            .or_else(|| local_item_semantic(expression, bindings, project, source_path))
     })
 }
 
@@ -165,6 +169,7 @@ fn item_semantic(expression: &JavaExpression, bindings: &JavaBindings) -> Option
 
 fn local_item_semantic(
     expression: &JavaExpression,
+    bindings: &JavaBindings,
     project: &JavaProjectIndex,
     source_path: &str,
 ) -> Option<ItemSemantic> {
@@ -180,8 +185,20 @@ fn local_item_semantic(
     if !resolved.return_type.ends_with("ItemStack") {
         return None;
     }
+    let method_id = resolved.stable_id();
+    if resolved.returns.len() == 1
+        && let Some(replacements) = resolved.argument_bindings(arguments)
+    {
+        let substituted = substitute_references(&resolved.returns[0].expression, &replacements);
+        if let Some(result) = item_semantic(&substituted, bindings) {
+            return Some(ItemSemantic::InlinedLocalMethod {
+                method_id,
+                result: Box::new(result),
+            });
+        }
+    }
     Some(ItemSemantic::LocalMethod {
-        method_id: resolved.stable_id(),
+        method_id,
         return_type: resolved.return_type.clone(),
         arguments: arguments.clone(),
     })
@@ -580,6 +597,37 @@ mod tests {
             return Err(anyhow::anyhow!("local method was not linked"));
         };
         assert_eq!(method_id, "R#get(String,int)");
+        Ok(())
+    }
+
+    #[test]
+    fn inlines_single_return_local_item_helper() -> anyhow::Result<()> {
+        let source = r"
+            import gregtech.api.enums.ItemList;
+            import gregtech.api.util.GTUtility;
+            import net.minecraft.item.ItemStack;
+            class R {
+                static ItemStack oversized(ItemList item, int amount) {
+                    return GTUtility.copyAmountUnsafe(amount, item.get(1));
+                }
+                void run() { builder.itemInputs(oversized(ItemList.Cell_Water, 48)); }
+            }
+        ";
+        let analysis = analyze_source("R.java", "gt5", None, source)?;
+        let mut project = minecraft_redox_java::JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let items = recipe_call(&analysis, "itemInputs")?;
+        let recovered = super::recover_items_with_project(
+            &items.arguments,
+            &items.argument_expressions,
+            &analysis.bindings,
+            &project,
+            "R.java",
+        );
+        let Some(ItemSemantic::InlinedLocalMethod { result, .. }) = &recovered[0].semantic else {
+            return Err(anyhow::anyhow!("local method body was not inlined"));
+        };
+        assert!(matches!(result.as_ref(), ItemSemantic::CopyAmount { .. }));
         Ok(())
     }
 
