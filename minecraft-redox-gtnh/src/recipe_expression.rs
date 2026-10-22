@@ -50,6 +50,13 @@ pub enum ItemSemantic {
     OreDictStack {
         arguments: Vec<JavaExpression>,
     },
+    OreDictAlternativeInput {
+        key: JavaExpression,
+        amount: JavaExpression,
+    },
+    ExplicitAlternatives {
+        alternatives: Vec<JavaExpression>,
+    },
     LinkedMethod {
         method_id: String,
         return_type: String,
@@ -101,6 +108,35 @@ pub fn recover_items(
 ) -> Vec<RecoveredExpression<ItemSemantic>> {
     recover_values(sources, expressions, |expression| {
         item_semantic(expression, bindings)
+    })
+}
+
+#[must_use]
+pub fn recover_item_inputs(
+    sources: &[String],
+    expressions: &[JavaExpression],
+    bindings: &JavaBindings,
+) -> Vec<RecoveredExpression<ItemSemantic>> {
+    recover_values(sources, expressions, |expression| {
+        recipe_input_semantic(expression, bindings).or_else(|| item_semantic(expression, bindings))
+    })
+}
+
+#[must_use]
+pub fn recover_item_inputs_with_project(
+    sources: &[String],
+    expressions: &[JavaExpression],
+    bindings: &JavaBindings,
+    project: &JavaProjectIndex,
+    source_path: &str,
+    byte_position: usize,
+) -> Vec<RecoveredExpression<ItemSemantic>> {
+    recover_values(sources, expressions, |expression| {
+        recipe_input_semantic(expression, bindings)
+            .or_else(|| item_semantic(expression, bindings))
+            .or_else(|| {
+                project_item_semantic(expression, bindings, project, source_path, byte_position)
+            })
     })
 }
 
@@ -169,6 +205,31 @@ where
             semantic: classify(expression),
         })
         .collect()
+}
+
+fn recipe_input_semantic(
+    expression: &JavaExpression,
+    bindings: &JavaBindings,
+) -> Option<ItemSemantic> {
+    let JavaExpression::Array {
+        element_type: Some(element_type),
+        elements,
+    } = expression
+    else {
+        return None;
+    };
+    let resolved_type = bindings.resolve_reference(element_type);
+    let simple_type = resolved_type.rsplit('.').next().unwrap_or(&resolved_type);
+    match simple_type {
+        "Object" if elements.len() == 2 => Some(ItemSemantic::OreDictAlternativeInput {
+            key: elements[0].clone(),
+            amount: elements[1].clone(),
+        }),
+        "ItemStack" => Some(ItemSemantic::ExplicitAlternatives {
+            alternatives: elements.clone(),
+        }),
+        _ => None,
+    }
 }
 
 fn item_semantic(expression: &JavaExpression, bindings: &JavaBindings) -> Option<ItemSemantic> {
@@ -573,7 +634,7 @@ fn known_integer_constant(reference: &str) -> Option<i64> {
 mod tests {
     use super::{
         FluidSemantic, ItemSemantic, duration_ticks, parse_integer_literal, recover_fluids,
-        recover_fluids_with_project, recover_items,
+        recover_fluids_with_project, recover_item_inputs, recover_items,
     };
     use minecraft_redox_java::{JavaExpression, analyze_source};
 
@@ -784,6 +845,44 @@ mod tests {
             recovered[0].semantic,
             Some(ItemSemantic::OreDictStack { .. })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn interprets_gt_recipe_input_arrays_only_in_input_context() -> anyhow::Result<()> {
+        let source = r#"
+            import net.minecraft.init.Blocks;
+            import net.minecraft.item.ItemStack;
+            class R { void run() {
+                builder.itemInputs(
+                    new Object[] { "circuitUV", 4 },
+                    new ItemStack[] { new ItemStack(Blocks.dirt, 1) });
+                builder.itemOutputs(new ItemStack[] { new ItemStack(Blocks.stone, 1) });
+            }}
+        "#;
+        let analysis = analyze_source("R.java", "gt5", None, source)?;
+        let inputs = recipe_call(&analysis, "itemInputs")?;
+        let recovered = recover_item_inputs(
+            &inputs.arguments,
+            &inputs.argument_expressions,
+            &analysis.bindings,
+        );
+        assert!(matches!(
+            recovered[0].semantic,
+            Some(ItemSemantic::OreDictAlternativeInput { .. })
+        ));
+        assert!(matches!(
+            recovered[1].semantic,
+            Some(ItemSemantic::ExplicitAlternatives { .. })
+        ));
+
+        let outputs = recipe_call(&analysis, "itemOutputs")?;
+        let recovered = recover_items(
+            &outputs.arguments,
+            &outputs.argument_expressions,
+            &analysis.bindings,
+        );
+        assert!(recovered[0].semantic.is_none());
         Ok(())
     }
 

@@ -40,6 +40,14 @@ pub enum JavaExpression {
         receiver: Box<JavaExpression>,
         field: String,
     },
+    Array {
+        element_type: Option<String>,
+        elements: Vec<JavaExpression>,
+    },
+    ArrayAccess {
+        array: Box<JavaExpression>,
+        index: Box<JavaExpression>,
+    },
     Literal(String),
     Call {
         receiver: Option<Box<JavaExpression>>,
@@ -410,7 +418,7 @@ impl JavaProjectIndex {
         match expression {
             JavaExpression::Reference(reference) => self
                 .reference_type_at(path, byte_position, reference)
-                .map(|type_name| self.normalize_owner_name(type_name, bindings.package.as_deref()))
+                .map(|type_name| self.normalize_type_name(type_name, bindings.package.as_deref()))
                 .or_else(|| self.imported_static_field_type(bindings, reference)),
             JavaExpression::FieldAccess { receiver, field } => {
                 let (owner, is_static) = match receiver.as_ref() {
@@ -427,21 +435,29 @@ impl JavaProjectIndex {
                     ),
                 };
                 let resolved = self.resolve_field(&owner, field, Some(is_static))?;
-                Some(self.normalize_owner_name(
+                Some(self.normalize_type_name(
                     &resolved.type_name,
                     resolved.owner.rsplit_once('.').map(|(package, _)| package),
                 ))
             }
+            JavaExpression::Array { element_type, .. } => element_type
+                .as_ref()
+                .map(|type_name| format!("{}[]", resolve_type_reference(bindings, type_name))),
+            JavaExpression::ArrayAccess { array, .. } => {
+                let array_type = self.expression_type_at(path, byte_position, array, bindings)?;
+                let element_type = array_element_type(&array_type)?;
+                Some(self.normalize_owner_name(element_type, bindings.package.as_deref()))
+            }
             JavaExpression::Call { .. } => self
                 .resolve_call_at(path, byte_position, expression, bindings)
                 .map(|(method, _)| {
-                    self.normalize_owner_name(
+                    self.normalize_type_name(
                         &method.return_type,
                         method.owner.rsplit_once('.').map(|(package, _)| package),
                     )
                 }),
-            JavaExpression::New { type_name, .. } => Some(self.normalize_owner_name(
-                &bindings.resolve_reference(type_name),
+            JavaExpression::New { type_name, .. } => Some(self.normalize_type_name(
+                &resolve_type_reference(bindings, type_name),
                 bindings.package.as_deref(),
             )),
             JavaExpression::Parenthesized(inner) => {
@@ -483,7 +499,7 @@ impl JavaProjectIndex {
             && let Some((owner, field_name)) = path.rsplit_once('.')
         {
             let field = self.resolve_field(owner, field_name, Some(true))?;
-            return Some(self.normalize_owner_name(
+            return Some(self.normalize_type_name(
                 &field.type_name,
                 field.owner.rsplit_once('.').map(|(package, _)| package),
             ));
@@ -497,7 +513,7 @@ impl JavaProjectIndex {
         if fields.next().is_some() {
             return None;
         }
-        Some(self.normalize_owner_name(
+        Some(self.normalize_type_name(
             &field.type_name,
             field.owner.rsplit_once('.').map(|(package, _)| package),
         ))
@@ -511,6 +527,20 @@ impl JavaProjectIndex {
         let resolved = bindings.resolve_reference(reference);
         let normalized = self.normalize_owner_name(&resolved, bindings.package.as_deref());
         self.has_owner(&normalized).then_some(normalized)
+    }
+
+    fn normalize_type_name(&self, type_name: &str, package: Option<&str>) -> String {
+        let mut base = type_name.trim();
+        let mut dimensions = 0usize;
+        while let Some(stripped) = base.strip_suffix("[]") {
+            dimensions += 1;
+            base = stripped.trim_end();
+        }
+        let mut normalized = self.normalize_owner_name(base, package);
+        for _ in 0..dimensions {
+            normalized.push_str("[]");
+        }
+        normalized
     }
 
     fn normalize_owner_name(&self, type_name: &str, package: Option<&str>) -> String {
@@ -603,6 +633,24 @@ impl JavaProjectIndex {
             .find(|parameter| parameter.name == parameter_name)
             .map(|parameter| parameter.type_name.as_str())
     }
+}
+
+fn resolve_type_reference(bindings: &JavaBindings, type_name: &str) -> String {
+    let mut base = type_name.trim();
+    let mut dimensions = 0usize;
+    while let Some(stripped) = base.strip_suffix("[]") {
+        dimensions += 1;
+        base = stripped.trim_end();
+    }
+    let mut resolved = bindings.resolve_reference(base);
+    for _ in 0..dimensions {
+        resolved.push_str("[]");
+    }
+    resolved
+}
+
+fn array_element_type(type_name: &str) -> Option<&str> {
+    type_name.trim().strip_suffix("[]").map(str::trim_end)
 }
 
 fn erase_java_type_syntax(type_name: &str) -> String {
@@ -865,7 +913,7 @@ fn collect_fields(
             && let Ok(type_name) = node_text(type_node, source)
             && let Some(owner) = enclosing_type_name(node, source, bindings)
         {
-            let type_name = bindings.resolve_reference(type_name.trim());
+            let type_name = resolve_type_reference(bindings, type_name.trim());
             let is_static = declaration_is_static(node, source);
             let mut cursor = node.walk();
             for declarator in node
@@ -931,7 +979,8 @@ fn method_from_node(
     let return_type_node = node.child_by_field_name("type")?;
     let parameters_node = node.child_by_field_name("parameters")?;
     let name = node_text(name_node, source).ok()?.to_owned();
-    let return_type = bindings.resolve_reference(node_text(return_type_node, source).ok()?.trim());
+    let return_type =
+        resolve_type_reference(bindings, node_text(return_type_node, source).ok()?.trim());
     let owner = enclosing_type_name(node, source, bindings)?;
     let parameters = method_parameters(parameters_node, source, bindings);
     let is_static = method_is_static(node, source);
@@ -975,7 +1024,10 @@ fn parameter_from_node(
             let type_node = parameter.child_by_field_name("type")?;
             let name_node = parameter.child_by_field_name("name")?;
             Some(JavaParameter {
-                type_name: bindings.resolve_reference(node_text(type_node, source).ok()?.trim()),
+                type_name: resolve_type_reference(
+                    bindings,
+                    node_text(type_node, source).ok()?.trim(),
+                ),
                 name: node_text(name_node, source).ok()?.to_owned(),
                 varargs: false,
             })
@@ -1055,7 +1107,7 @@ fn collect_local_variables(
         if let Some(type_node) = node.child_by_field_name("type")
             && let Ok(type_name) = node_text(type_node, source)
         {
-            let type_name = bindings.resolve_reference(type_name.trim());
+            let type_name = resolve_type_reference(bindings, type_name.trim());
             let scope_end_byte = lexical_scope_end(node);
             let mut cursor = node.walk();
             for declarator in node
@@ -1167,6 +1219,20 @@ pub fn substitute_references(
         JavaExpression::FieldAccess { receiver, field } => JavaExpression::FieldAccess {
             receiver: Box::new(substitute_references(receiver, replacements)),
             field: field.clone(),
+        },
+        JavaExpression::Array {
+            element_type,
+            elements,
+        } => JavaExpression::Array {
+            element_type: element_type.clone(),
+            elements: elements
+                .iter()
+                .map(|value| substitute_references(value, replacements))
+                .collect(),
+        },
+        JavaExpression::ArrayAccess { array, index } => JavaExpression::ArrayAccess {
+            array: Box::new(substitute_references(array, replacements)),
+            index: Box::new(substitute_references(index, replacements)),
         },
         JavaExpression::Call {
             receiver,
@@ -1305,6 +1371,9 @@ fn expression(node: Node<'_>, source: &str) -> JavaExpression {
     match node.kind() {
         "identifier" | "scoped_identifier" => JavaExpression::Reference(node_source(node, source)),
         "field_access" => expression_field_access(node, source),
+        "array_creation_expression" => expression_array_creation(node, source),
+        "array_initializer" => expression_array_initializer(node, source, None),
+        "array_access" => expression_array_access(node, source),
         "decimal_integer_literal"
         | "hex_integer_literal"
         | "octal_integer_literal"
@@ -1324,6 +1393,48 @@ fn expression(node: Node<'_>, source: &str) -> JavaExpression {
             |child| JavaExpression::Parenthesized(Box::new(expression(child, source))),
         ),
         _ => JavaExpression::Raw(node_source(node, source)),
+    }
+}
+
+fn expression_array_creation(node: Node<'_>, source: &str) -> JavaExpression {
+    let Some(type_node) = node.child_by_field_name("type") else {
+        return JavaExpression::Raw(node_source(node, source));
+    };
+    let element_type = node_source(type_node, source);
+    node.child_by_field_name("value").map_or_else(
+        || JavaExpression::Array {
+            element_type: Some(element_type.clone()),
+            elements: Vec::new(),
+        },
+        |initializer| expression_array_initializer(initializer, source, Some(element_type.clone())),
+    )
+}
+
+fn expression_array_initializer(
+    node: Node<'_>,
+    source: &str,
+    element_type: Option<String>,
+) -> JavaExpression {
+    let mut cursor = node.walk();
+    JavaExpression::Array {
+        element_type,
+        elements: node
+            .named_children(&mut cursor)
+            .map(|child| expression(child, source))
+            .collect(),
+    }
+}
+
+fn expression_array_access(node: Node<'_>, source: &str) -> JavaExpression {
+    let (Some(array), Some(index)) = (
+        node.child_by_field_name("array"),
+        node.child_by_field_name("index"),
+    ) else {
+        return JavaExpression::Raw(node_source(node, source));
+    };
+    JavaExpression::ArrayAccess {
+        array: Box::new(expression(array, source)),
+        index: Box::new(expression(index, source)),
     }
 }
 
@@ -1607,6 +1718,64 @@ mod tests {
         assert_eq!(
             index.reference_type_at("Factory.java", position, "parameter"),
             Some("Widget")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parses_array_creation_and_access_structurally() -> anyhow::Result<()> {
+        let source = r#"
+            package demo;
+            import net.minecraft.item.ItemStack;
+            class Recipe {
+                static final ItemStack[] ITEMS = new ItemStack[4];
+                void run() {
+                    sink(new Object[] { "dustIron", 4 });
+                    sink(new ItemStack[] { ITEMS[0], ITEMS[1] });
+                }
+            }
+        "#;
+        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
+        let sink_calls: Vec<_> = analysis
+            .call_chains
+            .iter()
+            .flat_map(|chain| &chain.calls)
+            .filter(|call| call.name == "sink")
+            .collect();
+        assert_eq!(sink_calls.len(), 2);
+        let Some(super::JavaExpression::Array {
+            element_type: Some(element_type),
+            elements,
+        }) = sink_calls[0].argument_expressions.first()
+        else {
+            return Err(anyhow::anyhow!("Object array was not structural"));
+        };
+        assert_eq!(element_type, "Object");
+        assert_eq!(elements.len(), 2);
+
+        let Some(super::JavaExpression::Array {
+            element_type: Some(element_type),
+            elements,
+        }) = sink_calls[1].argument_expressions.first()
+        else {
+            return Err(anyhow::anyhow!("ItemStack array was not structural"));
+        };
+        assert_eq!(element_type, "ItemStack");
+        assert!(matches!(
+            elements.first(),
+            Some(super::JavaExpression::ArrayAccess { .. })
+        ));
+
+        let mut index = super::JavaProjectIndex::default();
+        index.add_analysis(&analysis);
+        assert_eq!(
+            index.expression_type_at(
+                "Recipe.java",
+                sink_calls[1].byte_start,
+                &elements[0],
+                &analysis.bindings,
+            ),
+            Some(String::from("net.minecraft.item.ItemStack"))
         );
         Ok(())
     }

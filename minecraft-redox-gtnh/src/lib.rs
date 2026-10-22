@@ -9,8 +9,8 @@ use minecraft_redox_java::{
     JavaAnalysis, JavaBindings, JavaCall, JavaCallChain, JavaExpression, JavaProjectIndex,
 };
 use recipe_expression::{
-    duration_ticks, recover_fluids, recover_fluids_with_project, recover_items,
-    recover_items_with_project,
+    duration_ticks, recover_fluids, recover_fluids_with_project, recover_item_inputs,
+    recover_item_inputs_with_project, recover_items, recover_items_with_project,
 };
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -283,6 +283,7 @@ fn recognize_recipe(
                 bindings,
                 project,
                 &chain.origin.path,
+                true,
             ),
             "itemInputsUnsafe" => {
                 add_items(
@@ -292,6 +293,7 @@ fn recognize_recipe(
                     bindings,
                     project,
                     &chain.origin.path,
+                    true,
                 );
                 recipe.modifiers.push(call.into());
             }
@@ -302,6 +304,7 @@ fn recognize_recipe(
                 bindings,
                 project,
                 &chain.origin.path,
+                false,
             ),
             "fluidInputs" => add_fluids(
                 &mut recipe.fluid_inputs,
@@ -321,11 +324,7 @@ fn recognize_recipe(
             ),
             "inputChances" => recipe.input_chances.extend(call.arguments.clone()),
             "outputChances" => recipe.output_chances.extend(call.arguments.clone()),
-            "duration" => {
-                recipe.duration = one_argument(call);
-                recipe.duration_ticks = one_expression(call)
-                    .and_then(|expression| duration_ticks(expression, bindings));
-            }
+            "duration" => set_duration(&mut recipe, call, bindings),
             "eut" => recipe.eut = one_argument(call),
             "specialValue" => recipe.special_value = one_argument(call),
             "special" => recipe.special = one_argument(call),
@@ -338,6 +337,12 @@ fn recognize_recipe(
         }
     }
     Some(recipe)
+}
+
+fn set_duration(recipe: &mut RecipeDefinition, call: &JavaCall, bindings: &JavaBindings) {
+    recipe.duration = one_argument(call);
+    recipe.duration_ticks =
+        one_expression(call).and_then(|expression| duration_ticks(expression, bindings));
 }
 
 fn recognize_material(chain: &JavaCallChain) -> Option<MaterialDefinition> {
@@ -381,21 +386,29 @@ fn add_items(
     bindings: &JavaBindings,
     project: Option<&JavaProjectIndex>,
     source_path: &str,
+    input_context: bool,
 ) {
     raw.extend(call.arguments.clone());
-    let recovered = project.map_or_else(
-        || recover_items(&call.arguments, &call.argument_expressions, bindings),
-        |project| {
-            recover_items_with_project(
-                &call.arguments,
-                &call.argument_expressions,
-                bindings,
-                project,
-                source_path,
-                call.byte_start,
-            )
-        },
-    );
+    let recovered = match (project, input_context) {
+        (Some(project), true) => recover_item_inputs_with_project(
+            &call.arguments,
+            &call.argument_expressions,
+            bindings,
+            project,
+            source_path,
+            call.byte_start,
+        ),
+        (Some(project), false) => recover_items_with_project(
+            &call.arguments,
+            &call.argument_expressions,
+            bindings,
+            project,
+            source_path,
+            call.byte_start,
+        ),
+        (None, true) => recover_item_inputs(&call.arguments, &call.argument_expressions, bindings),
+        (None, false) => recover_items(&call.arguments, &call.argument_expressions, bindings),
+    };
     semantics.extend(recovered);
 }
 
