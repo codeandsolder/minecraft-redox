@@ -71,6 +71,9 @@ pub enum ItemSemantic {
         name: String,
         declared_type: String,
     },
+    TypedExpression {
+        expression_type: String,
+    },
     InlinedMethod {
         method_id: String,
         result: Box<ItemSemantic>,
@@ -125,8 +128,10 @@ pub fn recover_item_inputs(
     expressions: &[JavaExpression],
     bindings: &JavaBindings,
 ) -> Vec<RecoveredExpression<ItemSemantic>> {
+    let nested_array_is_slot = expressions.len() > 1;
     recover_values(sources, expressions, |expression| {
-        recipe_input_semantic(expression, bindings).or_else(|| item_semantic(expression, bindings))
+        recipe_input_semantic(expression, bindings, nested_array_is_slot)
+            .or_else(|| item_semantic(expression, bindings))
     })
 }
 
@@ -139,11 +144,19 @@ pub fn recover_item_inputs_with_project(
     source_path: &str,
     byte_position: usize,
 ) -> Vec<RecoveredExpression<ItemSemantic>> {
+    let nested_array_is_slot = expressions.len() > 1;
     recover_values(sources, expressions, |expression| {
-        recipe_input_semantic(expression, bindings)
+        recipe_input_semantic(expression, bindings, nested_array_is_slot)
             .or_else(|| item_semantic(expression, bindings))
             .or_else(|| {
-                project_item_semantic(expression, bindings, project, source_path, byte_position)
+                project_input_item_semantic(
+                    expression,
+                    bindings,
+                    project,
+                    source_path,
+                    byte_position,
+                    nested_array_is_slot,
+                )
             })
     })
 }
@@ -218,7 +231,11 @@ where
 fn recipe_input_semantic(
     expression: &JavaExpression,
     bindings: &JavaBindings,
+    nested_array_is_slot: bool,
 ) -> Option<ItemSemantic> {
+    if !nested_array_is_slot {
+        return None;
+    }
     let JavaExpression::Array {
         element_type: Some(element_type),
         elements,
@@ -261,6 +278,49 @@ fn item_semantic(expression: &JavaExpression, bindings: &JavaBindings) -> Option
     }
 }
 
+fn project_input_item_semantic(
+    expression: &JavaExpression,
+    bindings: &JavaBindings,
+    project: &JavaProjectIndex,
+    source_path: &str,
+    byte_position: usize,
+    nested_array_is_slot: bool,
+) -> Option<ItemSemantic> {
+    if nested_array_is_slot
+        && let JavaExpression::Call { arguments, .. } = expression
+        && let Some((resolved, receiver_type)) =
+            project.resolve_call_at(source_path, byte_position, expression, bindings)
+        && is_recipe_input_container_type(&resolved.return_type)
+    {
+        let method_id = resolved.stable_id();
+        if receiver_type.is_none()
+            && resolved.returns.len() == 1
+            && let Some(replacements) = resolved.argument_bindings(arguments)
+        {
+            let substituted = substitute_references(&resolved.returns[0].expression, &replacements);
+            if let Some(result) = recipe_input_semantic(&substituted, bindings, true)
+                .or_else(|| item_semantic(&substituted, bindings))
+            {
+                return Some(ItemSemantic::InlinedMethod {
+                    method_id,
+                    result: Box::new(result),
+                });
+            }
+        }
+        return Some(ItemSemantic::LinkedMethod {
+            method_id,
+            return_type: resolved.return_type.clone(),
+            receiver_type,
+            arguments: arguments.clone(),
+        });
+    }
+    project_item_semantic(expression, bindings, project, source_path, byte_position)
+}
+
+fn is_recipe_input_container_type(type_name: &str) -> bool {
+    type_name.ends_with("Object[]") || type_name.ends_with("ItemStack[]")
+}
+
 fn project_item_semantic(
     expression: &JavaExpression,
     bindings: &JavaBindings,
@@ -283,15 +343,33 @@ fn project_item_semantic(
             })
         }
         JavaExpression::Call { arguments, .. } => {
-            let (resolved, receiver_type) =
-                project.resolve_call_at(source_path, byte_position, expression, bindings)?;
-            linked_method_semantic(resolved, arguments, bindings, receiver_type)
+            if let Some((resolved, receiver_type)) =
+                project.resolve_call_at(source_path, byte_position, expression, bindings)
+                && let Some(semantic) =
+                    linked_method_semantic(resolved, arguments, bindings, receiver_type)
+            {
+                return Some(semantic);
+            }
+            typed_item_expression(expression, bindings, project, source_path, byte_position)
         }
         JavaExpression::Parenthesized(inner) => {
             project_item_semantic(inner, bindings, project, source_path, byte_position)
         }
-        _ => None,
+        _ => typed_item_expression(expression, bindings, project, source_path, byte_position),
     }
+}
+
+fn typed_item_expression(
+    expression: &JavaExpression,
+    bindings: &JavaBindings,
+    project: &JavaProjectIndex,
+    source_path: &str,
+    byte_position: usize,
+) -> Option<ItemSemantic> {
+    let expression_type =
+        project.expression_type_at(source_path, byte_position, expression, bindings)?;
+    is_item_value_type(&expression_type)
+        .then_some(ItemSemantic::TypedExpression { expression_type })
 }
 
 fn is_item_value_type(type_name: &str) -> bool {
@@ -872,6 +950,69 @@ mod tests {
         assert!(matches!(
             recovered[0].semantic,
             Some(ItemSemantic::OreDictStack { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn inlines_array_returning_input_helper_with_varargs_context() -> anyhow::Result<()> {
+        let source = r#"
+            import net.minecraft.init.Blocks;
+            import net.minecraft.item.ItemStack;
+            class R {
+                static Object[] alt(int amount) { return new Object[] { "dustIron", amount }; }
+                void run() {
+                    builder.itemInputs(new ItemStack(Blocks.dirt, 1), alt(4));
+                }
+            }
+        "#;
+        let analysis = analyze_source("R.java", "gt5", None, source)?;
+        let mut project = minecraft_redox_java::JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let inputs = recipe_call(&analysis, "itemInputs")?;
+        let recovered = recover_item_inputs_with_project(
+            &inputs.arguments,
+            &inputs.argument_expressions,
+            &analysis.bindings,
+            &project,
+            "R.java",
+            inputs.byte_start,
+        );
+        assert!(matches!(
+            &recovered[1].semantic,
+            Some(ItemSemantic::InlinedMethod { result, .. })
+                if matches!(result.as_ref(), ItemSemantic::OreDictAlternativeInput { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn links_typed_standard_collection_item_array() -> anyhow::Result<()> {
+        let source = r"
+            import java.util.List;
+            import net.minecraft.item.ItemStack;
+            class R {
+                void run(List<ItemStack> items) {
+                    builder.itemOutputs(items.toArray(new ItemStack[0]));
+                }
+            }
+        ";
+        let analysis = analyze_source("R.java", "gt5", None, source)?;
+        let mut project = minecraft_redox_java::JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let outputs = recipe_call(&analysis, "itemOutputs")?;
+        let recovered = super::recover_items_with_project(
+            &outputs.arguments,
+            &outputs.argument_expressions,
+            &analysis.bindings,
+            &project,
+            "R.java",
+            outputs.byte_start,
+        );
+        assert!(matches!(
+            &recovered[0].semantic,
+            Some(ItemSemantic::TypedExpression { expression_type })
+                if expression_type == "net.minecraft.item.ItemStack[]"
         ));
         Ok(())
     }

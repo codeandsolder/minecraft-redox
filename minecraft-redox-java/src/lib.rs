@@ -438,19 +438,20 @@ impl JavaProjectIndex {
                 .map(|type_name| self.normalize_type_name(type_name, bindings.package.as_deref()))
                 .or_else(|| self.imported_static_field_type(bindings, reference)),
             JavaExpression::FieldAccess { receiver, field } => {
-                let (owner, is_static) = match receiver.as_ref() {
-                    JavaExpression::Reference(reference)
-                        if self
-                            .reference_type_at(path, byte_position, reference)
-                            .is_none() =>
-                    {
-                        (self.class_owner_for_reference(bindings, reference)?, true)
+                let static_owner = qualified_reference_name(receiver).and_then(|reference| {
+                    let root = reference.split('.').next()?;
+                    if self.reference_type_at(path, byte_position, root).is_some() {
+                        return None;
                     }
-                    _ => (
-                        self.expression_type_at(path, byte_position, receiver, bindings)?,
-                        false,
-                    ),
-                };
+                    self.class_owner_for_reference(bindings, &reference)
+                });
+                let (owner, is_static) = static_owner.map_or_else(
+                    || {
+                        self.expression_type_at(path, byte_position, receiver, bindings)
+                            .map(|owner| (owner, false))
+                    },
+                    |owner| Some((owner, true)),
+                )?;
                 let resolved = self.resolve_field(&owner, field, Some(is_static))?;
                 Some(self.normalize_type_name(
                     &resolved.type_name,
@@ -465,13 +466,27 @@ impl JavaProjectIndex {
                 let element_type = array_element_type(&array_type)?;
                 Some(self.normalize_owner_name(element_type, bindings.package.as_deref()))
             }
-            JavaExpression::Call { .. } => self
-                .resolve_call_at(path, byte_position, expression, bindings)
-                .map(|(method, _)| {
-                    self.normalize_type_name(
-                        &method.return_type,
-                        method.owner.rsplit_once('.').map(|(package, _)| package),
-                    )
+            JavaExpression::Call {
+                receiver,
+                method,
+                arguments,
+            } => self
+                .standard_library_call_type(
+                    path,
+                    byte_position,
+                    receiver.as_deref(),
+                    method,
+                    arguments,
+                    bindings,
+                )
+                .or_else(|| {
+                    self.resolve_call_at(path, byte_position, expression, bindings)
+                        .map(|(resolved, _)| {
+                            self.normalize_type_name(
+                                &resolved.return_type,
+                                resolved.owner.rsplit_once('.').map(|(package, _)| package),
+                            )
+                        })
                 }),
             JavaExpression::New { type_name, .. } => Some(self.normalize_type_name(
                 &resolve_type_reference(bindings, type_name),
@@ -484,6 +499,42 @@ impl JavaProjectIndex {
                 None
             }
         }
+    }
+
+    fn standard_library_call_type(
+        &self,
+        path: &str,
+        byte_position: usize,
+        receiver: Option<&JavaExpression>,
+        method: &str,
+        arguments: &[JavaExpression],
+        bindings: &JavaBindings,
+    ) -> Option<String> {
+        if method != "toArray" || arguments.len() != 1 {
+            return None;
+        }
+        let receiver_type = self.expression_type_at(path, byte_position, receiver?, bindings)?;
+        let raw_receiver = erase_java_type_syntax(&receiver_type);
+        if !matches!(
+            raw_receiver.as_str(),
+            "java.util.Collection"
+                | "java.util.List"
+                | "java.util.ArrayList"
+                | "java.util.LinkedList"
+                | "java.util.Set"
+                | "java.util.HashSet"
+                | "java.util.LinkedHashSet"
+                | "java.util.SortedSet"
+                | "java.util.TreeSet"
+                | "java.util.Queue"
+                | "java.util.Deque"
+                | "java.util.ArrayDeque"
+        ) {
+            return None;
+        }
+        let argument_type =
+            self.expression_type_at(path, byte_position, arguments.first()?, bindings)?;
+        argument_type.ends_with("[]").then_some(argument_type)
     }
 
     fn resolve_static_import(
@@ -570,12 +621,14 @@ impl JavaProjectIndex {
         if self.has_owner(&type_name) {
             return type_name;
         }
-        if !type_name.contains('.')
-            && let Some(package) = package
-        {
-            let candidate = format!("{package}.{type_name}");
-            if self.has_owner(&candidate) {
-                return candidate;
+        if let Some(context) = package {
+            let mut prefix = Some(context);
+            while let Some(current) = prefix {
+                let candidate = format!("{current}.{type_name}");
+                if self.has_owner(&candidate) {
+                    return candidate;
+                }
+                prefix = current.rsplit_once('.').map(|(parent, _)| parent);
             }
         }
         type_name
@@ -736,7 +789,11 @@ fn resolve_type_reference(bindings: &JavaBindings, type_name: &str) -> String {
         dimensions += 1;
         base = stripped.trim_end();
     }
-    let mut resolved = bindings.resolve_reference(base);
+    let (raw_type, generic_suffix) = base
+        .find('<')
+        .map_or((base, ""), |index| (&base[..index], &base[index..]));
+    let mut resolved = bindings.resolve_reference(raw_type.trim());
+    resolved.push_str(generic_suffix);
     for _ in 0..dimensions {
         resolved.push_str("[]");
     }
@@ -923,6 +980,17 @@ fn strip_statement<'a>(text: &'a str, keyword: &str) -> Option<&'a str> {
         .map(str::trim)
 }
 
+fn qualified_reference_name(expression: &JavaExpression) -> Option<String> {
+    match expression {
+        JavaExpression::Reference(reference) => Some(reference.clone()),
+        JavaExpression::FieldAccess { receiver, field } => {
+            Some(format!("{}.{}", qualified_reference_name(receiver)?, field))
+        }
+        JavaExpression::Parenthesized(inner) => qualified_reference_name(inner),
+        _ => None,
+    }
+}
+
 fn is_java_reference(text: &str) -> bool {
     !text.is_empty()
         && text
@@ -1050,8 +1118,10 @@ fn collect_methods(
     bindings: &JavaBindings,
     methods: &mut Vec<JavaMethod>,
 ) {
-    if node.kind() == "method_declaration"
-        && let Some(method) = method_from_node(node, source, path, artifact, version, bindings)
+    if matches!(
+        node.kind(),
+        "method_declaration" | "constructor_declaration"
+    ) && let Some(method) = method_from_node(node, source, path, artifact, version, bindings)
     {
         methods.push(method);
     }
@@ -1070,14 +1140,20 @@ fn method_from_node(
     bindings: &JavaBindings,
 ) -> Option<JavaMethod> {
     let name_node = node.child_by_field_name("name")?;
-    let return_type_node = node.child_by_field_name("type")?;
     let parameters_node = node.child_by_field_name("parameters")?;
-    let name = node_text(name_node, source).ok()?.to_owned();
-    let return_type =
-        resolve_type_reference(bindings, node_text(return_type_node, source).ok()?.trim());
+    let source_name = node_text(name_node, source).ok()?.to_owned();
     let owner = enclosing_type_name(node, source, bindings)?;
+    let (name, return_type, is_static) = if node.kind() == "constructor_declaration" {
+        (String::from("<init>"), owner.clone(), false)
+    } else {
+        let return_type_node = node.child_by_field_name("type")?;
+        (
+            source_name.clone(),
+            resolve_type_reference(bindings, node_text(return_type_node, source).ok()?.trim()),
+            method_is_static(node, source),
+        )
+    };
     let parameters = method_parameters(parameters_node, source, bindings);
-    let is_static = method_is_static(node, source);
     let mut returns = Vec::new();
     let mut local_variables = Vec::new();
     if let Some(body) = node.child_by_field_name("body") {
@@ -1092,7 +1168,7 @@ fn method_from_node(
         local_variables,
         is_static,
         returns,
-        origin: origin_for(node, Some(&name), path, artifact, version),
+        origin: origin_for(node, Some(&source_name), path, artifact, version),
     })
 }
 
@@ -1156,6 +1232,7 @@ fn spread_parameter(
 }
 
 fn enclosing_type_name(node: Node<'_>, source: &str, bindings: &JavaBindings) -> Option<String> {
+    let mut names = Vec::new();
     let mut current = node.parent();
     while let Some(parent) = current {
         if matches!(
@@ -1167,16 +1244,21 @@ fn enclosing_type_name(node: Node<'_>, source: &str, bindings: &JavaBindings) ->
         ) && let Some(name_node) = parent.child_by_field_name("name")
             && let Ok(name) = node_text(name_node, source)
         {
-            return Some(
-                bindings
-                    .package
-                    .as_ref()
-                    .map_or_else(|| name.to_owned(), |package| format!("{package}.{name}")),
-            );
+            names.push(name.to_owned());
         }
         current = parent.parent();
     }
-    None
+    if names.is_empty() {
+        return None;
+    }
+    names.reverse();
+    let owner = names.join(".");
+    Some(
+        bindings
+            .package
+            .as_ref()
+            .map_or(owner.clone(), |package| format!("{package}.{owner}")),
+    )
 }
 
 fn method_is_static(node: Node<'_>, source: &str) -> bool {
@@ -1197,11 +1279,29 @@ fn collect_local_variables(
     bindings: &JavaBindings,
     variables: &mut Vec<JavaLocalVariable>,
 ) {
+    if node.kind() == "enhanced_for_statement" {
+        if let (Some(type_node), Some(name_node), Some(body)) = (
+            node.child_by_field_name("type"),
+            node.child_by_field_name("name"),
+            node.child_by_field_name("body"),
+        ) && let (Ok(type_name), Ok(name)) =
+            (node_text(type_node, source), node_text(name_node, source))
+        {
+            variables.push(JavaLocalVariable {
+                type_name: resolve_type_reference(bindings, type_name.trim()),
+                name: name.to_owned(),
+                declaration_byte: name_node.start_byte(),
+                scope_end_byte: body.end_byte(),
+            });
+            collect_local_variables(body, source, bindings, variables);
+        }
+        return;
+    }
     if node.kind() == "local_variable_declaration" {
         if let Some(type_node) = node.child_by_field_name("type")
             && let Ok(type_name) = node_text(type_node, source)
         {
-            let type_name = resolve_type_reference(bindings, type_name.trim());
+            let declared_type = resolve_type_reference(bindings, type_name.trim());
             let scope_end_byte = lexical_scope_end(node);
             let mut cursor = node.walk();
             for declarator in node
@@ -1211,8 +1311,14 @@ fn collect_local_variables(
                 if let Some(name_node) = declarator.child_by_field_name("name")
                     && let Ok(name) = node_text(name_node, source)
                 {
+                    let type_name = if declared_type == "var" {
+                        inferred_var_type(declarator, source, bindings)
+                            .unwrap_or_else(|| declared_type.clone())
+                    } else {
+                        declared_type.clone()
+                    };
                     variables.push(JavaLocalVariable {
-                        type_name: type_name.clone(),
+                        type_name,
                         name: name.to_owned(),
                         declaration_byte: declarator.start_byte(),
                         scope_end_byte,
@@ -1240,12 +1346,38 @@ fn collect_local_variables(
     }
 }
 
+fn inferred_var_type(
+    declarator: Node<'_>,
+    source: &str,
+    bindings: &JavaBindings,
+) -> Option<String> {
+    let value = declarator.child_by_field_name("value")?;
+    match value.kind() {
+        "object_creation_expression" => {
+            let type_node = value.child_by_field_name("type")?;
+            Some(resolve_type_reference(
+                bindings,
+                node_text(type_node, source).ok()?.trim(),
+            ))
+        }
+        "array_creation_expression" => {
+            let type_node = value.child_by_field_name("type")?;
+            Some(format!(
+                "{}[]",
+                resolve_type_reference(bindings, node_text(type_node, source).ok()?.trim())
+            ))
+        }
+        _ => None,
+    }
+}
+
 fn lexical_scope_end(node: Node<'_>) -> usize {
     let mut current = node.parent();
     while let Some(parent) = current {
         if matches!(
             parent.kind(),
             "block"
+                | "constructor_body"
                 | "for_statement"
                 | "enhanced_for_statement"
                 | "while_statement"
@@ -1886,6 +2018,43 @@ mod tests {
     }
 
     #[test]
+    fn infers_standard_collection_to_array_type() -> anyhow::Result<()> {
+        let source = r"
+            package demo;
+            import java.util.List;
+            import net.minecraft.item.ItemStack;
+            class Recipe {
+                void run(List<ItemStack> items) {
+                    sink(items.toArray(new ItemStack[0]));
+                }
+            }
+        ";
+        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
+        let mut index = super::JavaProjectIndex::default();
+        index.add_analysis(&analysis);
+        let sink = analysis
+            .call_chains
+            .iter()
+            .flat_map(|chain| &chain.calls)
+            .find(|call| call.name == "sink")
+            .ok_or_else(|| anyhow::anyhow!("sink call missing"))?;
+        let expression = sink
+            .argument_expressions
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("sink argument missing"))?;
+        assert_eq!(
+            index.expression_type_at(
+                "Recipe.java",
+                sink.byte_start,
+                expression,
+                &analysis.bindings
+            ),
+            Some(String::from("net.minecraft.item.ItemStack[]"))
+        );
+        Ok(())
+    }
+
+    #[test]
     fn resolves_recipe_value_provenance() -> anyhow::Result<()> {
         let source = r"
             package demo;
@@ -2018,6 +2187,150 @@ mod tests {
             assert_eq!(resolved.name, "get");
             assert_eq!(receiver_type.as_deref(), Some("demo.Holder"));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn infers_var_type_from_direct_constructor_initializer() -> anyhow::Result<()> {
+        let source = r"
+            package demo;
+            class OreDictItemStack { void marker() {} }
+            class Recipe {
+                void run() {
+                    var input = new OreDictItemStack();
+                    sink(input);
+                }
+            }
+        ";
+        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
+        let mut index = super::JavaProjectIndex::default();
+        index.add_analysis(&analysis);
+        let sink = analysis
+            .call_chains
+            .iter()
+            .flat_map(|chain| &chain.calls)
+            .find(|call| call.name == "sink")
+            .ok_or_else(|| anyhow::anyhow!("sink call missing"))?;
+        let value = index
+            .resolve_value_at("Recipe.java", sink.byte_start, "input", &analysis.bindings)
+            .ok_or_else(|| anyhow::anyhow!("inferred var missing"))?;
+        assert_eq!(value.type_name, "demo.OreDictItemStack");
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_values_inside_constructor_scope() -> anyhow::Result<()> {
+        let source = r"
+            package demo;
+            import net.minecraft.item.ItemStack;
+            class Recipe {
+                Recipe(ItemStack parameter) {
+                    ItemStack local = parameter;
+                    sink(parameter);
+                    sink(local);
+                }
+            }
+        ";
+        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
+        let mut index = super::JavaProjectIndex::default();
+        index.add_analysis(&analysis);
+        let calls: Vec<_> = analysis
+            .call_chains
+            .iter()
+            .flat_map(|chain| &chain.calls)
+            .filter(|call| call.name == "sink")
+            .collect();
+        assert_eq!(calls.len(), 2);
+        for (call, expected) in calls.iter().zip(["parameter", "local"]) {
+            let value = index
+                .resolve_value_at("Recipe.java", call.byte_start, expected, &analysis.bindings)
+                .ok_or_else(|| anyhow::anyhow!("constructor value missing"))?;
+            assert_eq!(value.type_name, "net.minecraft.item.ItemStack");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_enhanced_for_variable_scope() -> anyhow::Result<()> {
+        let source = r"
+            package demo;
+            import java.util.List;
+            import net.minecraft.item.ItemStack;
+            class Recipe {
+                void run(List<ItemStack> items) {
+                    for (ItemStack item : items) { sink(item); }
+                }
+            }
+        ";
+        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
+        let mut index = super::JavaProjectIndex::default();
+        index.add_analysis(&analysis);
+        let sink = analysis
+            .call_chains
+            .iter()
+            .flat_map(|chain| &chain.calls)
+            .find(|call| call.name == "sink")
+            .ok_or_else(|| anyhow::anyhow!("sink call missing"))?;
+        let value = index
+            .resolve_value_at("Recipe.java", sink.byte_start, "item", &analysis.bindings)
+            .ok_or_else(|| anyhow::anyhow!("enhanced-for value missing"))?;
+        assert_eq!(value.type_name, "net.minecraft.item.ItemStack");
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_nested_type_field_chain() -> anyhow::Result<()> {
+        let source = r"
+            package demo;
+            import net.minecraft.item.ItemStack;
+            class Holder { ItemStack get(int amount) { return null; } }
+            class Outer {
+                static class Inner { static final Holder VALUE = new Holder(); }
+            }
+            class Recipe { void run() { sink(Outer.Inner.VALUE.get(4)); } }
+        ";
+        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
+        let mut index = super::JavaProjectIndex::default();
+        index.add_analysis(&analysis);
+        let sink = analysis
+            .call_chains
+            .iter()
+            .flat_map(|chain| &chain.calls)
+            .find(|call| call.name == "sink")
+            .ok_or_else(|| anyhow::anyhow!("sink call missing"))?;
+        let expression = sink
+            .argument_expressions
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("sink argument missing"))?;
+        let nested_field = index
+            .resolve_field("demo.Outer.Inner", "VALUE", Some(true))
+            .ok_or_else(|| anyhow::anyhow!("nested VALUE field was not indexed"))?;
+        assert_eq!(nested_field.type_name, "Holder");
+        let super::JavaExpression::Call {
+            receiver: Some(receiver),
+            ..
+        } = expression
+        else {
+            return Err(anyhow::anyhow!("sink argument was not a receiver call"));
+        };
+        assert_eq!(
+            index.expression_type_at("Recipe.java", sink.byte_start, receiver, &analysis.bindings),
+            Some(String::from("demo.Holder"))
+        );
+        let direct = index
+            .resolve_instance_method("demo.Holder", "get", 1)
+            .ok_or_else(|| anyhow::anyhow!("direct Holder#get lookup failed"))?;
+        assert_eq!(direct.owner, "demo.Holder");
+        let (resolved, receiver_type) = index
+            .resolve_call_at(
+                "Recipe.java",
+                sink.byte_start,
+                expression,
+                &analysis.bindings,
+            )
+            .ok_or_else(|| anyhow::anyhow!("nested field chain was not resolved"))?;
+        assert_eq!(resolved.owner, "demo.Holder");
+        assert_eq!(receiver_type.as_deref(), Some("demo.Holder"));
         Ok(())
     }
 

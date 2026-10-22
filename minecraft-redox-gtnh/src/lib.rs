@@ -91,6 +91,7 @@ pub struct GtnhSummary {
     pub recipe_item_semantics_resolved: usize,
     pub recipe_item_method_links: usize,
     pub recipe_item_value_links: usize,
+    pub recipe_item_typed_expression_links: usize,
     pub recipe_fluid_expressions: usize,
     pub recipe_fluid_semantics_resolved: usize,
     pub recipe_fluid_method_links: usize,
@@ -113,6 +114,7 @@ impl GtnhSummary {
         self.recipe_item_semantics_resolved += other.recipe_item_semantics_resolved;
         self.recipe_item_method_links += other.recipe_item_method_links;
         self.recipe_item_value_links += other.recipe_item_value_links;
+        self.recipe_item_typed_expression_links += other.recipe_item_typed_expression_links;
         self.recipe_fluid_expressions += other.recipe_fluid_expressions;
         self.recipe_fluid_semantics_resolved += other.recipe_fluid_semantics_resolved;
         self.recipe_fluid_method_links += other.recipe_fluid_method_links;
@@ -162,6 +164,9 @@ impl GtnhSummary {
                     }
                     Some(ItemSemantic::LinkedValue { .. }) => {
                         self.recipe_item_value_links += 1;
+                    }
+                    Some(ItemSemantic::TypedExpression { .. }) => {
+                        self.recipe_item_typed_expression_links += 1;
                     }
                     Some(_) => self.recipe_item_semantics_resolved += 1,
                     None => {}

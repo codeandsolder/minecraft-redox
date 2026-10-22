@@ -141,3 +141,30 @@ Latest corrected GT5 measurement:
 - release two-pass scan: **2.94 s**, ~807% CPU, ~193 MB RSS on Acer
 
 Only **354 item expressions** remain completely unexplained after this pass. The remaining tail is now dominated by calls whose semantics/types require more than owner/name/arity, plus a small number of non-`ItemStack` references, array accesses, field accesses and conditional expressions.
+
+### Typed expression links and ordinary Java scope completion
+
+The project index now carries enough Java type structure to account for additional expressions without pretending their concrete runtime values are known. Standard `Collection.toArray(T[])` calls inherit the supplied array type, so values such as `List<ItemStack>.toArray(new ItemStack[0])` become `TypedExpression(ItemStack[])`. Array-returning local helpers used inside multi-argument `itemInputs(...)` calls can be safely inlined back through the GT recipe-input grammar; the single-array-varargs case remains distinct so an `ItemStack[]` passed as the entire varargs array is not mislabeled as one alternative-input slot.
+
+Nested Java owners are canonicalized with their full enclosing type chain, so references such as `MaterialsElements.STANDALONE.ADVANCED_NITINOL...` resolve through `package.Outer.Inner` rather than an invented top-level `package.Inner`. Constructors are indexed as `<init>` callable scopes for parameter/local lookup without becoming ordinary callable methods. Enhanced-for loop variables are given their lexical body scope, and direct `var x = new Type(...)` declarations infer the constructor type without any control-flow speculation.
+
+These remain separate evidence classes:
+
+- direct semantics mean the old recipe value itself has been understood;
+- `LinkedMethod` means a unique Java method target and return type are known;
+- `LinkedValue` means a unique parameter/local/field declaration and type are known;
+- `TypedExpression` means the expression type is proven even though its runtime contents are not.
+
+Current GT5 measurement after these Java-language passes:
+
+- item expressions: **17,294 total**
+- direct item semantics: **14,849**
+- unambiguous item method links: **1,817**
+- parameter/local/field item value links: **401**
+- typed item-expression links: **70**
+- total item accounting: **17,137 / 17,294 (99.09%)**
+- completely unexplained item expressions: **157 (0.91%)**
+- fluid expressions: **6,582 total**; 6,249 direct + 208 method-linked
+- recipe durations: 5,748 total; 5,428 exactly reduced to ticks
+
+The remaining 157 item expressions are no longer a broad syntax problem. They are mostly genuinely dynamic calls, conditional expressions, external-library behavior, or cases that require stronger overload/control-flow evidence. Further percentage-chasing is therefore lower value than making the recovered semantics compile against a real Oxidized target IR with provenance and tests.
