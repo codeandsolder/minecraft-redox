@@ -542,7 +542,12 @@ impl JavaProjectIndex {
                 .resolve_instance_call(&receiver_type, method, site)
                 .map(|resolved| (resolved, Some(receiver_type)));
         }
-        let owner = self.class_owner_for_reference(site.bindings, reference)?;
+        let owner = self.class_owner_for_reference_at(
+            site.path,
+            site.byte_position,
+            site.bindings,
+            reference,
+        )?;
         self.resolve_static_call(&owner, method, site)
             .map(|resolved| (resolved, Some(owner)))
     }
@@ -606,7 +611,7 @@ impl JavaProjectIndex {
                     if self.reference_type_at(path, byte_position, root).is_some() {
                         return None;
                     }
-                    self.class_owner_for_reference(bindings, &reference)
+                    self.class_owner_for_reference_at(path, byte_position, bindings, &reference)
                 });
                 let (owner, is_static) = static_owner.map_or_else(
                     || {
@@ -813,6 +818,26 @@ impl JavaProjectIndex {
             return None;
         }
         Some(field)
+    }
+
+    fn class_owner_for_reference_at(
+        &self,
+        path: &str,
+        byte_position: usize,
+        bindings: &JavaBindings,
+        reference: &str,
+    ) -> Option<String> {
+        if let Some(method) = self.enclosing_method(path, byte_position) {
+            let mut owner = Some(method.owner.as_str());
+            while let Some(current) = owner {
+                let candidate = format!("{current}.{reference}");
+                if self.has_owner(&candidate) {
+                    return Some(candidate);
+                }
+                owner = current.rsplit_once('.').map(|(parent, _)| parent);
+            }
+        }
+        self.class_owner_for_reference(bindings, reference)
     }
 
     fn class_owner_for_reference(
@@ -2584,6 +2609,46 @@ mod tests {
             .resolve_value_at("Recipe.java", sink.byte_start, "item", &analysis.bindings)
             .ok_or_else(|| anyhow::anyhow!("enhanced-for value missing"))?;
         assert_eq!(value.type_name, "net.minecraft.item.ItemStack");
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_lexically_visible_nested_type() -> anyhow::Result<()> {
+        let source = r"
+            package demo;
+            import net.minecraft.item.ItemStack;
+            class ItemList { ItemStack get(long amount) { return null; } }
+            class Outer {
+                enum ComponentType {
+                    MOTOR;
+                    ItemList getComponent(int tier) { return null; }
+                }
+                void run(int tier) { sink(ComponentType.MOTOR.getComponent(tier).get(4)); }
+            }
+        ";
+        let analysis = analyze_source("Outer.java", "demo", None, source)?;
+        let mut index = super::JavaProjectIndex::default();
+        index.add_analysis(&analysis);
+        let sink = analysis
+            .call_chains
+            .iter()
+            .flat_map(|chain| &chain.calls)
+            .find(|call| call.name == "sink")
+            .ok_or_else(|| anyhow::anyhow!("sink call missing"))?;
+        let expression = sink
+            .argument_expressions
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("sink argument missing"))?;
+        let (resolved, receiver_type) = index
+            .resolve_call_at(
+                "Outer.java",
+                sink.byte_start,
+                expression,
+                &analysis.bindings,
+            )
+            .ok_or_else(|| anyhow::anyhow!("nested lexical type was not resolved"))?;
+        assert_eq!(resolved.owner, "demo.ItemList");
+        assert_eq!(receiver_type.as_deref(), Some("demo.ItemList"));
         Ok(())
     }
 
