@@ -171,9 +171,20 @@ pub struct JavaValueResolution {
     pub value_id: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JavaTypeKind {
+    Class,
+    Interface,
+    Enum,
+    Record,
+    Anonymous,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct JavaTypeDeclaration {
     pub owner: String,
+    pub kind: JavaTypeKind,
     pub direct_supertypes: Vec<String>,
 }
 
@@ -284,6 +295,7 @@ pub struct JavaProjectIndex {
     locals_by_path: BTreeMap<String, Vec<JavaLocalVariable>>,
     fields: Vec<JavaField>,
     fields_by_owner: BTreeMap<String, Vec<usize>>,
+    type_kinds_by_owner: BTreeMap<String, JavaTypeKind>,
     supertypes_by_owner: BTreeMap<String, Vec<String>>,
 }
 
@@ -314,6 +326,8 @@ impl JavaProjectIndex {
                 .push(index);
         }
         for declaration in &analysis.types {
+            self.type_kinds_by_owner
+                .insert(declaration.owner.clone(), declaration.kind);
             self.supertypes_by_owner
                 .entry(declaration.owner.clone())
                 .or_default()
@@ -346,6 +360,7 @@ impl JavaProjectIndex {
             other.fields_by_owner,
             field_offset,
         );
+        self.type_kinds_by_owner.extend(other.type_kinds_by_owner);
         for (owner, supertypes) in other.supertypes_by_owner {
             self.supertypes_by_owner
                 .entry(owner)
@@ -805,6 +820,16 @@ impl JavaProjectIndex {
         bindings: &JavaBindings,
     ) -> Option<String> {
         let receiver = receiver?;
+        if let Some(enum_type) = self.synthetic_enum_call_type(
+            path,
+            byte_position,
+            receiver,
+            method,
+            arguments,
+            bindings,
+        ) {
+            return Some(enum_type);
+        }
         if method == "requireNonNull"
             && matches!(arguments.len(), 1 | 2)
             && resolved_reference_name(receiver, bindings).as_deref() == Some("java.util.Objects")
@@ -833,6 +858,31 @@ impl JavaProjectIndex {
         let argument_type =
             self.expression_type_at(path, byte_position, arguments.first()?, bindings)?;
         argument_type.ends_with("[]").then_some(argument_type)
+    }
+
+    fn synthetic_enum_call_type(
+        &self,
+        path: &str,
+        byte_position: usize,
+        receiver: &JavaExpression,
+        method: &str,
+        arguments: &[JavaExpression],
+        bindings: &JavaBindings,
+    ) -> Option<String> {
+        let reference = qualified_reference_name(receiver)?;
+        let owner = self.class_owner_for_reference_at(path, byte_position, bindings, &reference)?;
+        if self.type_kinds_by_owner.get(&owner) != Some(&JavaTypeKind::Enum) {
+            return None;
+        }
+        match (method, arguments.len()) {
+            ("valueOf", 1) => {
+                let argument_type =
+                    self.expression_type_at(path, byte_position, arguments.first()?, bindings)?;
+                (argument_type == "java.lang.String").then_some(owner)
+            }
+            ("values", 0) => Some(format!("{owner}[]")),
+            _ => None,
+        }
     }
 
     fn resolve_static_import(
@@ -1669,8 +1719,20 @@ fn collect_type_declarations(
                 }
             }
         }
+        let kind = if anonymous_type {
+            JavaTypeKind::Anonymous
+        } else {
+            match node.kind() {
+                "class_declaration" => JavaTypeKind::Class,
+                "interface_declaration" => JavaTypeKind::Interface,
+                "enum_declaration" => JavaTypeKind::Enum,
+                "record_declaration" => JavaTypeKind::Record,
+                _ => unreachable!("named_type matched an unsupported declaration kind"),
+            }
+        };
         declarations.push(JavaTypeDeclaration {
             owner,
+            kind,
             direct_supertypes,
         });
     }
@@ -2967,6 +3029,50 @@ mod tests {
                 .ok_or_else(|| anyhow::anyhow!("value was not resolved"))?;
             assert_eq!(value.kind, expected_kind);
             assert_eq!(value.type_name, "net.minecraft.item.ItemStack");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn infers_synthetic_enum_methods() -> anyhow::Result<()> {
+        let source = r#"
+            package demo;
+            import net.minecraft.item.ItemStack;
+            enum Component {
+                MOTOR;
+                ItemStack get(int amount) { return null; }
+            }
+            class Recipe {
+                void run() {
+                    sink(Component.valueOf("MOTOR").get(4));
+                    sink(Component.values()[0].get(2));
+                }
+            }
+        "#;
+        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
+        let mut index = super::JavaProjectIndex::default();
+        index.add_analysis(&analysis);
+        let calls: Vec<_> = analysis
+            .call_chains
+            .iter()
+            .flat_map(|chain| &chain.calls)
+            .filter(|call| call.name == "sink")
+            .collect();
+        assert_eq!(calls.len(), 2);
+        for call in calls {
+            let expression = call
+                .argument_expressions
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("sink argument missing"))?;
+            assert_eq!(
+                index.expression_type_at(
+                    "Recipe.java",
+                    call.byte_start,
+                    expression,
+                    &analysis.bindings,
+                ),
+                Some(String::from("net.minecraft.item.ItemStack"))
+            );
         }
         Ok(())
     }
