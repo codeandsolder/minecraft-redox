@@ -79,6 +79,9 @@ pub enum ItemSemantic {
     ExplicitAlternatives {
         alternatives: Vec<JavaExpression>,
     },
+    TypedInputContainer {
+        expression_type: String,
+    },
     LinkedMethod {
         method_id: String,
         return_type: String,
@@ -306,6 +309,13 @@ fn project_input_item_semantic(
     byte_position: usize,
     nested_array_is_slot: bool,
 ) -> Option<ItemSemantic> {
+    if !matches!(expression, JavaExpression::Call { .. })
+        && let Some(expression_type) =
+            project.expression_type_at(source_path, byte_position, expression, bindings)
+        && is_recipe_input_container_type(&expression_type)
+    {
+        return Some(ItemSemantic::TypedInputContainer { expression_type });
+    }
     if nested_array_is_slot
         && let JavaExpression::Call { arguments, .. } = expression
         && let Some((resolved, receiver_type)) =
@@ -1195,6 +1205,33 @@ mod tests {
         assert!(matches!(
             recovered[0].semantic,
             Some(ItemSemantic::OreDictStack { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn links_typed_dynamic_input_container() -> anyhow::Result<()> {
+        let source = r"
+            class R {
+                void run(Object[] inputs) { builder.itemInputs(inputs); }
+            }
+        ";
+        let analysis = analyze_source("R.java", "gt5", None, source)?;
+        let mut project = minecraft_redox_java::JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let inputs = recipe_call(&analysis, "itemInputs")?;
+        let recovered = recover_item_inputs_with_project(
+            &inputs.arguments,
+            &inputs.argument_expressions,
+            &analysis.bindings,
+            &project,
+            "R.java",
+            inputs.byte_start,
+        );
+        assert!(matches!(
+            &recovered[0].semantic,
+            Some(ItemSemantic::TypedInputContainer { expression_type })
+                if expression_type == "Object[]"
         ));
         Ok(())
     }
