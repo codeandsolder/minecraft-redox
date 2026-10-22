@@ -456,23 +456,6 @@ impl JavaProjectIndex {
         }
     }
 
-    fn resolve_local_method_typed(
-        &self,
-        name: &str,
-        site: JavaCallSite<'_>,
-    ) -> Option<&JavaMethod> {
-        let methods = self
-            .methods_by_path
-            .get(site.path)?
-            .iter()
-            .map(|index| &self.methods[*index]);
-        self.select_typed_method(
-            methods
-                .filter(|method| method.name == name && method.accepts_arity(site.arguments.len())),
-            site,
-        )
-    }
-
     fn resolve_method_filtered_typed(
         &self,
         owner: &str,
@@ -597,11 +580,20 @@ impl JavaProjectIndex {
         method: &str,
         site: JavaCallSite<'_>,
     ) -> Option<(&'a JavaMethod, Option<String>)> {
-        if let Some(local) = self.resolve_local_method(site.path, method, site.arguments.len()) {
-            return Some((local, None));
-        }
-        if let Some(local) = self.resolve_local_method_typed(method, site) {
-            return Some((local, None));
+        if let Some(enclosing) = self.enclosing_method(site.path, site.byte_position) {
+            if let Some(resolved) =
+                self.resolve_method(&enclosing.owner, method, site.arguments.len())
+            {
+                return Some((resolved, None));
+            }
+            if let Some(resolved) = self.resolve_method_filtered_typed(
+                &enclosing.owner,
+                method,
+                site,
+                MethodFilter::Any,
+            ) {
+                return Some((resolved, None));
+            }
         }
         if let Some(imported) =
             self.resolve_static_import(site.bindings, method, site.arguments.len())
@@ -3219,6 +3211,44 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("anonymous inherited member type was not resolved"))?;
         assert_eq!(resolved.owner, "demo.Base.Iter");
         assert_eq!(receiver_type.as_deref(), Some("demo.Base.Iter"));
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_implicit_default_interface_method() -> anyhow::Result<()> {
+        let source = r"
+            package demo;
+            class ItemStack {}
+            interface Helper {
+                default ItemStack make(int amount) { return null; }
+            }
+            class Recipe implements Helper {
+                void run() { sink(make(4)); }
+            }
+        ";
+        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
+        let mut index = super::JavaProjectIndex::default();
+        index.add_analysis(&analysis);
+        let sink = analysis
+            .call_chains
+            .iter()
+            .flat_map(|chain| &chain.calls)
+            .find(|call| call.name == "sink")
+            .ok_or_else(|| anyhow::anyhow!("sink call missing"))?;
+        let expression = sink
+            .argument_expressions
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("sink argument missing"))?;
+        let (resolved, receiver_type) = index
+            .resolve_call_at(
+                "Recipe.java",
+                sink.byte_start,
+                expression,
+                &analysis.bindings,
+            )
+            .ok_or_else(|| anyhow::anyhow!("default interface method was not resolved"))?;
+        assert_eq!(resolved.owner, "demo.Helper");
+        assert_eq!(receiver_type, None);
         Ok(())
     }
 
