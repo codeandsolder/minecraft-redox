@@ -1,0 +1,18 @@
+[package]
+name = "minecraft-redox-gtnh"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+minecraft-redox-core = { path = "../minecraft-redox-core" }
+minecraft-redox-java = { path = "../minecraft-redox-java" }
+serde.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+
+[lints]
+workspace = true

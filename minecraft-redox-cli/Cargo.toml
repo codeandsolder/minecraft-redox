@@ -8,8 +8,11 @@ repository.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+minecraft-redox-gtnh = { path = "../minecraft-redox-gtnh" }
 minecraft-redox-java = { path = "../minecraft-redox-java" }
+serde.workspace = true
 serde_json.workspace = true
+rayon.workspace = true
 
 [lints]
 workspace = true
