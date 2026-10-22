@@ -716,6 +716,11 @@ impl JavaProjectIndex {
                 if let Some(field_type) = standard_library_field_type(receiver, field, bindings) {
                     return Some(field_type.to_owned());
                 }
+                if let Some(field_type) =
+                    self.platform_field_type(path, byte_position, receiver, field, bindings)
+                {
+                    return Some(field_type);
+                }
                 let static_owner = qualified_reference_name(receiver).and_then(|reference| {
                     let root = reference.split('.').next()?;
                     if self.reference_type_at(path, byte_position, root).is_some() {
@@ -749,7 +754,7 @@ impl JavaProjectIndex {
                 method,
                 arguments,
             } => self
-                .standard_library_call_type(
+                .platform_call_type(
                     path,
                     byte_position,
                     receiver.as_deref(),
@@ -757,6 +762,16 @@ impl JavaProjectIndex {
                     arguments,
                     bindings,
                 )
+                .or_else(|| {
+                    self.standard_library_call_type(
+                        path,
+                        byte_position,
+                        receiver.as_deref(),
+                        method,
+                        arguments,
+                        bindings,
+                    )
+                })
                 .or_else(|| {
                     self.resolve_call_at(path, byte_position, expression, bindings)
                         .map(|(resolved, _)| {
@@ -813,6 +828,84 @@ impl JavaProjectIndex {
         None
     }
 
+    fn platform_call_type(
+        &self,
+        path: &str,
+        byte_position: usize,
+        receiver: Option<&JavaExpression>,
+        method: &str,
+        arguments: &[JavaExpression],
+        bindings: &JavaBindings,
+    ) -> Option<String> {
+        let receiver = receiver?;
+        if let Some(receiver_type) =
+            self.expression_type_at(path, byte_position, receiver, bindings)
+        {
+            let raw_receiver = erase_java_type_syntax(&receiver_type);
+            if raw_receiver == "net.minecraft.item.ItemStack"
+                && matches!(
+                    (method, arguments.len()),
+                    ("copy", 0) | ("splitStack" | "setStackDisplayName", 1)
+                )
+            {
+                return Some(String::from("net.minecraft.item.ItemStack"));
+            }
+            if raw_receiver == "net.minecraftforge.fluids.FluidStack"
+                && method == "copy"
+                && arguments.is_empty()
+            {
+                return Some(String::from("net.minecraftforge.fluids.FluidStack"));
+            }
+        }
+
+        let receiver_name = resolved_reference_name(receiver, bindings)?;
+        match (receiver_name.as_str(), method, arguments.len()) {
+            ("net.minecraftforge.oredict.OreDictionary", "getOres", 1 | 2) => Some(String::from(
+                "java.util.ArrayList<net.minecraft.item.ItemStack>",
+            )),
+            ("net.minecraftforge.fluids.FluidContainerRegistry", "fillFluidContainer", 2) => {
+                Some(String::from("net.minecraft.item.ItemStack"))
+            }
+            (
+                "net.minecraftforge.fluids.FluidContainerRegistry",
+                "getRegisteredFluidContainerData",
+                0,
+            ) => Some(String::from(
+                "net.minecraftforge.fluids.FluidContainerRegistry.FluidContainerData[]",
+            )),
+            _ => None,
+        }
+    }
+
+    fn platform_field_type(
+        &self,
+        path: &str,
+        byte_position: usize,
+        receiver: &JavaExpression,
+        field: &str,
+        bindings: &JavaBindings,
+    ) -> Option<String> {
+        if resolved_reference_name(receiver, bindings).as_deref() == Some("ic2.core.Ic2Items")
+            && is_known_ic2_item_field(field)
+        {
+            return Some(String::from("net.minecraft.item.ItemStack"));
+        }
+
+        let receiver_type = self.expression_type_at(path, byte_position, receiver, bindings)?;
+        if erase_java_type_syntax(&receiver_type)
+            != "net.minecraftforge.fluids.FluidContainerRegistry.FluidContainerData"
+        {
+            return None;
+        }
+        match field {
+            "filledContainer" | "emptyContainer" => {
+                Some(String::from("net.minecraft.item.ItemStack"))
+            }
+            "fluid" => Some(String::from("net.minecraftforge.fluids.FluidStack")),
+            _ => None,
+        }
+    }
+
     fn standard_library_call_type(
         &self,
         path: &str,
@@ -850,8 +943,8 @@ impl JavaProjectIndex {
         }
         if arguments.is_empty() && raw_receiver == "org.apache.commons.lang3.tuple.Pair" {
             let index = match method {
-                "getLeft" => 0,
-                "getRight" => 1,
+                "getLeft" | "getKey" => 0,
+                "getRight" | "getValue" => 1,
                 _ => usize::MAX,
             };
             if index != usize::MAX {
@@ -1464,6 +1557,18 @@ fn method_dispatch_signature(method: &JavaMethod) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!("{}({parameters})", method.name)
+}
+
+fn is_known_ic2_item_field(field: &str) -> bool {
+    matches!(
+        field,
+        "reactorVentSpread"
+            | "pahoehoelavaCell"
+            | "hazmatHelmet"
+            | "hazmatChestplate"
+            | "hazmatLeggings"
+            | "hazmatBoots"
+    )
 }
 
 fn standard_library_field_type<'a>(
@@ -2962,6 +3067,54 @@ mod tests {
             ),
             Some(String::from("net.minecraft.item.ItemStack"))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn infers_minecraft_platform_contract_types() -> anyhow::Result<()> {
+        let source = r#"
+            package demo;
+            import ic2.core.Ic2Items;
+            import net.minecraft.item.ItemStack;
+            import net.minecraftforge.fluids.FluidContainerRegistry;
+            import net.minecraftforge.fluids.FluidContainerRegistry.FluidContainerData;
+            import net.minecraftforge.fluids.FluidStack;
+            import net.minecraftforge.oredict.OreDictionary;
+            class Recipe {
+                void run(FluidContainerData data, FluidStack fluid, ItemStack empty) {
+                    sink(OreDictionary.getOres("dustIron").get(0));
+                    sink(FluidContainerRegistry.fillFluidContainer(fluid, empty));
+                    sink(data.filledContainer);
+                    sink(Ic2Items.hazmatHelmet);
+                    sink(Ic2Items.hazmatHelmet.copy().splitStack(1));
+                }
+            }
+        "#;
+        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
+        let mut index = super::JavaProjectIndex::default();
+        index.add_analysis(&analysis);
+        let calls: Vec<_> = analysis
+            .call_chains
+            .iter()
+            .flat_map(|chain| &chain.calls)
+            .filter(|call| call.name == "sink")
+            .collect();
+        assert_eq!(calls.len(), 5);
+        for call in calls {
+            let expression = call
+                .argument_expressions
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("sink argument missing"))?;
+            assert_eq!(
+                index.expression_type_at(
+                    "Recipe.java",
+                    call.byte_start,
+                    expression,
+                    &analysis.bindings,
+                ),
+                Some(String::from("net.minecraft.item.ItemStack"))
+            );
+        }
         Ok(())
     }
 
