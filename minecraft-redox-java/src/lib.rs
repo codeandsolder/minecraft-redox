@@ -281,6 +281,7 @@ pub struct JavaProjectIndex {
     methods: Vec<JavaMethod>,
     methods_by_path: BTreeMap<String, Vec<usize>>,
     methods_by_owner: BTreeMap<String, Vec<usize>>,
+    locals_by_path: BTreeMap<String, Vec<JavaLocalVariable>>,
     fields: Vec<JavaField>,
     fields_by_owner: BTreeMap<String, Vec<usize>>,
     supertypes_by_owner: BTreeMap<String, Vec<String>>,
@@ -300,6 +301,10 @@ impl JavaProjectIndex {
                 .or_default()
                 .push(index);
         }
+        self.locals_by_path
+            .entry(analysis.inventory.path.clone())
+            .or_default()
+            .extend(analysis.local_variables.iter().cloned());
         for field in &analysis.fields {
             let index = self.fields.len();
             self.fields.push(field.clone());
@@ -330,6 +335,9 @@ impl JavaProjectIndex {
             other.methods_by_owner,
             method_offset,
         );
+        for (path, locals) in other.locals_by_path {
+            self.locals_by_path.entry(path).or_default().extend(locals);
+        }
 
         let field_offset = self.fields.len();
         self.fields.extend(other.fields);
@@ -1077,57 +1085,41 @@ impl JavaProjectIndex {
         reference_name: &str,
         bindings: &JavaBindings,
     ) -> Option<JavaValueResolution> {
-        let method = self.enclosing_method(path, byte_position)?;
-        if let Some(local) = method
-            .local_variables
-            .iter()
-            .filter(|local| {
-                local.name == reference_name
-                    && local.declaration_byte <= byte_position
-                    && byte_position < local.scope_end_byte
-            })
-            .max_by_key(|local| local.declaration_byte)
-        {
+        if let Some(local) = self.local_variable_at(path, byte_position, reference_name) {
             return Some(JavaValueResolution {
                 kind: JavaValueKind::Local,
                 name: local.name.clone(),
-                type_name: self.normalize_type_name(
-                    &local.type_name,
-                    method.owner.rsplit_once('.').map(|(package, _)| package),
-                ),
-                value_id: format!(
-                    "{}::local:{}@{}",
-                    method.stable_id(),
-                    local.name,
-                    local.declaration_byte
-                ),
+                type_name: self.normalize_type_name(&local.type_name, bindings.package.as_deref()),
+                value_id: format!("{path}::local:{}@{}", local.name, local.declaration_byte),
             });
         }
-        if let Some(parameter) = method
-            .parameters
-            .iter()
-            .find(|parameter| parameter.name == reference_name)
-        {
-            return Some(JavaValueResolution {
-                kind: JavaValueKind::Parameter,
-                name: parameter.name.clone(),
-                type_name: self.normalize_type_name(
-                    &parameter.type_name,
-                    method.owner.rsplit_once('.').map(|(package, _)| package),
-                ),
-                value_id: format!("{}::param:{}", method.stable_id(), parameter.name),
-            });
-        }
-        if let Some(field) = self.resolve_field(&method.owner, reference_name, None) {
-            return Some(JavaValueResolution {
-                kind: JavaValueKind::Field,
-                name: field.name.clone(),
-                type_name: self.normalize_type_name(
-                    &field.type_name,
-                    field.owner.rsplit_once('.').map(|(package, _)| package),
-                ),
-                value_id: format!("{}::field:{}", field.owner, field.name),
-            });
+        if let Some(method) = self.enclosing_method(path, byte_position) {
+            if let Some(parameter) = method
+                .parameters
+                .iter()
+                .find(|parameter| parameter.name == reference_name)
+            {
+                return Some(JavaValueResolution {
+                    kind: JavaValueKind::Parameter,
+                    name: parameter.name.clone(),
+                    type_name: self.normalize_type_name(
+                        &parameter.type_name,
+                        method.owner.rsplit_once('.').map(|(package, _)| package),
+                    ),
+                    value_id: format!("{}::param:{}", method.stable_id(), parameter.name),
+                });
+            }
+            if let Some(field) = self.resolve_field(&method.owner, reference_name, None) {
+                return Some(JavaValueResolution {
+                    kind: JavaValueKind::Field,
+                    name: field.name.clone(),
+                    type_name: self.normalize_type_name(
+                        &field.type_name,
+                        field.owner.rsplit_once('.').map(|(package, _)| package),
+                    ),
+                    value_id: format!("{}::field:{}", field.owner, field.name),
+                });
+            }
         }
         let field = self.imported_static_field(bindings, reference_name)?;
         Some(JavaValueResolution {
@@ -1148,19 +1140,10 @@ impl JavaProjectIndex {
         byte_position: usize,
         reference_name: &str,
     ) -> Option<&str> {
-        let method = self.enclosing_method(path, byte_position)?;
-        if let Some(local) = method
-            .local_variables
-            .iter()
-            .filter(|local| {
-                local.name == reference_name
-                    && local.declaration_byte <= byte_position
-                    && byte_position < local.scope_end_byte
-            })
-            .max_by_key(|local| local.declaration_byte)
-        {
+        if let Some(local) = self.local_variable_at(path, byte_position, reference_name) {
             return Some(local.type_name.as_str());
         }
+        let method = self.enclosing_method(path, byte_position)?;
         if let Some(parameter) = method
             .parameters
             .iter()
@@ -1170,6 +1153,23 @@ impl JavaProjectIndex {
         }
         self.resolve_field(&method.owner, reference_name, None)
             .map(|field| field.type_name.as_str())
+    }
+
+    fn local_variable_at(
+        &self,
+        path: &str,
+        byte_position: usize,
+        reference_name: &str,
+    ) -> Option<&JavaLocalVariable> {
+        self.locals_by_path
+            .get(path)?
+            .iter()
+            .filter(|local| {
+                local.name == reference_name
+                    && local.declaration_byte <= byte_position
+                    && byte_position < local.scope_end_byte
+            })
+            .max_by_key(|local| local.declaration_byte)
     }
 
     #[must_use]
@@ -1416,6 +1416,7 @@ pub struct JavaAnalysis {
     pub bindings: JavaBindings,
     pub inventory: JavaInventory,
     pub methods: Vec<JavaMethod>,
+    pub local_variables: Vec<JavaLocalVariable>,
     pub fields: Vec<JavaField>,
     pub types: Vec<JavaTypeDeclaration>,
     pub call_chains: Vec<JavaCallChain>,
@@ -1446,6 +1447,8 @@ pub fn analyze_source(
         &bindings,
         &mut methods,
     );
+    let mut local_variables = Vec::new();
+    collect_file_local_variables(tree.root_node(), source, &bindings, &mut local_variables);
     let mut fields = Vec::new();
     collect_fields(
         tree.root_node(),
@@ -1471,6 +1474,7 @@ pub fn analyze_source(
         bindings,
         inventory,
         methods,
+        local_variables,
         fields,
         types,
         call_chains,
@@ -1931,12 +1935,27 @@ fn declaration_is_static(node: Node<'_>, source: &str) -> bool {
         .is_some_and(|modifiers| modifiers.split_whitespace().any(|token| token == "static"))
 }
 
-fn collect_local_variables(
+fn collect_file_local_variables(
     node: Node<'_>,
     source: &str,
     bindings: &JavaBindings,
     variables: &mut Vec<JavaLocalVariable>,
 ) {
+    if collect_local_variable_node(node, source, bindings, variables) {
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_file_local_variables(child, source, bindings, variables);
+    }
+}
+
+fn collect_local_variable_node(
+    node: Node<'_>,
+    source: &str,
+    bindings: &JavaBindings,
+    variables: &mut Vec<JavaLocalVariable>,
+) -> bool {
     if node.kind() == "enhanced_for_statement" {
         if let (Some(type_node), Some(name_node), Some(body)) = (
             node.child_by_field_name("type"),
@@ -1951,39 +1970,51 @@ fn collect_local_variables(
                 declaration_byte: name_node.start_byte(),
                 scope_end_byte: body.end_byte(),
             });
-            collect_local_variables(body, source, bindings, variables);
+            collect_file_local_variables(body, source, bindings, variables);
         }
-        return;
+        return true;
     }
-    if node.kind() == "local_variable_declaration" {
-        if let Some(type_node) = node.child_by_field_name("type")
-            && let Ok(type_name) = node_text(type_node, source)
+    if node.kind() != "local_variable_declaration" {
+        return false;
+    }
+    if let Some(type_node) = node.child_by_field_name("type")
+        && let Ok(type_name) = node_text(type_node, source)
+    {
+        let declared_type = resolve_type_reference(bindings, type_name.trim());
+        let scope_end_byte = lexical_scope_end(node);
+        let mut cursor = node.walk();
+        for declarator in node
+            .named_children(&mut cursor)
+            .filter(|child| child.kind() == "variable_declarator")
         {
-            let declared_type = resolve_type_reference(bindings, type_name.trim());
-            let scope_end_byte = lexical_scope_end(node);
-            let mut cursor = node.walk();
-            for declarator in node
-                .named_children(&mut cursor)
-                .filter(|child| child.kind() == "variable_declarator")
+            if let Some(name_node) = declarator.child_by_field_name("name")
+                && let Ok(name) = node_text(name_node, source)
             {
-                if let Some(name_node) = declarator.child_by_field_name("name")
-                    && let Ok(name) = node_text(name_node, source)
-                {
-                    let type_name = if declared_type == "var" {
-                        inferred_var_type(declarator, source, bindings)
-                            .unwrap_or_else(|| declared_type.clone())
-                    } else {
-                        declared_type.clone()
-                    };
-                    variables.push(JavaLocalVariable {
-                        type_name,
-                        name: name.to_owned(),
-                        declaration_byte: declarator.start_byte(),
-                        scope_end_byte,
-                    });
-                }
+                let type_name = if declared_type == "var" {
+                    inferred_var_type(declarator, source, bindings)
+                        .unwrap_or_else(|| declared_type.clone())
+                } else {
+                    declared_type.clone()
+                };
+                variables.push(JavaLocalVariable {
+                    type_name,
+                    name: name.to_owned(),
+                    declaration_byte: declarator.start_byte(),
+                    scope_end_byte,
+                });
             }
         }
+    }
+    true
+}
+
+fn collect_local_variables(
+    node: Node<'_>,
+    source: &str,
+    bindings: &JavaBindings,
+    variables: &mut Vec<JavaLocalVariable>,
+) {
+    if collect_local_variable_node(node, source, bindings, variables) {
         return;
     }
     if matches!(
@@ -2696,6 +2727,44 @@ mod tests {
                 &analysis.bindings,
             ),
             Some(String::from("net.minecraft.item.ItemStack"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_typed_local_inside_initializer_lambda() -> anyhow::Result<()> {
+        let source = r"
+            package demo;
+            import java.util.ArrayList;
+            class ItemStack {}
+            class Recipe {
+                static final Object VALUE = configure(builder -> {
+                    ArrayList<ItemStack> items = new ArrayList<>();
+                    sink(items.toArray(new ItemStack[0]));
+                });
+            }
+        ";
+        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
+        let mut index = super::JavaProjectIndex::default();
+        index.add_analysis(&analysis);
+        let sink = analysis
+            .call_chains
+            .iter()
+            .flat_map(|chain| &chain.calls)
+            .find(|call| call.name == "sink")
+            .ok_or_else(|| anyhow::anyhow!("sink call missing"))?;
+        let expression = sink
+            .argument_expressions
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("sink argument missing"))?;
+        assert_eq!(
+            index.expression_type_at(
+                "Recipe.java",
+                sink.byte_start,
+                expression,
+                &analysis.bindings
+            ),
+            Some(String::from("ItemStack[]"))
         );
         Ok(())
     }
