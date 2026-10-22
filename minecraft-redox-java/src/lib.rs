@@ -379,6 +379,11 @@ impl JavaProjectIndex {
                         self.resolve_instance_method(&receiver_type, method, arguments.len())?;
                     return Some((resolved, Some(receiver_type)));
                 }
+                if let Some(receiver_type) = self.imported_static_field_type(bindings, reference) {
+                    let resolved =
+                        self.resolve_instance_method(&receiver_type, method, arguments.len())?;
+                    return Some((resolved, Some(receiver_type)));
+                }
 
                 let owner = self.class_owner_for_reference(bindings, reference)?;
                 let resolved = self.resolve_static_method(&owner, method, arguments.len())?;
@@ -405,7 +410,8 @@ impl JavaProjectIndex {
         match expression {
             JavaExpression::Reference(reference) => self
                 .reference_type_at(path, byte_position, reference)
-                .map(|type_name| self.normalize_owner_name(type_name, bindings.package.as_deref())),
+                .map(|type_name| self.normalize_owner_name(type_name, bindings.package.as_deref()))
+                .or_else(|| self.imported_static_field_type(bindings, reference)),
             JavaExpression::FieldAccess { receiver, field } => {
                 let (owner, is_static) = match receiver.as_ref() {
                     JavaExpression::Reference(reference)
@@ -466,6 +472,35 @@ impl JavaProjectIndex {
                 .iter()
                 .filter_map(|owner| self.resolve_static_method(owner, method_name, arity)),
         )
+    }
+
+    fn imported_static_field_type(
+        &self,
+        bindings: &JavaBindings,
+        reference: &str,
+    ) -> Option<String> {
+        if let Some(path) = bindings.static_imports.get(reference)
+            && let Some((owner, field_name)) = path.rsplit_once('.')
+        {
+            let field = self.resolve_field(owner, field_name, Some(true))?;
+            return Some(self.normalize_owner_name(
+                &field.type_name,
+                field.owner.rsplit_once('.').map(|(package, _)| package),
+            ));
+        }
+
+        let mut fields = bindings
+            .static_wildcard_imports
+            .iter()
+            .filter_map(|owner| self.resolve_field(owner, reference, Some(true)));
+        let field = fields.next()?;
+        if fields.next().is_some() {
+            return None;
+        }
+        Some(self.normalize_owner_name(
+            &field.type_name,
+            field.owner.rsplit_once('.').map(|(package, _)| package),
+        ))
     }
 
     fn class_owner_for_reference(
@@ -543,11 +578,15 @@ impl JavaProjectIndex {
         {
             return Some(local.type_name.as_str());
         }
-        method
+        if let Some(parameter) = method
             .parameters
             .iter()
             .find(|parameter| parameter.name == reference_name)
-            .map(|parameter| parameter.type_name.as_str())
+        {
+            return Some(parameter.type_name.as_str());
+        }
+        self.resolve_field(&method.owner, reference_name, None)
+            .map(|field| field.type_name.as_str())
     }
 
     #[must_use]
@@ -806,6 +845,21 @@ fn collect_fields(
     bindings: &JavaBindings,
     fields: &mut Vec<JavaField>,
 ) {
+    if node.kind() == "enum_constant" {
+        if let Some(name_node) = node.child_by_field_name("name")
+            && let Ok(name) = node_text(name_node, source)
+            && let Some(owner) = enclosing_type_name(node, source, bindings)
+        {
+            fields.push(JavaField {
+                owner: owner.clone(),
+                name: name.to_owned(),
+                type_name: owner,
+                is_static: true,
+                origin: origin_for(node, Some(name), path, artifact, version),
+            });
+        }
+        return;
+    }
     if node.kind() == "field_declaration" {
         if let Some(type_node) = node.child_by_field_name("type")
             && let Ok(type_name) = node_text(type_node, source)
@@ -1554,6 +1608,89 @@ mod tests {
             index.reference_type_at("Factory.java", position, "parameter"),
             Some("Widget")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_enum_constant_receiver_type() -> anyhow::Result<()> {
+        let source = r"
+            package demo;
+            import net.minecraft.item.ItemStack;
+            enum Component {
+                MOTOR;
+                ItemStack get(int amount) { return null; }
+            }
+            class Recipe { void run() { sink(Component.MOTOR.get(4)); } }
+        ";
+        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
+        let mut index = super::JavaProjectIndex::default();
+        index.add_analysis(&analysis);
+        let sink = analysis
+            .call_chains
+            .iter()
+            .flat_map(|chain| &chain.calls)
+            .find(|call| call.name == "sink")
+            .ok_or_else(|| anyhow::anyhow!("sink call missing"))?;
+        let expression = sink
+            .argument_expressions
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("sink argument missing"))?;
+        let (resolved, receiver_type) = index
+            .resolve_call_at(
+                "Recipe.java",
+                sink.byte_start,
+                expression,
+                &analysis.bindings,
+            )
+            .ok_or_else(|| anyhow::anyhow!("enum receiver was not resolved"))?;
+        assert_eq!(resolved.owner, "demo.Component");
+        assert_eq!(receiver_type.as_deref(), Some("demo.Component"));
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_enclosing_and_static_imported_field_receivers() -> anyhow::Result<()> {
+        let source = r"
+            package demo;
+            import static demo.Registry.IMPORTED;
+            import net.minecraft.item.ItemStack;
+            class Holder { ItemStack get(int amount) { return null; } }
+            class Registry { static final Holder IMPORTED = new Holder(); }
+            class Recipe {
+                Holder member = new Holder();
+                void run() {
+                    sink(member.get(1));
+                    sink(IMPORTED.get(2));
+                }
+            }
+        ";
+        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
+        let mut index = super::JavaProjectIndex::default();
+        index.add_analysis(&analysis);
+        let calls: Vec<_> = analysis
+            .call_chains
+            .iter()
+            .flat_map(|chain| &chain.calls)
+            .filter(|call| call.name == "sink")
+            .collect();
+        assert_eq!(calls.len(), 2);
+        for call in calls {
+            let expression = call
+                .argument_expressions
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("sink argument missing"))?;
+            let (resolved, receiver_type) = index
+                .resolve_call_at(
+                    "Recipe.java",
+                    call.byte_start,
+                    expression,
+                    &analysis.bindings,
+                )
+                .ok_or_else(|| anyhow::anyhow!("field receiver was not resolved"))?;
+            assert_eq!(resolved.owner, "demo.Holder");
+            assert_eq!(resolved.name, "get");
+            assert_eq!(receiver_type.as_deref(), Some("demo.Holder"));
+        }
         Ok(())
     }
 
