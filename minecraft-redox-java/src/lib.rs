@@ -804,11 +804,28 @@ impl JavaProjectIndex {
         arguments: &[JavaExpression],
         bindings: &JavaBindings,
     ) -> Option<String> {
-        let receiver_type = self.expression_type_at(path, byte_position, receiver?, bindings)?;
+        let receiver = receiver?;
+        if method == "requireNonNull"
+            && matches!(arguments.len(), 1 | 2)
+            && resolved_reference_name(receiver, bindings).as_deref() == Some("java.util.Objects")
+        {
+            return self.expression_type_at(path, byte_position, arguments.first()?, bindings);
+        }
+        let receiver_type = self.expression_type_at(path, byte_position, receiver, bindings)?;
         let raw_receiver = erase_java_type_syntax(&receiver_type);
-        if method == "get" && arguments.len() == 1 && is_java_list_type(&raw_receiver) {
-            let element_type = first_generic_type_argument(&receiver_type)?;
-            return Some(self.normalize_type_name(element_type, bindings.package.as_deref()));
+        if method == "get" && arguments.is_empty() && is_optional_type(&raw_receiver) {
+            let value_type = generic_type_argument(&receiver_type, 0)?;
+            return Some(self.normalize_type_name(value_type, bindings.package.as_deref()));
+        }
+        if method == "get" && arguments.len() == 1 {
+            if is_java_list_type(&raw_receiver) {
+                let value_type = generic_type_argument(&receiver_type, 0)?;
+                return Some(self.normalize_type_name(value_type, bindings.package.as_deref()));
+            }
+            if is_java_map_type(&raw_receiver) {
+                let value_type = generic_type_argument(&receiver_type, 1)?;
+                return Some(self.normalize_type_name(value_type, bindings.package.as_deref()));
+            }
         }
         if method != "toArray" || arguments.len() != 1 || !is_java_collection_type(&raw_receiver) {
             return None;
@@ -1228,22 +1245,61 @@ fn is_java_list_type(type_name: &str) -> bool {
     )
 }
 
-fn first_generic_type_argument(type_name: &str) -> Option<&str> {
-    let start = type_name.find('<')? + 1;
+fn is_java_map_type(type_name: &str) -> bool {
+    matches!(
+        type_name,
+        "java.util.Map"
+            | "java.util.HashMap"
+            | "java.util.LinkedHashMap"
+            | "java.util.SortedMap"
+            | "java.util.NavigableMap"
+            | "java.util.TreeMap"
+            | "java.util.concurrent.ConcurrentMap"
+            | "java.util.concurrent.ConcurrentHashMap"
+    )
+}
+
+fn is_optional_type(type_name: &str) -> bool {
+    matches!(
+        type_name,
+        "java.util.Optional" | "com.google.common.base.Optional"
+    )
+}
+
+fn resolved_reference_name(expression: &JavaExpression, bindings: &JavaBindings) -> Option<String> {
+    qualified_reference_name(expression).map(|reference| bindings.resolve_reference(&reference))
+}
+
+fn generic_type_argument(type_name: &str, target_index: usize) -> Option<&str> {
+    let mut argument_start = type_name.find('<')? + 1;
     let bytes = type_name.as_bytes();
     let mut depth = 1usize;
-    for (index, byte) in bytes.iter().copied().enumerate().skip(start) {
+    let mut argument_index = 0usize;
+    for (index, byte) in bytes.iter().copied().enumerate().skip(argument_start) {
         match byte {
             b'<' => depth += 1,
-            b'>' | b',' if depth == 1 => {
-                let argument = type_name.get(start..index)?.trim();
-                return (!argument.is_empty() && !argument.starts_with('?')).then_some(argument);
+            b',' if depth == 1 => {
+                if argument_index == target_index {
+                    return valid_generic_argument(type_name.get(argument_start..index)?);
+                }
+                argument_index += 1;
+                argument_start = index + 1;
+            }
+            b'>' if depth == 1 => {
+                return (argument_index == target_index)
+                    .then(|| valid_generic_argument(type_name.get(argument_start..index)?))
+                    .flatten();
             }
             b'>' => depth = depth.saturating_sub(1),
             _ => {}
         }
     }
     None
+}
+
+fn valid_generic_argument(argument: &str) -> Option<&str> {
+    let argument = argument.trim();
+    (!argument.is_empty() && !argument.starts_with('?')).then_some(argument)
 }
 
 fn array_element_type(type_name: &str) -> Option<&str> {
@@ -2684,6 +2740,83 @@ mod tests {
             ),
             Some(String::from("ItemStack"))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn infers_objects_require_non_null_type() -> anyhow::Result<()> {
+        let source = r"
+            package demo;
+            import java.util.Objects;
+            class ItemStack {}
+            class Recipe {
+                void run(ItemStack item) { sink(Objects.requireNonNull(item)); }
+            }
+        ";
+        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
+        let mut index = super::JavaProjectIndex::default();
+        index.add_analysis(&analysis);
+        let sink = analysis
+            .call_chains
+            .iter()
+            .flat_map(|chain| &chain.calls)
+            .find(|call| call.name == "sink")
+            .ok_or_else(|| anyhow::anyhow!("sink call missing"))?;
+        let expression = sink
+            .argument_expressions
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("sink argument missing"))?;
+        assert_eq!(
+            index.expression_type_at(
+                "Recipe.java",
+                sink.byte_start,
+                expression,
+                &analysis.bindings
+            ),
+            Some(String::from("demo.ItemStack"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn infers_optional_and_map_get_types() -> anyhow::Result<()> {
+        let source = r#"
+            package demo;
+            import java.util.Map;
+            import java.util.Optional;
+            class ItemStack {}
+            class Recipe {
+                void run(Optional<ItemStack> optional, Map<String, ItemStack> items) {
+                    sink(optional.get());
+                    sink(items.get("key"));
+                }
+            }
+        "#;
+        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
+        let mut index = super::JavaProjectIndex::default();
+        index.add_analysis(&analysis);
+        let sink_calls: Vec<_> = analysis
+            .call_chains
+            .iter()
+            .flat_map(|chain| &chain.calls)
+            .filter(|call| call.name == "sink")
+            .collect();
+        assert_eq!(sink_calls.len(), 2);
+        for sink in sink_calls {
+            let expression = sink
+                .argument_expressions
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("sink argument missing"))?;
+            assert_eq!(
+                index.expression_type_at(
+                    "Recipe.java",
+                    sink.byte_start,
+                    expression,
+                    &analysis.bindings
+                ),
+                Some(String::from("demo.ItemStack"))
+            );
+        }
         Ok(())
     }
 
