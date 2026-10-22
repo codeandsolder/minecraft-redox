@@ -656,6 +656,37 @@ fn is_fluid_accessor(method: &str) -> bool {
     )
 }
 
+pub(crate) fn literal_i64(expression: &JavaExpression) -> Option<i64> {
+    match expression {
+        JavaExpression::Literal(value) => parse_integer_literal(value),
+        JavaExpression::Binary {
+            left,
+            operator,
+            right,
+        } => {
+            let left = literal_i64(left)?;
+            let right = literal_i64(right)?;
+            match operator.as_str() {
+                "+" => left.checked_add(right),
+                "-" => left.checked_sub(right),
+                "*" => left.checked_mul(right),
+                "/" if right != 0 => left.checked_div(right),
+                "%" if right != 0 => left.checked_rem(right),
+                _ => None,
+            }
+        }
+        JavaExpression::Parenthesized(inner) => literal_i64(inner),
+        _ => None,
+    }
+}
+
+pub(crate) fn resolved_reference_name(
+    expression: &JavaExpression,
+    bindings: &JavaBindings,
+) -> Option<String> {
+    reference_name(expression, bindings)
+}
+
 fn eval_i64(expression: &JavaExpression, bindings: &JavaBindings) -> Option<i64> {
     match expression {
         JavaExpression::Literal(value) => parse_integer_literal(value),

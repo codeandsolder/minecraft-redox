@@ -168,3 +168,35 @@ Current GT5 measurement after these Java-language passes:
 - recipe durations: 5,748 total; 5,428 exactly reduced to ticks
 
 The remaining 157 item expressions are no longer a broad syntax problem. They are mostly genuinely dynamic calls, conditional expressions, external-library behavior, or cases that require stronger overload/control-flow evidence. Further percentage-chasing is therefore lower value than making the recovered semantics compile against a real Oxidized target IR with provenance and tests.
+
+
+## Target content IR v1
+
+The first source-language-free recipe target now exists in `minecraft-redox-core::content`. It deliberately contains no Java expression nodes: logical content IDs, named/material-form/ore-key item selectors, concrete stack amounts, input alternatives, recipe-map ID, duration ticks, EU/t and source provenance.
+
+GTNH recipe lowering is fail-closed. A recovered builder only becomes a `ContentRecipe` when every semantic feature used by that source recipe is representable in target IR v1. Fluids, chances, metadata, modifiers, special values/items, post-`addTo` behavior, unresolved item selectors/amounts, missing duration and non-constant EU/t are explicit lowering blockers rather than silently discarded behavior.
+
+This introduces the first real **generated/lowered** metric, distinct from parser/classifier coverage. On the full GT5 tree:
+
+- recovered recipe builders: **5,791**
+- recipe builders structurally normalized: **5,791**
+- item expressions archaeologically accounted: **17,137 / 17,294 (99.09%)**
+- recipes actually lowered into target content IR v1: **161 / 5,791 (2.78%)**
+
+Per-recipe blocker counts (a recipe may have more than one blocker):
+
+- non-constant EU/t: **4,634**
+- fluids: **3,558**
+- item input not yet concretely lowerable: **2,992**
+- modifiers: **2,496**
+- item output not yet concretely lowerable: **2,379**
+- metadata: **1,156**
+- chances: **418**
+- missing duration: **363**
+- missing EU/t: **55**
+- special item/value: **31**
+- post-add or otherwise unhandled builder behavior: **7**
+
+The important result is not that v1 lowers only 161 recipes; it is that those 161 are the first recipes for which the compiler can make a much stronger claim: the output is a typed, source-language-independent content record and no unsupported source behavior was knowingly dropped.
+
+The largest artificial blocker is now scalar evaluation rather than recipe syntax: 4,634 recipes use symbolic EU/t expressions such as tier constants instead of literal integers. Resolving statically provable GT tier constants is therefore the next high-leverage lowering pass, followed by explicit fluid IR rather than another round of syntax-percentage chasing.

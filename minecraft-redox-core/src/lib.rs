@@ -1,4 +1,5 @@
 //! Shared semantic IR and provenance types for Minecraft Redox.
+pub mod content;
 
 use serde::{Deserialize, Serialize};
 

@@ -1,8 +1,12 @@
 //! GTNH-specific semantic recognizers built on Minecraft Redox Java structure.
 
 mod recipe_expression;
+mod target_recipe;
 
 pub use recipe_expression::{FluidSemantic, ItemSemantic, RecoveredExpression};
+pub use target_recipe::{
+    RecipeLoweringBlocker, RecipeLoweringBlockerKind, RecipeLoweringFailure, lower_recipe,
+};
 
 use minecraft_redox_core::SourceOrigin;
 use minecraft_redox_java::{
@@ -13,7 +17,7 @@ use recipe_expression::{
     recover_item_inputs_with_project, recover_items, recover_items_with_project,
 };
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct BuilderCall {
@@ -48,6 +52,7 @@ pub struct RecipeDefinition {
     pub duration: Option<String>,
     pub duration_ticks: Option<i64>,
     pub eut: Option<String>,
+    pub eut_expression: Option<JavaExpression>,
     pub special_value: Option<String>,
     pub special: Option<String>,
     pub metadata: Vec<BuilderCall>,
@@ -85,6 +90,8 @@ pub struct GtnhSummary {
     pub recipes_builder_fully_normalized: usize,
     pub materials: usize,
     pub materials_builder_fully_normalized: usize,
+    pub recipes_lowered: usize,
+    pub recipe_lowering_blockers: BTreeMap<String, usize>,
     pub recipe_unhandled_methods: BTreeMap<String, usize>,
     pub material_unhandled_methods: BTreeMap<String, usize>,
     pub recipe_item_expressions: usize,
@@ -110,6 +117,11 @@ impl GtnhSummary {
         self.recipes_builder_fully_normalized += other.recipes_builder_fully_normalized;
         self.materials += other.materials;
         self.materials_builder_fully_normalized += other.materials_builder_fully_normalized;
+        self.recipes_lowered += other.recipes_lowered;
+        merge_counts(
+            &mut self.recipe_lowering_blockers,
+            other.recipe_lowering_blockers,
+        );
         self.recipe_item_expressions += other.recipe_item_expressions;
         self.recipe_item_semantics_resolved += other.recipe_item_semantics_resolved;
         self.recipe_item_method_links += other.recipe_item_method_links;
@@ -150,6 +162,24 @@ impl GtnhSummary {
             .iter()
             .filter(|material| material.unhandled_calls.is_empty())
             .count();
+        for recipe in &recovery.recipes {
+            match target_recipe::lower_recipe(recipe, &analysis.bindings) {
+                Ok(_) => self.recipes_lowered += 1,
+                Err(failure) => {
+                    let kinds: BTreeSet<_> = failure
+                        .blockers
+                        .iter()
+                        .map(|blocker| blocker.kind)
+                        .collect();
+                    for kind in kinds {
+                        *self
+                            .recipe_lowering_blockers
+                            .entry(kind.as_str().to_owned())
+                            .or_default() += 1;
+                    }
+                }
+            }
+        }
         for recipe in &recovery.recipes {
             self.recipe_item_expressions +=
                 recipe.item_input_semantics.len() + recipe.item_output_semantics.len();
@@ -271,6 +301,7 @@ fn recognize_recipe(
         duration: None,
         duration_ticks: None,
         eut: None,
+        eut_expression: None,
         special_value: None,
         special: None,
         metadata: Vec::new(),
@@ -335,7 +366,7 @@ fn recognize_recipe(
             "inputChances" => recipe.input_chances.extend(call.arguments.clone()),
             "outputChances" => recipe.output_chances.extend(call.arguments.clone()),
             "duration" => set_duration(&mut recipe, call, bindings),
-            "eut" => recipe.eut = one_argument(call),
+            "eut" => set_eut(&mut recipe, call),
             "specialValue" => recipe.special_value = one_argument(call),
             "special" => recipe.special = one_argument(call),
             "metadata" | "recipeCategory" => recipe.metadata.push(call.into()),
@@ -353,6 +384,11 @@ fn set_duration(recipe: &mut RecipeDefinition, call: &JavaCall, bindings: &JavaB
     recipe.duration = one_argument(call);
     recipe.duration_ticks =
         one_expression(call).and_then(|expression| duration_ticks(expression, bindings));
+}
+
+fn set_eut(recipe: &mut RecipeDefinition, call: &JavaCall) {
+    recipe.eut = one_argument(call);
+    recipe.eut_expression = one_expression(call).cloned();
 }
 
 fn recognize_material(chain: &JavaCallChain) -> Option<MaterialDefinition> {
@@ -534,7 +570,7 @@ fn is_known_material_property(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::recover;
+    use super::{GtnhSummary, recover};
     use minecraft_redox_java::analyze_source;
 
     #[test]
@@ -561,6 +597,10 @@ mod tests {
         assert!(recipe.item_input_semantics[0].semantic.is_some());
         assert_eq!(recipe.eut.as_deref(), Some("2"));
         assert_eq!(recipe.unhandled_calls.len(), 0);
+        let mut summary = GtnhSummary::default();
+        summary.absorb(&analysis, &recovery);
+        assert_eq!(summary.recipes_lowered, 1);
+        assert!(summary.recipe_lowering_blockers.is_empty());
         Ok(())
     }
 
