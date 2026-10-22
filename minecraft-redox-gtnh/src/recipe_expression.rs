@@ -143,6 +143,61 @@ pub struct RecoveredExpression<T> {
     pub semantic: Option<T>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ExpressionSemantic {
+    LinkedMethod {
+        method_id: String,
+        return_type: String,
+        receiver_type: Option<String>,
+        arguments: Vec<JavaExpression>,
+    },
+    LinkedValue {
+        value_id: String,
+        value_kind: JavaValueKind,
+        name: String,
+        declared_type: String,
+    },
+    TypedExpression {
+        expression_type: String,
+    },
+    StructuredExpression {
+        expression: JavaExpression,
+    },
+    OpaqueExpression {
+        source: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum NumericSemantic {
+    ExactValue {
+        value: i64,
+    },
+    LinkedMethod {
+        method_id: String,
+        return_type: String,
+        receiver_type: Option<String>,
+        arguments: Vec<JavaExpression>,
+    },
+    LinkedValue {
+        value_id: String,
+        value_kind: JavaValueKind,
+        name: String,
+        declared_type: String,
+    },
+    TypedExpression {
+        expression_type: String,
+    },
+    StructuredExpression {
+        expression: JavaExpression,
+    },
+    OpaqueExpression {
+        source: String,
+    },
+}
+
 #[must_use]
 pub fn recover_items(
     sources: &[String],
@@ -234,6 +289,108 @@ pub fn recover_fluids_with_project(
             project_fluid_semantic(expression, bindings, project, source_path, byte_position)
         })
     })
+}
+
+#[must_use]
+pub fn recover_expression(
+    source: &str,
+    expression: &JavaExpression,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+    source_path: &str,
+    byte_position: usize,
+) -> ExpressionSemantic {
+    if let Some(project) = project {
+        if let JavaExpression::Reference(reference) = expression
+            && let Some(value) =
+                project.resolve_value_at(source_path, byte_position, reference, bindings)
+        {
+            return ExpressionSemantic::LinkedValue {
+                value_id: value.value_id,
+                value_kind: value.kind,
+                name: value.name,
+                declared_type: value.type_name,
+            };
+        }
+        if let JavaExpression::Call { arguments, .. } = expression
+            && let Some((resolved, receiver_type)) =
+                project.resolve_call_at(source_path, byte_position, expression, bindings)
+        {
+            return ExpressionSemantic::LinkedMethod {
+                method_id: resolved.stable_id(),
+                return_type: resolved.return_type.clone(),
+                receiver_type,
+                arguments: arguments.clone(),
+            };
+        }
+        if let Some(expression_type) =
+            project.expression_type_at(source_path, byte_position, expression, bindings)
+        {
+            return ExpressionSemantic::TypedExpression { expression_type };
+        }
+    }
+    match expression {
+        JavaExpression::Raw(_) => ExpressionSemantic::OpaqueExpression {
+            source: source.to_owned(),
+        },
+        _ => ExpressionSemantic::StructuredExpression {
+            expression: expression.clone(),
+        },
+    }
+}
+
+#[must_use]
+pub fn recover_numeric_expression(
+    source: &str,
+    expression: &JavaExpression,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+    source_path: &str,
+    byte_position: usize,
+) -> NumericSemantic {
+    if let Some(ticks) = duration_ticks(expression, bindings) {
+        return NumericSemantic::ExactValue { value: ticks };
+    }
+    match recover_expression(
+        source,
+        expression,
+        bindings,
+        project,
+        source_path,
+        byte_position,
+    ) {
+        ExpressionSemantic::LinkedMethod {
+            method_id,
+            return_type,
+            receiver_type,
+            arguments,
+        } => NumericSemantic::LinkedMethod {
+            method_id,
+            return_type,
+            receiver_type,
+            arguments,
+        },
+        ExpressionSemantic::LinkedValue {
+            value_id,
+            value_kind,
+            name,
+            declared_type,
+        } => NumericSemantic::LinkedValue {
+            value_id,
+            value_kind,
+            name,
+            declared_type,
+        },
+        ExpressionSemantic::TypedExpression { expression_type } => {
+            NumericSemantic::TypedExpression { expression_type }
+        }
+        ExpressionSemantic::StructuredExpression { expression } => {
+            NumericSemantic::StructuredExpression { expression }
+        }
+        ExpressionSemantic::OpaqueExpression { source } => {
+            NumericSemantic::OpaqueExpression { source }
+        }
+    }
 }
 
 #[must_use]
@@ -883,6 +1040,16 @@ fn eval_i64(expression: &JavaExpression, bindings: &JavaBindings) -> Option<i64>
                 "*" => left.checked_mul(right),
                 "/" if right != 0 => left.checked_div(right),
                 "%" if right != 0 => left.checked_rem(right),
+                _ => None,
+            }
+        }
+        JavaExpression::Cast { value, .. } => eval_i64(value, bindings),
+        JavaExpression::Unary { operator, operand } => {
+            let value = eval_i64(operand, bindings)?;
+            match operator.as_str() {
+                "+" => Some(value),
+                "-" => value.checked_neg(),
+                "~" => Some(!value),
                 _ => None,
             }
         }
@@ -1563,6 +1730,22 @@ mod tests {
         assert_eq!(parse_integer_literal("0x10"), Some(16));
         assert_eq!(parse_integer_literal("0b1010"), Some(10));
         assert_eq!(parse_integer_literal("077"), Some(63));
+    }
+
+    #[test]
+    fn evaluates_cast_and_unary_duration_constants() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.util.GTRecipeBuilder.SECONDS;
+            class R { void run() { builder.duration((int) +(2 * SECONDS)); } }
+        ";
+        let analysis = analyze_source("R.java", "gt5", None, source)?;
+        let call = recipe_call(&analysis, "duration")?;
+        let expression = call
+            .argument_expressions
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("missing duration expression"))?;
+        assert_eq!(duration_ticks(expression, &analysis.bindings), Some(40));
+        Ok(())
     }
 
     #[test]

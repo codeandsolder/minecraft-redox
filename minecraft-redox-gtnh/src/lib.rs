@@ -2,15 +2,16 @@
 
 mod recipe_expression;
 
-pub use recipe_expression::{FluidSemantic, ItemSemantic, RecoveredExpression};
+pub use recipe_expression::{FluidSemantic, ItemSemantic, NumericSemantic, RecoveredExpression};
 
 use minecraft_redox_core::SourceOrigin;
 use minecraft_redox_java::{
     JavaAnalysis, JavaBindings, JavaCall, JavaCallChain, JavaExpression, JavaProjectIndex,
 };
 use recipe_expression::{
-    duration_ticks, recover_fluids, recover_fluids_with_project, recover_item_inputs,
+    recover_fluids, recover_fluids_with_project, recover_item_inputs,
     recover_item_inputs_with_project, recover_items, recover_items_with_project,
+    recover_numeric_expression,
 };
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -46,9 +47,17 @@ pub struct RecipeDefinition {
     pub input_chances: Vec<String>,
     pub output_chances: Vec<String>,
     pub duration: Option<String>,
+    pub duration_expression: Option<JavaExpression>,
+    pub duration_semantic: Option<NumericSemantic>,
     pub duration_ticks: Option<i64>,
     pub eut: Option<String>,
+    pub eut_expression: Option<JavaExpression>,
+    pub eut_semantic: Option<NumericSemantic>,
+    pub eut_value: Option<i64>,
     pub special_value: Option<String>,
+    pub special_value_expression: Option<JavaExpression>,
+    pub special_value_semantic: Option<NumericSemantic>,
+    pub special_value_exact: Option<i64>,
     pub special: Option<String>,
     pub metadata: Vec<BuilderCall>,
     pub modifiers: Vec<BuilderCall>,
@@ -99,6 +108,25 @@ pub struct GtnhSummary {
     pub recipe_fluid_typed_expression_links: usize,
     pub recipe_durations: usize,
     pub recipe_durations_resolved_to_ticks: usize,
+    pub recipe_duration_method_links: usize,
+    pub recipe_duration_value_links: usize,
+    pub recipe_duration_typed_expressions: usize,
+    pub recipe_duration_structured_expressions: usize,
+    pub recipe_duration_opaque_expressions: usize,
+    pub recipe_eut_expressions: usize,
+    pub recipe_eut_resolved_to_value: usize,
+    pub recipe_eut_method_links: usize,
+    pub recipe_eut_value_links: usize,
+    pub recipe_eut_typed_expressions: usize,
+    pub recipe_eut_structured_expressions: usize,
+    pub recipe_eut_opaque_expressions: usize,
+    pub recipe_special_values: usize,
+    pub recipe_special_values_exact: usize,
+    pub recipe_special_value_method_links: usize,
+    pub recipe_special_value_value_links: usize,
+    pub recipe_special_value_typed_expressions: usize,
+    pub recipe_special_value_structured_expressions: usize,
+    pub recipe_special_value_opaque_expressions: usize,
 }
 
 impl GtnhSummary {
@@ -124,6 +152,27 @@ impl GtnhSummary {
         self.recipe_fluid_typed_expression_links += other.recipe_fluid_typed_expression_links;
         self.recipe_durations += other.recipe_durations;
         self.recipe_durations_resolved_to_ticks += other.recipe_durations_resolved_to_ticks;
+        self.recipe_duration_method_links += other.recipe_duration_method_links;
+        self.recipe_duration_value_links += other.recipe_duration_value_links;
+        self.recipe_duration_typed_expressions += other.recipe_duration_typed_expressions;
+        self.recipe_duration_structured_expressions += other.recipe_duration_structured_expressions;
+        self.recipe_duration_opaque_expressions += other.recipe_duration_opaque_expressions;
+        self.recipe_eut_expressions += other.recipe_eut_expressions;
+        self.recipe_eut_resolved_to_value += other.recipe_eut_resolved_to_value;
+        self.recipe_eut_method_links += other.recipe_eut_method_links;
+        self.recipe_eut_value_links += other.recipe_eut_value_links;
+        self.recipe_eut_typed_expressions += other.recipe_eut_typed_expressions;
+        self.recipe_eut_structured_expressions += other.recipe_eut_structured_expressions;
+        self.recipe_eut_opaque_expressions += other.recipe_eut_opaque_expressions;
+        self.recipe_special_values += other.recipe_special_values;
+        self.recipe_special_values_exact += other.recipe_special_values_exact;
+        self.recipe_special_value_method_links += other.recipe_special_value_method_links;
+        self.recipe_special_value_value_links += other.recipe_special_value_value_links;
+        self.recipe_special_value_typed_expressions += other.recipe_special_value_typed_expressions;
+        self.recipe_special_value_structured_expressions +=
+            other.recipe_special_value_structured_expressions;
+        self.recipe_special_value_opaque_expressions +=
+            other.recipe_special_value_opaque_expressions;
         merge_counts(
             &mut self.recipe_unhandled_methods,
             other.recipe_unhandled_methods,
@@ -197,8 +246,9 @@ impl GtnhSummary {
                     None => {}
                 }
             }
-            self.recipe_durations += usize::from(recipe.duration.is_some());
-            self.recipe_durations_resolved_to_ticks += usize::from(recipe.duration_ticks.is_some());
+            self.absorb_duration(recipe);
+            self.absorb_eut(recipe);
+            self.absorb_special_value(recipe);
         }
         for call in recovery
             .recipes
@@ -219,6 +269,65 @@ impl GtnhSummary {
                 .material_unhandled_methods
                 .entry(call.name.clone())
                 .or_default() += 1;
+        }
+    }
+
+    fn absorb_duration(&mut self, recipe: &RecipeDefinition) {
+        self.recipe_durations += usize::from(recipe.duration.is_some());
+        let Some(duration) = &recipe.duration_semantic else {
+            return;
+        };
+        match duration {
+            NumericSemantic::ExactValue { .. } => self.recipe_durations_resolved_to_ticks += 1,
+            NumericSemantic::LinkedMethod { .. } => self.recipe_duration_method_links += 1,
+            NumericSemantic::LinkedValue { .. } => self.recipe_duration_value_links += 1,
+            NumericSemantic::TypedExpression { .. } => {
+                self.recipe_duration_typed_expressions += 1;
+            }
+            NumericSemantic::StructuredExpression { .. } => {
+                self.recipe_duration_structured_expressions += 1;
+            }
+            NumericSemantic::OpaqueExpression { .. } => {
+                self.recipe_duration_opaque_expressions += 1;
+            }
+        }
+    }
+
+    fn absorb_eut(&mut self, recipe: &RecipeDefinition) {
+        self.recipe_eut_expressions += usize::from(recipe.eut.is_some());
+        let Some(eut) = &recipe.eut_semantic else {
+            return;
+        };
+        match eut {
+            NumericSemantic::ExactValue { .. } => self.recipe_eut_resolved_to_value += 1,
+            NumericSemantic::LinkedMethod { .. } => self.recipe_eut_method_links += 1,
+            NumericSemantic::LinkedValue { .. } => self.recipe_eut_value_links += 1,
+            NumericSemantic::TypedExpression { .. } => self.recipe_eut_typed_expressions += 1,
+            NumericSemantic::StructuredExpression { .. } => {
+                self.recipe_eut_structured_expressions += 1;
+            }
+            NumericSemantic::OpaqueExpression { .. } => self.recipe_eut_opaque_expressions += 1,
+        }
+    }
+
+    fn absorb_special_value(&mut self, recipe: &RecipeDefinition) {
+        self.recipe_special_values += usize::from(recipe.special_value.is_some());
+        let Some(value) = &recipe.special_value_semantic else {
+            return;
+        };
+        match value {
+            NumericSemantic::ExactValue { .. } => self.recipe_special_values_exact += 1,
+            NumericSemantic::LinkedMethod { .. } => self.recipe_special_value_method_links += 1,
+            NumericSemantic::LinkedValue { .. } => self.recipe_special_value_value_links += 1,
+            NumericSemantic::TypedExpression { .. } => {
+                self.recipe_special_value_typed_expressions += 1;
+            }
+            NumericSemantic::StructuredExpression { .. } => {
+                self.recipe_special_value_structured_expressions += 1;
+            }
+            NumericSemantic::OpaqueExpression { .. } => {
+                self.recipe_special_value_opaque_expressions += 1;
+            }
         }
     }
 }
@@ -279,9 +388,17 @@ fn recognize_recipe(
         input_chances: Vec::new(),
         output_chances: Vec::new(),
         duration: None,
+        duration_expression: None,
+        duration_semantic: None,
         duration_ticks: None,
         eut: None,
+        eut_expression: None,
+        eut_semantic: None,
+        eut_value: None,
         special_value: None,
+        special_value_expression: None,
+        special_value_semantic: None,
+        special_value_exact: None,
         special: None,
         metadata: Vec::new(),
         modifiers: Vec::new(),
@@ -305,15 +422,7 @@ fn recognize_recipe(
                 true,
             ),
             "itemInputsUnsafe" => {
-                add_recipe_items(
-                    &mut recipe,
-                    call,
-                    bindings,
-                    project,
-                    &chain.origin.path,
-                    true,
-                );
-                recipe.modifiers.push(call.into());
+                add_unsafe_recipe_inputs(&mut recipe, call, bindings, project, &chain.origin.path);
             }
             "itemOutputs" => add_recipe_items(
                 &mut recipe,
@@ -341,14 +450,14 @@ fn recognize_recipe(
             ),
             "inputChances" => recipe.input_chances.extend(call.arguments.clone()),
             "outputChances" => recipe.output_chances.extend(call.arguments.clone()),
-            "duration" => set_duration(&mut recipe, call, bindings),
-            "eut" => recipe.eut = one_argument(call),
-            "specialValue" => recipe.special_value = one_argument(call),
+            "duration" => set_duration(&mut recipe, call, bindings, project, &chain.origin.path),
+            "eut" => set_eut(&mut recipe, call, bindings, project, &chain.origin.path),
+            "specialValue" => {
+                set_special_value(&mut recipe, call, bindings, project, &chain.origin.path);
+            }
             "special" => recipe.special = one_argument(call),
             "metadata" | "recipeCategory" => recipe.metadata.push(call.into()),
-            "noOptimize" | "ignoreCollision" | "fake" | "enabled" | "disabled" | "hidden"
-            | "requiresCleanRoom" | "requiresLowGravity" | "requireMods" | "nbtSensitive"
-            | "noBuffer" | "setNEIDesc" | "circuit" => recipe.modifiers.push(call.into()),
+            name if is_recipe_modifier(name) => recipe.modifiers.push(call.into()),
             "addTo" => after_add = true,
             _ => recipe.unhandled_calls.push(call.into()),
         }
@@ -356,10 +465,117 @@ fn recognize_recipe(
     Some(recipe)
 }
 
-fn set_duration(recipe: &mut RecipeDefinition, call: &JavaCall, bindings: &JavaBindings) {
-    recipe.duration = one_argument(call);
-    recipe.duration_ticks =
-        one_expression(call).and_then(|expression| duration_ticks(expression, bindings));
+struct NumericCallRecovery {
+    source: String,
+    expression: JavaExpression,
+    semantic: NumericSemantic,
+    exact_value: Option<i64>,
+}
+
+fn recover_numeric_call(
+    call: &JavaCall,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+    source_path: &str,
+) -> Option<NumericCallRecovery> {
+    let source = one_argument(call)?;
+    let expression = one_expression(call)?.clone();
+    let semantic = recover_numeric_expression(
+        &source,
+        &expression,
+        bindings,
+        project,
+        source_path,
+        call.byte_start,
+    );
+    let exact_value = match semantic {
+        NumericSemantic::ExactValue { value } => Some(value),
+        _ => None,
+    };
+    Some(NumericCallRecovery {
+        source,
+        expression,
+        semantic,
+        exact_value,
+    })
+}
+
+fn add_unsafe_recipe_inputs(
+    recipe: &mut RecipeDefinition,
+    call: &JavaCall,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+    source_path: &str,
+) {
+    add_recipe_items(recipe, call, bindings, project, source_path, true);
+    recipe.modifiers.push(call.into());
+}
+
+fn is_recipe_modifier(name: &str) -> bool {
+    matches!(
+        name,
+        "noOptimize"
+            | "ignoreCollision"
+            | "fake"
+            | "enabled"
+            | "disabled"
+            | "hidden"
+            | "requiresCleanRoom"
+            | "requiresLowGravity"
+            | "requireMods"
+            | "nbtSensitive"
+            | "noBuffer"
+            | "setNEIDesc"
+            | "circuit"
+    )
+}
+
+fn set_duration(
+    recipe: &mut RecipeDefinition,
+    call: &JavaCall,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+    source_path: &str,
+) {
+    let Some(recovered) = recover_numeric_call(call, bindings, project, source_path) else {
+        return;
+    };
+    recipe.duration = Some(recovered.source);
+    recipe.duration_expression = Some(recovered.expression);
+    recipe.duration_ticks = recovered.exact_value;
+    recipe.duration_semantic = Some(recovered.semantic);
+}
+
+fn set_eut(
+    recipe: &mut RecipeDefinition,
+    call: &JavaCall,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+    source_path: &str,
+) {
+    let Some(recovered) = recover_numeric_call(call, bindings, project, source_path) else {
+        return;
+    };
+    recipe.eut = Some(recovered.source);
+    recipe.eut_expression = Some(recovered.expression);
+    recipe.eut_value = recovered.exact_value;
+    recipe.eut_semantic = Some(recovered.semantic);
+}
+
+fn set_special_value(
+    recipe: &mut RecipeDefinition,
+    call: &JavaCall,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+    source_path: &str,
+) {
+    let Some(recovered) = recover_numeric_call(call, bindings, project, source_path) else {
+        return;
+    };
+    recipe.special_value = Some(recovered.source);
+    recipe.special_value_expression = Some(recovered.expression);
+    recipe.special_value_exact = recovered.exact_value;
+    recipe.special_value_semantic = Some(recovered.semantic);
 }
 
 fn recognize_material(chain: &JavaCallChain) -> Option<MaterialDefinition> {
