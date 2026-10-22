@@ -44,6 +44,11 @@ pub enum ItemSemantic {
         inner: Option<Box<ItemSemantic>>,
         unsafe_copy: bool,
     },
+    CopyItem {
+        item: JavaExpression,
+        inner: Option<Box<ItemSemantic>>,
+        nullable: bool,
+    },
     ItemStack {
         item: JavaExpression,
         amount: Option<JavaExpression>,
@@ -343,6 +348,15 @@ fn project_item_semantic(
             })
         }
         JavaExpression::Call { arguments, .. } => {
+            if let Some(semantic) = project_copy_item_semantic(
+                expression,
+                bindings,
+                project,
+                source_path,
+                byte_position,
+            ) {
+                return Some(semantic);
+            }
             if let Some((resolved, receiver_type)) =
                 project.resolve_call_at(source_path, byte_position, expression, bindings)
                 && let Some(semantic) =
@@ -357,6 +371,40 @@ fn project_item_semantic(
         }
         _ => typed_item_expression(expression, bindings, project, source_path, byte_position),
     }
+}
+
+fn project_copy_item_semantic(
+    expression: &JavaExpression,
+    bindings: &JavaBindings,
+    project: &JavaProjectIndex,
+    source_path: &str,
+    byte_position: usize,
+) -> Option<ItemSemantic> {
+    let JavaExpression::Call {
+        receiver: Some(receiver),
+        method,
+        arguments,
+    } = expression
+    else {
+        return None;
+    };
+    if method != "copy" || !arguments.is_empty() {
+        return None;
+    }
+    let receiver_type =
+        project.expression_type_at(source_path, byte_position, receiver, bindings)?;
+    if !receiver_type.trim().ends_with("ItemStack") {
+        return None;
+    }
+    let item = receiver.as_ref().clone();
+    let inner = item_semantic(&item, bindings)
+        .or_else(|| project_item_semantic(&item, bindings, project, source_path, byte_position))
+        .map(Box::new);
+    Some(ItemSemantic::CopyItem {
+        item,
+        inner,
+        nullable: false,
+    })
 }
 
 fn typed_item_expression(
@@ -470,6 +518,15 @@ fn classify_item_call(
     }
 
     if resolved_receiver.ends_with("GTUtility") {
+        if method == "copyOrNull" && arguments.len() == 1 {
+            let item = arguments.first()?.clone();
+            let inner = item_semantic(&item, bindings).map(Box::new);
+            return Some(ItemSemantic::CopyItem {
+                item,
+                inner,
+                nullable: true,
+            });
+        }
         if matches!(method, "copyAmount" | "copyAmountUnsafe") && arguments.len() >= 2 {
             let item = arguments.get(1)?.clone();
             let inner = item_semantic(&item, bindings).map(Box::new);
@@ -900,6 +957,43 @@ mod tests {
         };
         assert_eq!(receiver_type.as_deref(), Some("Widget"));
         assert_eq!(method_id, "Widget#get(int)");
+        Ok(())
+    }
+
+    #[test]
+    fn recognizes_item_copy_operations() -> anyhow::Result<()> {
+        let source = r"
+            import gregtech.api.util.GTUtility;
+            class ItemStack { ItemStack copy() { return this; } }
+            class R {
+                void run(ItemStack input) {
+                    builder.itemInputs(input.copy(), GTUtility.copyOrNull(input));
+                }
+            }
+        ";
+        let analysis = analyze_source("R.java", "gt5", None, source)?;
+        let mut project = minecraft_redox_java::JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let items = recipe_call(&analysis, "itemInputs")?;
+        let recovered = super::recover_items_with_project(
+            &items.arguments,
+            &items.argument_expressions,
+            &analysis.bindings,
+            &project,
+            "R.java",
+            items.byte_start,
+        );
+        assert!(matches!(
+            recovered[0].semantic,
+            Some(ItemSemantic::CopyItem {
+                nullable: false,
+                ..
+            })
+        ));
+        assert!(matches!(
+            recovered[1].semantic,
+            Some(ItemSemantic::CopyItem { nullable: true, .. })
+        ));
         Ok(())
     }
 
