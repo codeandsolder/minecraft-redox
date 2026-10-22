@@ -4,8 +4,8 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use minecraft_redox_gtnh::{GtnhSummary, recover};
-use minecraft_redox_java::{analyze_source, inventory_source};
+use minecraft_redox_gtnh::{GtnhSummary, recover_with_project};
+use minecraft_redox_java::{JavaProjectIndex, analyze_source, inventory_source};
 use rayon::prelude::*;
 use serde::Serialize;
 
@@ -47,8 +47,9 @@ fn print_chains(path: &str) -> Result<()> {
 
 fn print_gtnh(path: &str, summary_only: bool) -> Result<()> {
     let paths = java_paths(Path::new(path))?;
+    let project = build_project_index(&paths)?;
     if summary_only {
-        let summary = summarize_gtnh(&paths)?;
+        let summary = summarize_gtnh(&paths, &project)?;
         println!("{}", serde_json::to_string_pretty(&summary)?);
         return Ok(());
     }
@@ -58,7 +59,7 @@ fn print_gtnh(path: &str, summary_only: bool) -> Result<()> {
         let display = source_path.to_string_lossy().into_owned();
         let source = read_source(&source_path)?;
         let analysis = analyze_source(&display, "GTNH", None, &source)?;
-        let recovery = recover(&analysis);
+        let recovery = recover_with_project(&analysis, &project);
         if !recovery.recipes.is_empty() || !recovery.materials.is_empty() {
             files.push(FileRecovery {
                 path: display,
@@ -70,14 +71,30 @@ fn print_gtnh(path: &str, summary_only: bool) -> Result<()> {
     Ok(())
 }
 
-fn summarize_gtnh(paths: &[PathBuf]) -> Result<GtnhSummary> {
+fn build_project_index(paths: &[PathBuf]) -> Result<JavaProjectIndex> {
     paths
         .par_iter()
         .map(|source_path| {
             let display = source_path.to_string_lossy().into_owned();
             let source = read_source(source_path)?;
             let analysis = analyze_source(&display, "GTNH", None, &source)?;
-            let recovery = recover(&analysis);
+            let mut index = JavaProjectIndex::default();
+            index.add_analysis(&analysis);
+            Ok(index)
+        })
+        .try_reduce(JavaProjectIndex::default, |left, right| {
+            Ok(left.merged(right))
+        })
+}
+
+fn summarize_gtnh(paths: &[PathBuf], project: &JavaProjectIndex) -> Result<GtnhSummary> {
+    paths
+        .par_iter()
+        .map(|source_path| {
+            let display = source_path.to_string_lossy().into_owned();
+            let source = read_source(source_path)?;
+            let analysis = analyze_source(&display, "GTNH", None, &source)?;
+            let recovery = recover_with_project(&analysis, project);
             let mut summary = GtnhSummary::default();
             summary.absorb(&analysis, &recovery);
             Ok(summary)

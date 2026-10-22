@@ -5,8 +5,12 @@ mod recipe_expression;
 pub use recipe_expression::{FluidSemantic, ItemSemantic, RecoveredExpression};
 
 use minecraft_redox_core::SourceOrigin;
-use minecraft_redox_java::{JavaAnalysis, JavaBindings, JavaCall, JavaCallChain, JavaExpression};
-use recipe_expression::{duration_ticks, recover_fluids, recover_items};
+use minecraft_redox_java::{
+    JavaAnalysis, JavaBindings, JavaCall, JavaCallChain, JavaExpression, JavaProjectIndex,
+};
+use recipe_expression::{
+    duration_ticks, recover_fluids, recover_items, recover_items_with_project,
+};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
@@ -84,6 +88,7 @@ pub struct GtnhSummary {
     pub material_unhandled_methods: BTreeMap<String, usize>,
     pub recipe_item_expressions: usize,
     pub recipe_item_semantics_resolved: usize,
+    pub recipe_item_local_method_links: usize,
     pub recipe_fluid_expressions: usize,
     pub recipe_fluid_semantics_resolved: usize,
     pub recipe_durations: usize,
@@ -103,6 +108,7 @@ impl GtnhSummary {
         self.materials_builder_fully_normalized += other.materials_builder_fully_normalized;
         self.recipe_item_expressions += other.recipe_item_expressions;
         self.recipe_item_semantics_resolved += other.recipe_item_semantics_resolved;
+        self.recipe_item_local_method_links += other.recipe_item_local_method_links;
         self.recipe_fluid_expressions += other.recipe_fluid_expressions;
         self.recipe_fluid_semantics_resolved += other.recipe_fluid_semantics_resolved;
         self.recipe_durations += other.recipe_durations;
@@ -140,12 +146,19 @@ impl GtnhSummary {
         for recipe in &recovery.recipes {
             self.recipe_item_expressions +=
                 recipe.item_input_semantics.len() + recipe.item_output_semantics.len();
-            self.recipe_item_semantics_resolved += recipe
+            for value in recipe
                 .item_input_semantics
                 .iter()
                 .chain(&recipe.item_output_semantics)
-                .filter(|value| value.semantic.is_some())
-                .count();
+            {
+                match value.semantic {
+                    Some(ItemSemantic::LocalMethod { .. }) => {
+                        self.recipe_item_local_method_links += 1;
+                    }
+                    Some(_) => self.recipe_item_semantics_resolved += 1,
+                    None => {}
+                }
+            }
             self.recipe_fluid_expressions +=
                 recipe.fluid_input_semantics.len() + recipe.fluid_output_semantics.len();
             self.recipe_fluid_semantics_resolved += recipe
@@ -188,11 +201,20 @@ fn merge_counts(target: &mut BTreeMap<String, usize>, source: BTreeMap<String, u
 
 #[must_use]
 pub fn recover(analysis: &JavaAnalysis) -> GtnhRecovery {
+    recover_internal(analysis, None)
+}
+
+#[must_use]
+pub fn recover_with_project(analysis: &JavaAnalysis, project: &JavaProjectIndex) -> GtnhRecovery {
+    recover_internal(analysis, Some(project))
+}
+
+fn recover_internal(analysis: &JavaAnalysis, project: Option<&JavaProjectIndex>) -> GtnhRecovery {
     GtnhRecovery {
         recipes: analysis
             .call_chains
             .iter()
-            .filter_map(|chain| recognize_recipe(chain, &analysis.bindings))
+            .filter_map(|chain| recognize_recipe(chain, &analysis.bindings, project))
             .collect(),
         materials: analysis
             .call_chains
@@ -202,7 +224,11 @@ pub fn recover(analysis: &JavaAnalysis) -> GtnhRecovery {
     }
 }
 
-fn recognize_recipe(chain: &JavaCallChain, bindings: &JavaBindings) -> Option<RecipeDefinition> {
+fn recognize_recipe(
+    chain: &JavaCallChain,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+) -> Option<RecipeDefinition> {
     if chain.calls.first()?.name != "stdBuilder" {
         return None;
     }
@@ -245,6 +271,8 @@ fn recognize_recipe(chain: &JavaCallChain, bindings: &JavaBindings) -> Option<Re
                 &mut recipe.item_input_semantics,
                 call,
                 bindings,
+                project,
+                &chain.origin.path,
             ),
             "itemInputsUnsafe" => {
                 add_items(
@@ -252,6 +280,8 @@ fn recognize_recipe(chain: &JavaCallChain, bindings: &JavaBindings) -> Option<Re
                     &mut recipe.item_input_semantics,
                     call,
                     bindings,
+                    project,
+                    &chain.origin.path,
                 );
                 recipe.modifiers.push(call.into());
             }
@@ -260,6 +290,8 @@ fn recognize_recipe(chain: &JavaCallChain, bindings: &JavaBindings) -> Option<Re
                 &mut recipe.item_output_semantics,
                 call,
                 bindings,
+                project,
+                &chain.origin.path,
             ),
             "fluidInputs" => add_fluids(
                 &mut recipe.fluid_inputs,
@@ -333,13 +365,23 @@ fn add_items(
     semantics: &mut Vec<RecoveredExpression<ItemSemantic>>,
     call: &JavaCall,
     bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+    source_path: &str,
 ) {
     raw.extend(call.arguments.clone());
-    semantics.extend(recover_items(
-        &call.arguments,
-        &call.argument_expressions,
-        bindings,
-    ));
+    let recovered = project.map_or_else(
+        || recover_items(&call.arguments, &call.argument_expressions, bindings),
+        |project| {
+            recover_items_with_project(
+                &call.arguments,
+                &call.argument_expressions,
+                bindings,
+                project,
+                source_path,
+            )
+        },
+    );
+    semantics.extend(recovered);
 }
 
 fn add_fluids(

@@ -81,3 +81,11 @@ On the same full GT5 source scan:
 - recipe durations: 5,748 total; **5,428 exactly reduced to integer ticks (94.4%)**
 
 The unresolved tail is intentionally preserved. A major remaining item family is local helper calls such as `get(...)` in `ComponentAssemblyLineLoader`; their meaning comes from actual local method definitions, so resolving them belongs in a project symbol/method layer rather than a name-based heuristic.
+
+## Project method index
+
+The Java frontend now inventories method owners, return types, parameters, varargs/static status and exact provenance, and builds a compact project index. GTNH lowering runs as two parallel passes: one builds the method index; the second performs semantic recovery with that index available.
+
+Local calls are linked only when `(source file, method name, arity)` identifies exactly one compatible method. Ambiguous overloads remain unresolved. A linked method returning `ItemStack` is recorded as a `LocalMethod` semantic with its stable signature, but is **not** counted as a fully resolved item meaning until its body is understood.
+
+On GT5 this links 431 recipe item expressions while preserving the previous 14,546 directly understood item semantics. `ComponentAssemblyLineLoader` accounts for 421 of those links: 299 calls to `get(OrePrefixes,Object,int)` and 122 calls to `get(ItemList,int)`. This is the intended handoff to method-body lowering rather than another name heuristic.

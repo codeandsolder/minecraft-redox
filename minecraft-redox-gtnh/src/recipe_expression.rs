@@ -1,4 +1,4 @@
-use minecraft_redox_java::{JavaBindings, JavaExpression};
+use minecraft_redox_java::{JavaBindings, JavaExpression, JavaProjectIndex};
 use serde::Serialize;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -50,6 +50,11 @@ pub enum ItemSemantic {
     OreDictStack {
         arguments: Vec<JavaExpression>,
     },
+    LocalMethod {
+        method_id: String,
+        return_type: String,
+        arguments: Vec<JavaExpression>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -85,6 +90,20 @@ pub fn recover_items(
 ) -> Vec<RecoveredExpression<ItemSemantic>> {
     recover_values(sources, expressions, |expression| {
         item_semantic(expression, bindings)
+    })
+}
+
+#[must_use]
+pub fn recover_items_with_project(
+    sources: &[String],
+    expressions: &[JavaExpression],
+    bindings: &JavaBindings,
+    project: &JavaProjectIndex,
+    source_path: &str,
+) -> Vec<RecoveredExpression<ItemSemantic>> {
+    recover_values(sources, expressions, |expression| {
+        item_semantic(expression, bindings)
+            .or_else(|| local_item_semantic(expression, project, source_path))
     })
 }
 
@@ -142,6 +161,30 @@ fn item_semantic(expression: &JavaExpression, bindings: &JavaBindings) -> Option
         JavaExpression::Parenthesized(inner) => item_semantic(inner, bindings),
         _ => None,
     }
+}
+
+fn local_item_semantic(
+    expression: &JavaExpression,
+    project: &JavaProjectIndex,
+    source_path: &str,
+) -> Option<ItemSemantic> {
+    let JavaExpression::Call {
+        receiver: None,
+        method,
+        arguments,
+    } = expression
+    else {
+        return None;
+    };
+    let resolved = project.resolve_local_method(source_path, method, arguments.len())?;
+    if !resolved.return_type.ends_with("ItemStack") {
+        return None;
+    }
+    Some(ItemSemantic::LocalMethod {
+        method_id: resolved.stable_id(),
+        return_type: resolved.return_type.clone(),
+        arguments: arguments.clone(),
+    })
 }
 
 fn classify_item_call(
@@ -510,6 +553,33 @@ mod tests {
             recovered[0].semantic,
             Some(FluidSemantic::FluidAccessor { .. })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn links_unique_local_item_factory_by_name_and_arity() -> anyhow::Result<()> {
+        let source = r#"
+            import net.minecraft.item.ItemStack;
+            class R {
+                static ItemStack get(String key, int amount) { return null; }
+                void run() { builder.itemInputs(get("dustIron", 4)); }
+            }
+        "#;
+        let analysis = analyze_source("R.java", "gt5", None, source)?;
+        let mut project = minecraft_redox_java::JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let items = recipe_call(&analysis, "itemInputs")?;
+        let recovered = super::recover_items_with_project(
+            &items.arguments,
+            &items.argument_expressions,
+            &analysis.bindings,
+            &project,
+            "R.java",
+        );
+        let Some(ItemSemantic::LocalMethod { method_id, .. }) = &recovered[0].semantic else {
+            return Err(anyhow::anyhow!("local method was not linked"));
+        };
+        assert_eq!(method_id, "R#get(String,int)");
         Ok(())
     }
 

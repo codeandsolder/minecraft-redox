@@ -105,9 +105,107 @@ impl JavaBindings {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct JavaParameter {
+    pub type_name: String,
+    pub name: String,
+    pub varargs: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct JavaMethod {
+    pub owner: String,
+    pub name: String,
+    pub return_type: String,
+    pub parameters: Vec<JavaParameter>,
+    pub is_static: bool,
+    pub origin: SourceOrigin,
+}
+
+impl JavaMethod {
+    #[must_use]
+    pub fn stable_id(&self) -> String {
+        let parameters = self
+            .parameters
+            .iter()
+            .map(|parameter| {
+                if parameter.varargs {
+                    format!("{}...", parameter.type_name)
+                } else {
+                    parameter.type_name.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        format!("{}#{}({parameters})", self.owner, self.name)
+    }
+
+    #[must_use]
+    pub fn accepts_arity(&self, arity: usize) -> bool {
+        match self.parameters.last() {
+            Some(parameter) if parameter.varargs => {
+                arity >= self.parameters.len().saturating_sub(1)
+            }
+            _ => arity == self.parameters.len(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct JavaProjectIndex {
+    methods_by_path: BTreeMap<String, Vec<JavaMethod>>,
+}
+
+impl JavaProjectIndex {
+    pub fn add_analysis(&mut self, analysis: &JavaAnalysis) {
+        for method in &analysis.methods {
+            self.methods_by_path
+                .entry(method.origin.path.clone())
+                .or_default()
+                .push(method.clone());
+        }
+    }
+
+    #[must_use]
+    pub fn merged(mut self, other: Self) -> Self {
+        for (path, mut methods) in other.methods_by_path {
+            self.methods_by_path
+                .entry(path)
+                .or_default()
+                .append(&mut methods);
+        }
+        self
+    }
+
+    #[must_use]
+    pub fn method_count(&self) -> usize {
+        self.methods_by_path.values().map(Vec::len).sum()
+    }
+
+    #[must_use]
+    pub fn resolve_local_method(
+        &self,
+        path: &str,
+        name: &str,
+        arity: usize,
+    ) -> Option<&JavaMethod> {
+        let mut matches = self
+            .methods_by_path
+            .get(path)?
+            .iter()
+            .filter(|method| method.name == name && method.accepts_arity(arity));
+        let method = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        Some(method)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct JavaAnalysis {
     pub bindings: JavaBindings,
     pub inventory: JavaInventory,
+    pub methods: Vec<JavaMethod>,
     pub call_chains: Vec<JavaCallChain>,
 }
 
@@ -126,6 +224,16 @@ pub fn analyze_source(
     let tree = parse(source)?;
     let bindings = bindings_tree(tree.root_node(), source);
     let inventory = inventory_tree(path, artifact, version, source, &tree);
+    let mut methods = Vec::new();
+    collect_methods(
+        tree.root_node(),
+        source,
+        path,
+        artifact,
+        version,
+        &bindings,
+        &mut methods,
+    );
     let mut call_chains = Vec::new();
     collect_outer_call_chains(
         tree.root_node(),
@@ -138,6 +246,7 @@ pub fn analyze_source(
     Ok(JavaAnalysis {
         bindings,
         inventory,
+        methods,
         call_chains,
     })
 }
@@ -273,6 +382,140 @@ fn walk_symbols(
     for child in node.children(&mut cursor) {
         walk_symbols(child, source, path, artifact, version, symbols);
     }
+}
+
+fn collect_methods(
+    node: Node<'_>,
+    source: &str,
+    path: &str,
+    artifact: &str,
+    version: Option<&str>,
+    bindings: &JavaBindings,
+    methods: &mut Vec<JavaMethod>,
+) {
+    if node.kind() == "method_declaration"
+        && let Some(method) = method_from_node(node, source, path, artifact, version, bindings)
+    {
+        methods.push(method);
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_methods(child, source, path, artifact, version, bindings, methods);
+    }
+}
+
+fn method_from_node(
+    node: Node<'_>,
+    source: &str,
+    path: &str,
+    artifact: &str,
+    version: Option<&str>,
+    bindings: &JavaBindings,
+) -> Option<JavaMethod> {
+    let name_node = node.child_by_field_name("name")?;
+    let return_type_node = node.child_by_field_name("type")?;
+    let parameters_node = node.child_by_field_name("parameters")?;
+    let name = node_text(name_node, source).ok()?.to_owned();
+    let return_type = bindings.resolve_reference(node_text(return_type_node, source).ok()?.trim());
+    let owner = enclosing_type_name(node, source, bindings)?;
+    let parameters = method_parameters(parameters_node, source, bindings);
+    let is_static = method_is_static(node, source);
+    Some(JavaMethod {
+        owner,
+        name: name.clone(),
+        return_type,
+        parameters,
+        is_static,
+        origin: origin_for(node, Some(&name), path, artifact, version),
+    })
+}
+
+fn method_parameters(
+    parameters: Node<'_>,
+    source: &str,
+    bindings: &JavaBindings,
+) -> Vec<JavaParameter> {
+    let mut cursor = parameters.walk();
+    parameters
+        .named_children(&mut cursor)
+        .filter_map(|parameter| parameter_from_node(parameter, source, bindings))
+        .collect()
+}
+
+fn parameter_from_node(
+    parameter: Node<'_>,
+    source: &str,
+    bindings: &JavaBindings,
+) -> Option<JavaParameter> {
+    match parameter.kind() {
+        "formal_parameter" => {
+            let type_node = parameter.child_by_field_name("type")?;
+            let name_node = parameter.child_by_field_name("name")?;
+            Some(JavaParameter {
+                type_name: bindings.resolve_reference(node_text(type_node, source).ok()?.trim()),
+                name: node_text(name_node, source).ok()?.to_owned(),
+                varargs: false,
+            })
+        }
+        "spread_parameter" => spread_parameter(parameter, source, bindings),
+        _ => None,
+    }
+}
+
+fn spread_parameter(
+    parameter: Node<'_>,
+    source: &str,
+    bindings: &JavaBindings,
+) -> Option<JavaParameter> {
+    let mut cursor = parameter.walk();
+    let children: Vec<Node<'_>> = parameter.named_children(&mut cursor).collect();
+    let variable = children
+        .iter()
+        .find(|child| child.kind() == "variable_declarator")?;
+    let name_node = variable.child_by_field_name("name")?;
+    let type_node = children.iter().find(|child| {
+        !matches!(
+            child.kind(),
+            "modifiers" | "annotation" | "marker_annotation" | "variable_declarator"
+        )
+    })?;
+    Some(JavaParameter {
+        type_name: bindings.resolve_reference(node_text(*type_node, source).ok()?.trim()),
+        name: node_text(name_node, source).ok()?.to_owned(),
+        varargs: true,
+    })
+}
+
+fn enclosing_type_name(node: Node<'_>, source: &str, bindings: &JavaBindings) -> Option<String> {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if matches!(
+            parent.kind(),
+            "class_declaration"
+                | "interface_declaration"
+                | "enum_declaration"
+                | "record_declaration"
+        ) && let Some(name_node) = parent.child_by_field_name("name")
+            && let Ok(name) = node_text(name_node, source)
+        {
+            return Some(
+                bindings
+                    .package
+                    .as_ref()
+                    .map_or_else(|| name.to_owned(), |package| format!("{package}.{name}")),
+            );
+        }
+        current = parent.parent();
+    }
+    None
+}
+
+fn method_is_static(node: Node<'_>, source: &str) -> bool {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| child.kind() == "modifiers")
+        .and_then(|modifiers| node_text(modifiers, source).ok())
+        .is_some_and(|modifiers| modifiers.split_whitespace().any(|token| token == "static"))
 }
 
 fn collect_outer_call_chains(
@@ -566,6 +809,40 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("material builder chain not recovered"))?;
         assert_eq!(chain.calls[0].name, "setName");
         assert_eq!(chain.calls[2].name, "constructMaterial");
+        Ok(())
+    }
+
+    #[test]
+    fn indexes_method_signatures_and_resolves_unique_local_overloads() -> anyhow::Result<()> {
+        let source = r"
+            package demo;
+            import net.minecraft.item.ItemStack;
+            class Factory {
+                private static ItemStack get(String key, int amount) { return null; }
+                private static ItemStack get(int amount) { return null; }
+            }
+        ";
+        let analysis = analyze_source("Factory.java", "demo", None, source)?;
+        assert_eq!(analysis.methods.len(), 2);
+        assert_eq!(analysis.methods[0].owner, "demo.Factory");
+        assert_eq!(
+            analysis.methods[0].return_type,
+            "net.minecraft.item.ItemStack"
+        );
+        assert!(analysis.methods[0].is_static);
+        assert_eq!(
+            analysis.methods[0].stable_id(),
+            "demo.Factory#get(String,int)"
+        );
+
+        let mut index = super::JavaProjectIndex::default();
+        index.add_analysis(&analysis);
+        assert_eq!(index.method_count(), 2);
+        let method = index
+            .resolve_local_method("Factory.java", "get", 2)
+            .ok_or_else(|| anyhow::anyhow!("two-argument overload not resolved"))?;
+        assert_eq!(method.parameters.len(), 2);
+        assert_eq!(method.return_type, "net.minecraft.item.ItemStack");
         Ok(())
     }
 
