@@ -63,6 +63,11 @@ pub enum JavaExpression {
         operator: String,
         right: Box<JavaExpression>,
     },
+    Ternary {
+        condition: Box<JavaExpression>,
+        consequence: Box<JavaExpression>,
+        alternative: Box<JavaExpression>,
+    },
     Parenthesized(Box<JavaExpression>),
     Raw(String),
 }
@@ -650,12 +655,47 @@ impl JavaProjectIndex {
                 &resolve_type_reference(bindings, type_name),
                 bindings.package.as_deref(),
             )),
+            JavaExpression::Ternary {
+                consequence,
+                alternative,
+                ..
+            } => self.ternary_expression_type_at(
+                path,
+                byte_position,
+                consequence,
+                alternative,
+                bindings,
+            ),
             JavaExpression::Parenthesized(inner) => {
                 self.expression_type_at(path, byte_position, inner, bindings)
             }
             JavaExpression::Literal(value) => Some(literal_java_type(value).to_owned()),
             JavaExpression::Binary { .. } | JavaExpression::Raw(_) => None,
         }
+    }
+
+    fn ternary_expression_type_at(
+        &self,
+        path: &str,
+        byte_position: usize,
+        consequence: &JavaExpression,
+        alternative: &JavaExpression,
+        bindings: &JavaBindings,
+    ) -> Option<String> {
+        let consequence_type =
+            self.expression_type_at(path, byte_position, consequence, bindings)?;
+        let alternative_type =
+            self.expression_type_at(path, byte_position, alternative, bindings)?;
+        if consequence_type == alternative_type {
+            return Some(consequence_type);
+        }
+        if consequence_type == "null" && !is_java_primitive(&alternative_type) {
+            return Some(alternative_type);
+        }
+        if alternative_type == "null" && !is_java_primitive(&consequence_type) {
+            return Some(consequence_type);
+        }
+        None
     }
 
     fn standard_library_call_type(
@@ -1737,6 +1777,15 @@ pub fn substitute_references(
             operator: operator.clone(),
             right: Box::new(substitute_references(right, replacements)),
         },
+        JavaExpression::Ternary {
+            condition,
+            consequence,
+            alternative,
+        } => JavaExpression::Ternary {
+            condition: Box::new(substitute_references(condition, replacements)),
+            consequence: Box::new(substitute_references(consequence, replacements)),
+            alternative: Box::new(substitute_references(alternative, replacements)),
+        },
         JavaExpression::Parenthesized(inner) => {
             JavaExpression::Parenthesized(Box::new(substitute_references(inner, replacements)))
         }
@@ -1861,6 +1910,7 @@ fn expression(node: Node<'_>, source: &str) -> JavaExpression {
         "method_invocation" => expression_call(node, source),
         "object_creation_expression" => expression_new(node, source),
         "binary_expression" => expression_binary(node, source),
+        "ternary_expression" => expression_ternary(node, source),
         "parenthesized_expression" => node.named_child(0).map_or_else(
             || JavaExpression::Raw(node_source(node, source)),
             |child| JavaExpression::Parenthesized(Box::new(expression(child, source))),
@@ -1954,6 +2004,21 @@ fn expression_new(node: Node<'_>, source: &str) -> JavaExpression {
     JavaExpression::New {
         type_name,
         arguments,
+    }
+}
+
+fn expression_ternary(node: Node<'_>, source: &str) -> JavaExpression {
+    let (Some(condition), Some(consequence), Some(alternative)) = (
+        node.child_by_field_name("condition"),
+        node.child_by_field_name("consequence"),
+        node.child_by_field_name("alternative"),
+    ) else {
+        return JavaExpression::Raw(node_source(node, source));
+    };
+    JavaExpression::Ternary {
+        condition: Box::new(expression(condition, source)),
+        consequence: Box::new(expression(consequence, source)),
+        alternative: Box::new(expression(alternative, source)),
     }
 }
 
@@ -2654,6 +2719,43 @@ mod tests {
             )
             .ok_or_else(|| anyhow::anyhow!("primitive overload was not resolved"))?;
         assert_eq!(resolved.parameters[0].type_name, "long");
+        Ok(())
+    }
+
+    #[test]
+    fn parses_and_types_ternary_expression() -> anyhow::Result<()> {
+        let source = r"
+            package demo;
+            class ItemStack {}
+            class Recipe {
+                void run(boolean choose, ItemStack left, ItemStack right) {
+                    sink(choose ? left : right);
+                }
+            }
+        ";
+        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
+        let mut index = super::JavaProjectIndex::default();
+        index.add_analysis(&analysis);
+        let sink = analysis
+            .call_chains
+            .iter()
+            .flat_map(|chain| &chain.calls)
+            .find(|call| call.name == "sink")
+            .ok_or_else(|| anyhow::anyhow!("sink call missing"))?;
+        let expression = sink
+            .argument_expressions
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("sink argument missing"))?;
+        assert!(matches!(expression, super::JavaExpression::Ternary { .. }));
+        assert_eq!(
+            index.expression_type_at(
+                "Recipe.java",
+                sink.byte_start,
+                expression,
+                &analysis.bindings
+            ),
+            Some(String::from("ItemStack"))
+        );
         Ok(())
     }
 
