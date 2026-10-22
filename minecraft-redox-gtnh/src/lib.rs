@@ -1,7 +1,12 @@
 //! GTNH-specific semantic recognizers built on Minecraft Redox Java structure.
 
+mod recipe_expression;
+
+pub use recipe_expression::{FluidSemantic, ItemSemantic, RecoveredExpression};
+
 use minecraft_redox_core::SourceOrigin;
-use minecraft_redox_java::{JavaAnalysis, JavaBindings, JavaCall, JavaCallChain};
+use minecraft_redox_java::{JavaAnalysis, JavaBindings, JavaCall, JavaCallChain, JavaExpression};
+use recipe_expression::{duration_ticks, recover_fluids, recover_items};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
@@ -26,12 +31,17 @@ pub struct RecipeDefinition {
     pub builder_root: String,
     pub recipe_map: String,
     pub item_inputs: Vec<String>,
+    pub item_input_semantics: Vec<RecoveredExpression<ItemSemantic>>,
     pub item_outputs: Vec<String>,
+    pub item_output_semantics: Vec<RecoveredExpression<ItemSemantic>>,
     pub fluid_inputs: Vec<String>,
+    pub fluid_input_semantics: Vec<RecoveredExpression<FluidSemantic>>,
     pub fluid_outputs: Vec<String>,
+    pub fluid_output_semantics: Vec<RecoveredExpression<FluidSemantic>>,
     pub input_chances: Vec<String>,
     pub output_chances: Vec<String>,
     pub duration: Option<String>,
+    pub duration_ticks: Option<i64>,
     pub eut: Option<String>,
     pub special_value: Option<String>,
     pub special: Option<String>,
@@ -72,6 +82,12 @@ pub struct GtnhSummary {
     pub materials_builder_fully_normalized: usize,
     pub recipe_unhandled_methods: BTreeMap<String, usize>,
     pub material_unhandled_methods: BTreeMap<String, usize>,
+    pub recipe_item_expressions: usize,
+    pub recipe_item_semantics_resolved: usize,
+    pub recipe_fluid_expressions: usize,
+    pub recipe_fluid_semantics_resolved: usize,
+    pub recipe_durations: usize,
+    pub recipe_durations_resolved_to_ticks: usize,
 }
 
 impl GtnhSummary {
@@ -85,6 +101,12 @@ impl GtnhSummary {
         self.recipes_builder_fully_normalized += other.recipes_builder_fully_normalized;
         self.materials += other.materials;
         self.materials_builder_fully_normalized += other.materials_builder_fully_normalized;
+        self.recipe_item_expressions += other.recipe_item_expressions;
+        self.recipe_item_semantics_resolved += other.recipe_item_semantics_resolved;
+        self.recipe_fluid_expressions += other.recipe_fluid_expressions;
+        self.recipe_fluid_semantics_resolved += other.recipe_fluid_semantics_resolved;
+        self.recipe_durations += other.recipe_durations;
+        self.recipe_durations_resolved_to_ticks += other.recipe_durations_resolved_to_ticks;
         merge_counts(
             &mut self.recipe_unhandled_methods,
             other.recipe_unhandled_methods,
@@ -115,6 +137,26 @@ impl GtnhSummary {
             .iter()
             .filter(|material| material.unhandled_calls.is_empty())
             .count();
+        for recipe in &recovery.recipes {
+            self.recipe_item_expressions +=
+                recipe.item_input_semantics.len() + recipe.item_output_semantics.len();
+            self.recipe_item_semantics_resolved += recipe
+                .item_input_semantics
+                .iter()
+                .chain(&recipe.item_output_semantics)
+                .filter(|value| value.semantic.is_some())
+                .count();
+            self.recipe_fluid_expressions +=
+                recipe.fluid_input_semantics.len() + recipe.fluid_output_semantics.len();
+            self.recipe_fluid_semantics_resolved += recipe
+                .fluid_input_semantics
+                .iter()
+                .chain(&recipe.fluid_output_semantics)
+                .filter(|value| value.semantic.is_some())
+                .count();
+            self.recipe_durations += usize::from(recipe.duration.is_some());
+            self.recipe_durations_resolved_to_ticks += usize::from(recipe.duration_ticks.is_some());
+        }
         for call in recovery
             .recipes
             .iter()
@@ -171,12 +213,17 @@ fn recognize_recipe(chain: &JavaCallChain, bindings: &JavaBindings) -> Option<Re
         builder_root: bindings.resolve_reference(&chain.root),
         recipe_map,
         item_inputs: Vec::new(),
+        item_input_semantics: Vec::new(),
         item_outputs: Vec::new(),
+        item_output_semantics: Vec::new(),
         fluid_inputs: Vec::new(),
+        fluid_input_semantics: Vec::new(),
         fluid_outputs: Vec::new(),
+        fluid_output_semantics: Vec::new(),
         input_chances: Vec::new(),
         output_chances: Vec::new(),
         duration: None,
+        duration_ticks: None,
         eut: None,
         special_value: None,
         special: None,
@@ -193,17 +240,46 @@ fn recognize_recipe(chain: &JavaCallChain, bindings: &JavaBindings) -> Option<Re
             continue;
         }
         match call.name.as_str() {
-            "itemInputs" => recipe.item_inputs.extend(call.arguments.clone()),
+            "itemInputs" => add_items(
+                &mut recipe.item_inputs,
+                &mut recipe.item_input_semantics,
+                call,
+                bindings,
+            ),
             "itemInputsUnsafe" => {
-                recipe.item_inputs.extend(call.arguments.clone());
+                add_items(
+                    &mut recipe.item_inputs,
+                    &mut recipe.item_input_semantics,
+                    call,
+                    bindings,
+                );
                 recipe.modifiers.push(call.into());
             }
-            "itemOutputs" => recipe.item_outputs.extend(call.arguments.clone()),
-            "fluidInputs" => recipe.fluid_inputs.extend(call.arguments.clone()),
-            "fluidOutputs" => recipe.fluid_outputs.extend(call.arguments.clone()),
+            "itemOutputs" => add_items(
+                &mut recipe.item_outputs,
+                &mut recipe.item_output_semantics,
+                call,
+                bindings,
+            ),
+            "fluidInputs" => add_fluids(
+                &mut recipe.fluid_inputs,
+                &mut recipe.fluid_input_semantics,
+                call,
+                bindings,
+            ),
+            "fluidOutputs" => add_fluids(
+                &mut recipe.fluid_outputs,
+                &mut recipe.fluid_output_semantics,
+                call,
+                bindings,
+            ),
             "inputChances" => recipe.input_chances.extend(call.arguments.clone()),
             "outputChances" => recipe.output_chances.extend(call.arguments.clone()),
-            "duration" => recipe.duration = one_argument(call),
+            "duration" => {
+                recipe.duration = one_argument(call);
+                recipe.duration_ticks = one_expression(call)
+                    .and_then(|expression| duration_ticks(expression, bindings));
+            }
             "eut" => recipe.eut = one_argument(call),
             "specialValue" => recipe.special_value = one_argument(call),
             "special" => recipe.special = one_argument(call),
@@ -250,6 +326,42 @@ fn recognize_material(chain: &JavaCallChain) -> Option<MaterialDefinition> {
         }
     }
     Some(material)
+}
+
+fn add_items(
+    raw: &mut Vec<String>,
+    semantics: &mut Vec<RecoveredExpression<ItemSemantic>>,
+    call: &JavaCall,
+    bindings: &JavaBindings,
+) {
+    raw.extend(call.arguments.clone());
+    semantics.extend(recover_items(
+        &call.arguments,
+        &call.argument_expressions,
+        bindings,
+    ));
+}
+
+fn add_fluids(
+    raw: &mut Vec<String>,
+    semantics: &mut Vec<RecoveredExpression<FluidSemantic>>,
+    call: &JavaCall,
+    bindings: &JavaBindings,
+) {
+    raw.extend(call.arguments.clone());
+    semantics.extend(recover_fluids(
+        &call.arguments,
+        &call.argument_expressions,
+        bindings,
+    ));
+}
+
+fn one_expression(call: &JavaCall) -> Option<&JavaExpression> {
+    if call.argument_expressions.len() == 1 {
+        call.argument_expressions.first()
+    } else {
+        None
+    }
 }
 
 fn one_argument(call: &JavaCall) -> Option<String> {
@@ -337,6 +449,7 @@ mod tests {
     #[test]
     fn recognizes_gt_recipe_builder() -> anyhow::Result<()> {
         let source = r"
+            import static gregtech.api.util.GTRecipeBuilder.SECONDS;
             class Recipes { void run() {
                 GTValues.RA.stdBuilder()
                     .itemInputs(ItemList.Cell_Water.get(1))
@@ -352,6 +465,9 @@ mod tests {
         let recipe = &recovery.recipes[0];
         assert_eq!(recipe.recipe_map, "compressorRecipes");
         assert_eq!(recipe.duration.as_deref(), Some("15 * SECONDS"));
+        assert_eq!(recipe.duration_ticks, Some(300));
+        assert_eq!(recipe.item_input_semantics.len(), 1);
+        assert!(recipe.item_input_semantics[0].semantic.is_some());
         assert_eq!(recipe.eut.as_deref(), Some("2"));
         assert_eq!(recipe.unhandled_calls.len(), 0);
         Ok(())
