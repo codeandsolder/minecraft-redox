@@ -66,6 +66,14 @@ pub enum JavaExpression {
         operator: String,
         right: Box<JavaExpression>,
     },
+    Cast {
+        type_name: String,
+        value: Box<JavaExpression>,
+    },
+    Unary {
+        operator: String,
+        operand: Box<JavaExpression>,
+    },
     Ternary {
         condition: Box<JavaExpression>,
         consequence: Box<JavaExpression>,
@@ -781,10 +789,12 @@ impl JavaProjectIndex {
                             )
                         })
                 }),
-            JavaExpression::New { type_name, .. } => Some(self.normalize_type_name(
-                &resolve_type_reference(bindings, type_name),
-                bindings.package.as_deref(),
-            )),
+            JavaExpression::New { type_name, .. } | JavaExpression::Cast { type_name, .. } => {
+                Some(self.declared_expression_type(type_name, bindings))
+            }
+            JavaExpression::Unary { operator, operand } => {
+                self.unary_expression_type_at(path, byte_position, operator, operand, bindings)
+            }
             JavaExpression::Ternary {
                 consequence,
                 alternative,
@@ -802,6 +812,27 @@ impl JavaProjectIndex {
             JavaExpression::Literal(value) => Some(literal_java_type(value).to_owned()),
             JavaExpression::Binary { .. } | JavaExpression::Raw(_) => None,
         }
+    }
+
+    fn declared_expression_type(&self, type_name: &str, bindings: &JavaBindings) -> String {
+        self.normalize_type_name(
+            &resolve_type_reference(bindings, type_name),
+            bindings.package.as_deref(),
+        )
+    }
+
+    fn unary_expression_type_at(
+        &self,
+        path: &str,
+        byte_position: usize,
+        operator: &str,
+        operand: &JavaExpression,
+        bindings: &JavaBindings,
+    ) -> Option<String> {
+        if operator == "!" {
+            return Some(String::from("boolean"));
+        }
+        self.expression_type_at(path, byte_position, operand, bindings)
     }
 
     fn ternary_expression_type_at(
@@ -1479,7 +1510,8 @@ fn resolved_reference_name(expression: &JavaExpression, bindings: &JavaBindings)
     qualified_reference_name(expression).map(|reference| bindings.resolve_reference(&reference))
 }
 
-fn generic_type_argument(type_name: &str, target_index: usize) -> Option<&str> {
+#[must_use]
+pub fn generic_type_argument(type_name: &str, target_index: usize) -> Option<&str> {
     let mut argument_start = type_name.find('<')? + 1;
     let bytes = type_name.as_bytes();
     let mut depth = 1usize;
@@ -2446,6 +2478,14 @@ pub fn substitute_references(
             operator: operator.clone(),
             right: Box::new(substitute_references(right, replacements)),
         },
+        JavaExpression::Cast { type_name, value } => JavaExpression::Cast {
+            type_name: type_name.clone(),
+            value: Box::new(substitute_references(value, replacements)),
+        },
+        JavaExpression::Unary { operator, operand } => JavaExpression::Unary {
+            operator: operator.clone(),
+            operand: Box::new(substitute_references(operand, replacements)),
+        },
         JavaExpression::Ternary {
             condition,
             consequence,
@@ -2581,6 +2621,8 @@ fn expression(node: Node<'_>, source: &str) -> JavaExpression {
         "method_invocation" => expression_call(node, source),
         "object_creation_expression" => expression_new(node, source),
         "binary_expression" => expression_binary(node, source),
+        "cast_expression" => expression_cast(node, source),
+        "unary_expression" => expression_unary(node, source),
         "ternary_expression" => expression_ternary(node, source),
         "parenthesized_expression" => node.named_child(0).map_or_else(
             || JavaExpression::Raw(node_source(node, source)),
@@ -2690,6 +2732,39 @@ fn expression_ternary(node: Node<'_>, source: &str) -> JavaExpression {
         condition: Box::new(expression(condition, source)),
         consequence: Box::new(expression(consequence, source)),
         alternative: Box::new(expression(alternative, source)),
+    }
+}
+
+fn expression_cast(node: Node<'_>, source: &str) -> JavaExpression {
+    let Some(value) = node.child_by_field_name("value") else {
+        return JavaExpression::Raw(node_source(node, source));
+    };
+    let mut cursor = node.walk();
+    let type_name = node
+        .children_by_field_name("type", &mut cursor)
+        .filter_map(|type_node| node_text(type_node, source).ok())
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .join(" & ");
+    if type_name.is_empty() {
+        return JavaExpression::Raw(node_source(node, source));
+    }
+    JavaExpression::Cast {
+        type_name,
+        value: Box::new(expression(value, source)),
+    }
+}
+
+fn expression_unary(node: Node<'_>, source: &str) -> JavaExpression {
+    let (Some(operator), Some(operand)) = (
+        node.child_by_field_name("operator"),
+        node.child_by_field_name("operand"),
+    ) else {
+        return JavaExpression::Raw(node_source(node, source));
+    };
+    JavaExpression::Unary {
+        operator: node_source(operator, source),
+        operand: Box::new(expression(operand, source)),
     }
 }
 
@@ -3931,6 +4006,46 @@ mod tests {
             )
             .ok_or_else(|| anyhow::anyhow!("primitive overload was not resolved"))?;
         assert_eq!(resolved.parameters[0].type_name, "long");
+        Ok(())
+    }
+
+    #[test]
+    fn parses_and_types_cast_and_unary_expressions() -> anyhow::Result<()> {
+        let source = r"
+            package demo;
+            class Recipe {
+                void run(long value) {
+                    sink((int) -value);
+                }
+            }
+        ";
+        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
+        let mut index = super::JavaProjectIndex::default();
+        index.add_analysis(&analysis);
+        let sink = analysis
+            .call_chains
+            .iter()
+            .flat_map(|chain| &chain.calls)
+            .find(|call| call.name == "sink")
+            .ok_or_else(|| anyhow::anyhow!("sink call missing"))?;
+        let expression = sink
+            .argument_expressions
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("sink argument missing"))?;
+        assert!(matches!(
+            expression,
+            super::JavaExpression::Cast { value, .. }
+                if matches!(value.as_ref(), super::JavaExpression::Unary { operator, .. } if operator == "-")
+        ));
+        assert_eq!(
+            index.expression_type_at(
+                "Recipe.java",
+                sink.byte_start,
+                expression,
+                &analysis.bindings,
+            ),
+            Some(String::from("int"))
+        );
         Ok(())
     }
 
