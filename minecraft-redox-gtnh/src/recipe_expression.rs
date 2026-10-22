@@ -54,6 +54,16 @@ pub enum ItemSemantic {
         inner: Option<Box<ItemSemantic>>,
         nullable: bool,
     },
+    SplitStack {
+        item: JavaExpression,
+        amount: JavaExpression,
+        inner: Option<Box<ItemSemantic>>,
+    },
+    WithDisplayName {
+        item: JavaExpression,
+        name: JavaExpression,
+        inner: Option<Box<ItemSemantic>>,
+    },
     ItemStack {
         item: JavaExpression,
         amount: Option<JavaExpression>,
@@ -362,7 +372,7 @@ fn project_item_semantic(
             ) {
                 return Some(semantic);
             }
-            if let Some(semantic) = project_copy_item_semantic(
+            if let Some(semantic) = project_item_stack_transform_semantic(
                 expression,
                 bindings,
                 project,
@@ -417,7 +427,7 @@ fn project_dynamic_item_list_semantic(
     })
 }
 
-fn project_copy_item_semantic(
+fn project_item_stack_transform_semantic(
     expression: &JavaExpression,
     bindings: &JavaBindings,
     project: &JavaProjectIndex,
@@ -432,22 +442,44 @@ fn project_copy_item_semantic(
     else {
         return None;
     };
-    if method != "copy" || !arguments.is_empty() {
-        return None;
-    }
-    let receiver_type =
-        project.expression_type_at(source_path, byte_position, receiver, bindings)?;
-    if !receiver_type.trim().ends_with("ItemStack") {
-        return None;
-    }
     let item = receiver.as_ref().clone();
-    let inner = item_semantic(&item, bindings)
-        .or_else(|| project_item_semantic(&item, bindings, project, source_path, byte_position))
-        .map(Box::new);
-    Some(ItemSemantic::CopyItem {
-        item,
-        inner,
-        nullable: false,
+    let inner = receiver_item_semantic(&item, bindings, project, source_path, byte_position);
+    let receiver_is_item = inner.is_some()
+        || project
+            .expression_type_at(source_path, byte_position, receiver, bindings)
+            .is_some_and(|type_name| type_name.trim().ends_with("ItemStack"));
+    if !receiver_is_item {
+        return None;
+    }
+    match (method.as_str(), arguments.as_slice()) {
+        ("copy", []) => Some(ItemSemantic::CopyItem {
+            item,
+            inner: inner.map(Box::new),
+            nullable: false,
+        }),
+        ("splitStack", [amount]) => Some(ItemSemantic::SplitStack {
+            item,
+            amount: amount.clone(),
+            inner: inner.map(Box::new),
+        }),
+        ("setStackDisplayName", [name]) => Some(ItemSemantic::WithDisplayName {
+            item,
+            name: name.clone(),
+            inner: inner.map(Box::new),
+        }),
+        _ => None,
+    }
+}
+
+fn receiver_item_semantic(
+    expression: &JavaExpression,
+    bindings: &JavaBindings,
+    project: &JavaProjectIndex,
+    source_path: &str,
+    byte_position: usize,
+) -> Option<ItemSemantic> {
+    item_semantic(expression, bindings).or_else(|| {
+        project_item_semantic(expression, bindings, project, source_path, byte_position)
     })
 }
 
@@ -1041,6 +1073,41 @@ mod tests {
         };
         assert_eq!(accessor, "get");
         assert_eq!(arguments.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn recognizes_item_stack_mutating_transforms() -> anyhow::Result<()> {
+        let source = r#"
+            class ItemStack {}
+            class R {
+                void run(ItemStack input) {
+                    builder.itemInputs(
+                        input.splitStack(3),
+                        input.setStackDisplayName("Named"));
+                }
+            }
+        "#;
+        let analysis = analyze_source("R.java", "gt5", None, source)?;
+        let mut project = minecraft_redox_java::JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let items = recipe_call(&analysis, "itemInputs")?;
+        let recovered = super::recover_items_with_project(
+            &items.arguments,
+            &items.argument_expressions,
+            &analysis.bindings,
+            &project,
+            "R.java",
+            items.byte_start,
+        );
+        assert!(matches!(
+            recovered[0].semantic,
+            Some(ItemSemantic::SplitStack { .. })
+        ));
+        assert!(matches!(
+            recovered[1].semantic,
+            Some(ItemSemantic::WithDisplayName { .. })
+        ));
         Ok(())
     }
 
