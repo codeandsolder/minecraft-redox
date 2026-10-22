@@ -713,6 +713,9 @@ impl JavaProjectIndex {
                 })
                 .or_else(|| self.imported_static_field_type(bindings, reference)),
             JavaExpression::FieldAccess { receiver, field } => {
+                if let Some(field_type) = standard_library_field_type(receiver, field, bindings) {
+                    return Some(field_type.to_owned());
+                }
                 let static_owner = qualified_reference_name(receiver).and_then(|reference| {
                     let root = reference.split('.').next()?;
                     if self.reference_type_at(path, byte_position, root).is_some() {
@@ -1390,6 +1393,29 @@ fn method_dispatch_signature(method: &JavaMethod) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!("{}({parameters})", method.name)
+}
+
+fn standard_library_field_type<'a>(
+    receiver: &JavaExpression,
+    field: &str,
+    bindings: &JavaBindings,
+) -> Option<&'a str> {
+    if !matches!(field, "MIN_VALUE" | "MAX_VALUE") {
+        return None;
+    }
+    let receiver = qualified_reference_name(receiver)?;
+    let resolved = bindings.resolve_reference(&receiver);
+    let simple = resolved.rsplit('.').next().unwrap_or(&resolved);
+    match simple {
+        "Byte" => Some("byte"),
+        "Short" => Some("short"),
+        "Integer" => Some("int"),
+        "Long" => Some("long"),
+        "Float" => Some("float"),
+        "Double" => Some("double"),
+        "Character" => Some("char"),
+        _ => None,
+    }
 }
 
 fn literal_java_type(value: &str) -> &'static str {
@@ -3502,6 +3528,42 @@ mod tests {
         assert_eq!(resolved.owner, "demo.Helper");
         assert_eq!(resolved.parameters.len(), 2);
         assert_eq!(resolved.parameters[0].type_name, "Materials");
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_boxed_primitive_constant_overload() -> anyhow::Result<()> {
+        let source = r"
+            package demo;
+            class ItemStack {}
+            class Helper {
+                static ItemStack get(int meta) { return null; }
+                static ItemStack get(ItemStack replacement) { return null; }
+            }
+            class Recipe { void run() { sink(Helper.get(Short.MAX_VALUE)); } }
+        ";
+        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
+        let mut index = super::JavaProjectIndex::default();
+        index.add_analysis(&analysis);
+        let sink = analysis
+            .call_chains
+            .iter()
+            .flat_map(|chain| &chain.calls)
+            .find(|call| call.name == "sink")
+            .ok_or_else(|| anyhow::anyhow!("sink call missing"))?;
+        let expression = sink
+            .argument_expressions
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("sink argument missing"))?;
+        let (resolved, _) = index
+            .resolve_call_at(
+                "Recipe.java",
+                sink.byte_start,
+                expression,
+                &analysis.bindings,
+            )
+            .ok_or_else(|| anyhow::anyhow!("overload was not resolved"))?;
+        assert_eq!(resolved.stable_id(), "demo.Helper#get(int)");
         Ok(())
     }
 
