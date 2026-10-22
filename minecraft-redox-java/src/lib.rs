@@ -384,6 +384,50 @@ impl JavaProjectIndex {
     }
 
     #[must_use]
+    pub fn generic_supertype_argument(
+        &self,
+        owner: &str,
+        supertype_suffix: &str,
+        target_index: usize,
+    ) -> Option<String> {
+        let owner = self.normalize_owner_name(owner, None);
+        let mut visited = BTreeSet::new();
+        self.generic_supertype_argument_inner(&owner, supertype_suffix, target_index, &mut visited)
+    }
+
+    fn generic_supertype_argument_inner(
+        &self,
+        owner: &str,
+        supertype_suffix: &str,
+        target_index: usize,
+        visited: &mut BTreeSet<String>,
+    ) -> Option<String> {
+        if !visited.insert(owner.to_owned()) {
+            return None;
+        }
+        let supertypes = self.supertypes_by_owner.get(owner)?;
+        for supertype in supertypes {
+            let raw = erase_java_type_syntax(supertype);
+            if raw.ends_with(supertype_suffix)
+                && let Some(argument) = generic_type_argument(supertype, target_index)
+            {
+                return Some(argument.to_owned());
+            }
+            let normalized =
+                self.normalize_owner_name(&raw, owner.rsplit_once('.').map(|(package, _)| package));
+            if let Some(argument) = self.generic_supertype_argument_inner(
+                &normalized,
+                supertype_suffix,
+                target_index,
+                visited,
+            ) {
+                return Some(argument);
+            }
+        }
+        None
+    }
+
+    #[must_use]
     pub fn resolve_local_method(
         &self,
         path: &str,
@@ -1397,8 +1441,7 @@ fn resolve_type_reference(bindings: &JavaBindings, type_name: &str) -> String {
         let raw_type = base.get(..generic_start).unwrap_or(base).trim();
         let arguments = base
             .get(generic_start + 1..generic_end)
-            .map(|text| resolve_generic_arguments(bindings, text))
-            .unwrap_or_default();
+            .map_or_default(|text| resolve_generic_arguments(bindings, text));
         format!("{}<{arguments}>", bindings.resolve_reference(raw_type))
     } else {
         bindings.resolve_reference(base)
@@ -3856,6 +3899,24 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("default interface method was not resolved"))?;
         assert_eq!(resolved.owner, "demo.Helper");
         assert_eq!(receiver_type, None);
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_inherited_generic_supertype_argument() -> anyhow::Result<()> {
+        let source = r"
+            package demo;
+            import net.minecraft.item.ItemStack;
+            class RecipeMetadataKey<T> {}
+            class ResearchKey extends RecipeMetadataKey<ItemStack> {}
+        ";
+        let analysis = analyze_source("ResearchKey.java", "demo", None, source)?;
+        let mut index = super::JavaProjectIndex::default();
+        index.add_analysis(&analysis);
+        assert_eq!(
+            index.generic_supertype_argument("demo.ResearchKey", "RecipeMetadataKey", 0),
+            Some(String::from("net.minecraft.item.ItemStack"))
+        );
         Ok(())
     }
 
