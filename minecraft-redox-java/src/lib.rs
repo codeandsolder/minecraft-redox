@@ -223,6 +223,14 @@ impl JavaMethod {
     }
 }
 
+#[derive(Clone, Copy)]
+struct JavaCallSite<'a> {
+    path: &'a str,
+    byte_position: usize,
+    arguments: &'a [JavaExpression],
+    bindings: &'a JavaBindings,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct JavaProjectIndex {
     methods: Vec<JavaMethod>,
@@ -346,6 +354,94 @@ impl JavaProjectIndex {
         )
     }
 
+    fn resolve_local_method_typed(
+        &self,
+        name: &str,
+        site: JavaCallSite<'_>,
+    ) -> Option<&JavaMethod> {
+        let methods = self
+            .methods_by_path
+            .get(site.path)?
+            .iter()
+            .map(|index| &self.methods[*index]);
+        self.select_typed_method(
+            methods
+                .filter(|method| method.name == name && method.accepts_arity(site.arguments.len())),
+            site,
+        )
+    }
+
+    fn resolve_method_filtered_typed(
+        &self,
+        owner: &str,
+        name: &str,
+        site: JavaCallSite<'_>,
+        predicate: impl Fn(&JavaMethod) -> bool,
+    ) -> Option<&JavaMethod> {
+        let owner = self.normalize_owner_name(owner, None);
+        let methods = self
+            .methods_by_owner
+            .get(&owner)?
+            .iter()
+            .map(|index| &self.methods[*index]);
+        self.select_typed_method(
+            methods.filter(|method| {
+                method.name == name
+                    && method.accepts_arity(site.arguments.len())
+                    && predicate(method)
+            }),
+            site,
+        )
+    }
+
+    fn select_typed_method<'a>(
+        &'a self,
+        methods: impl Iterator<Item = &'a JavaMethod>,
+        site: JavaCallSite<'_>,
+    ) -> Option<&'a JavaMethod> {
+        let mut best: Option<(u32, &'a JavaMethod)> = None;
+        let mut tied = false;
+        for method in methods {
+            let score = self.method_type_score(method, site);
+            match best {
+                None => {
+                    best = Some((score, method));
+                    tied = false;
+                }
+                Some((best_score, _)) if score > best_score => {
+                    best = Some((score, method));
+                    tied = false;
+                }
+                Some((best_score, _)) if score == best_score => tied = true,
+                Some(_) => {}
+            }
+        }
+        (!tied).then(|| best.map(|(_, method)| method)).flatten()
+    }
+
+    fn method_type_score(&self, method: &JavaMethod, site: JavaCallSite<'_>) -> u32 {
+        let varargs = method
+            .parameters
+            .last()
+            .is_some_and(|parameter| parameter.varargs);
+        let fixed_count = method.parameters.len().saturating_sub(usize::from(varargs));
+        let mut score = u32::from(!varargs);
+        for (index, argument) in site.arguments.iter().enumerate() {
+            let Some(actual) =
+                self.expression_type_at(site.path, site.byte_position, argument, site.bindings)
+            else {
+                continue;
+            };
+            let Some(parameter) = method.parameters.get(index.min(fixed_count)) else {
+                continue;
+            };
+            let package = method.owner.rsplit_once('.').map(|(package, _)| package);
+            let expected = self.normalize_type_name(&parameter.type_name, package);
+            score += java_type_match_score(&actual, &expected);
+        }
+        score
+    }
+
     #[must_use]
     pub fn resolve_field(
         &self,
@@ -386,42 +482,104 @@ impl JavaProjectIndex {
         else {
             return None;
         };
-
+        let site = JavaCallSite {
+            path,
+            byte_position,
+            arguments,
+            bindings,
+        };
         match receiver.as_deref() {
-            None => {
-                if let Some(local) = self.resolve_local_method(path, method, arguments.len()) {
-                    return Some((local, None));
-                }
-                let imported = self.resolve_static_import(bindings, method, arguments.len())?;
-                Some((imported, None))
-            }
+            None => self.resolve_implicit_call_at(method, site),
             Some(JavaExpression::Reference(reference)) => {
-                if let Some(receiver_type) = self.reference_type_at(path, byte_position, reference)
-                {
-                    let receiver_type =
-                        self.normalize_owner_name(receiver_type, bindings.package.as_deref());
-                    let resolved =
-                        self.resolve_instance_method(&receiver_type, method, arguments.len())?;
-                    return Some((resolved, Some(receiver_type)));
-                }
-                if let Some(receiver_type) = self.imported_static_field_type(bindings, reference) {
-                    let resolved =
-                        self.resolve_instance_method(&receiver_type, method, arguments.len())?;
-                    return Some((resolved, Some(receiver_type)));
-                }
-
-                let owner = self.class_owner_for_reference(bindings, reference)?;
-                let resolved = self.resolve_static_method(&owner, method, arguments.len())?;
-                Some((resolved, Some(owner)))
+                self.resolve_reference_call_at(reference, method, site)
             }
-            Some(receiver) => {
-                let receiver_type =
-                    self.expression_type_at(path, byte_position, receiver, bindings)?;
-                let resolved =
-                    self.resolve_instance_method(&receiver_type, method, arguments.len())?;
-                Some((resolved, Some(receiver_type)))
-            }
+            Some(receiver) => self.resolve_expression_call_at(receiver, method, site),
         }
+    }
+
+    fn resolve_implicit_call_at<'a>(
+        &'a self,
+        method: &str,
+        site: JavaCallSite<'_>,
+    ) -> Option<(&'a JavaMethod, Option<String>)> {
+        if let Some(local) = self.resolve_local_method(site.path, method, site.arguments.len()) {
+            return Some((local, None));
+        }
+        if let Some(local) = self.resolve_local_method_typed(method, site) {
+            return Some((local, None));
+        }
+        if let Some(imported) =
+            self.resolve_static_import(site.bindings, method, site.arguments.len())
+        {
+            return Some((imported, None));
+        }
+        self.resolve_static_import_typed(method, site)
+            .map(|imported| (imported, None))
+    }
+
+    fn resolve_reference_call_at<'a>(
+        &'a self,
+        reference: &str,
+        method: &str,
+        site: JavaCallSite<'_>,
+    ) -> Option<(&'a JavaMethod, Option<String>)> {
+        if let Some(receiver_type) =
+            self.reference_type_at(site.path, site.byte_position, reference)
+        {
+            let receiver_type =
+                self.normalize_owner_name(receiver_type, site.bindings.package.as_deref());
+            return self
+                .resolve_instance_call(&receiver_type, method, site)
+                .map(|resolved| (resolved, Some(receiver_type)));
+        }
+        if let Some(receiver_type) = self.imported_static_field_type(site.bindings, reference) {
+            return self
+                .resolve_instance_call(&receiver_type, method, site)
+                .map(|resolved| (resolved, Some(receiver_type)));
+        }
+        let owner = self.class_owner_for_reference(site.bindings, reference)?;
+        self.resolve_static_call(&owner, method, site)
+            .map(|resolved| (resolved, Some(owner)))
+    }
+
+    fn resolve_expression_call_at<'a>(
+        &'a self,
+        receiver: &JavaExpression,
+        method: &str,
+        site: JavaCallSite<'_>,
+    ) -> Option<(&'a JavaMethod, Option<String>)> {
+        let receiver_type =
+            self.expression_type_at(site.path, site.byte_position, receiver, site.bindings)?;
+        self.resolve_instance_call(&receiver_type, method, site)
+            .map(|resolved| (resolved, Some(receiver_type)))
+    }
+
+    fn resolve_instance_call<'a>(
+        &'a self,
+        owner: &str,
+        method: &str,
+        site: JavaCallSite<'_>,
+    ) -> Option<&'a JavaMethod> {
+        self.resolve_instance_method(owner, method, site.arguments.len())
+            .or_else(|| {
+                self.resolve_method_filtered_typed(owner, method, site, |candidate| {
+                    !candidate.is_static
+                })
+            })
+    }
+
+    fn resolve_static_call<'a>(
+        &'a self,
+        owner: &str,
+        method: &str,
+        site: JavaCallSite<'_>,
+    ) -> Option<&'a JavaMethod> {
+        self.resolve_static_method(owner, method, site.arguments.len())
+            .or_else(|| {
+                self.resolve_method_filtered_typed(owner, method, site, |candidate| {
+                    candidate.is_static
+                })
+            })
     }
 
     #[must_use]
@@ -495,9 +653,8 @@ impl JavaProjectIndex {
             JavaExpression::Parenthesized(inner) => {
                 self.expression_type_at(path, byte_position, inner, bindings)
             }
-            JavaExpression::Literal(_) | JavaExpression::Binary { .. } | JavaExpression::Raw(_) => {
-                None
-            }
+            JavaExpression::Literal(value) => Some(literal_java_type(value).to_owned()),
+            JavaExpression::Binary { .. } | JavaExpression::Raw(_) => None,
         }
     }
 
@@ -556,6 +713,32 @@ impl JavaProjectIndex {
                 .iter()
                 .filter_map(|owner| self.resolve_static_method(owner, method_name, arity)),
         )
+    }
+
+    fn resolve_static_import_typed(
+        &self,
+        method_name: &str,
+        site: JavaCallSite<'_>,
+    ) -> Option<&JavaMethod> {
+        if let Some(import_path) = site.bindings.static_imports.get(method_name)
+            && let Some((owner, imported_name)) = import_path.rsplit_once('.')
+            && imported_name == method_name
+        {
+            return self.resolve_method_filtered_typed(owner, method_name, site, |method| {
+                method.is_static
+            });
+        }
+        let mut methods = site
+            .bindings
+            .static_wildcard_imports
+            .iter()
+            .filter_map(|owner| {
+                self.resolve_method_filtered_typed(owner, method_name, site, |method| {
+                    method.is_static
+                })
+            });
+        let method = methods.next()?;
+        methods.next().is_none().then_some(method)
     }
 
     fn imported_static_field_type(
@@ -829,6 +1012,67 @@ fn merge_index_map(
             .entry(key)
             .or_default()
             .extend(indexes.into_iter().map(|index| index + offset));
+    }
+}
+
+fn literal_java_type(value: &str) -> &'static str {
+    let value = value.trim();
+    if matches!(value, "true" | "false") {
+        return "boolean";
+    }
+    if value == "null" {
+        return "null";
+    }
+    if value.starts_with('"') {
+        return "java.lang.String";
+    }
+    if value.as_bytes().first() == Some(&39) {
+        return "char";
+    }
+    let lower = value.to_ascii_lowercase();
+    if lower.ends_with('f') {
+        return "float";
+    }
+    let floating = lower.contains('.')
+        || lower.contains('p')
+        || (!lower.starts_with("0x") && lower.contains('e'));
+    if floating {
+        return "double";
+    }
+    if lower.ends_with('l') {
+        return "long";
+    }
+    "int"
+}
+
+fn java_type_match_score(actual: &str, expected: &str) -> u32 {
+    if actual == expected {
+        return 8;
+    }
+    if actual == "null" && !is_java_primitive(expected) {
+        return 1;
+    }
+    if java_primitive_widens_to(actual, expected) {
+        return 4;
+    }
+    0
+}
+
+fn is_java_primitive(type_name: &str) -> bool {
+    matches!(
+        type_name,
+        "boolean" | "byte" | "short" | "char" | "int" | "long" | "float" | "double"
+    )
+}
+
+fn java_primitive_widens_to(actual: &str, expected: &str) -> bool {
+    match actual {
+        "byte" => matches!(expected, "short" | "int" | "long" | "float" | "double"),
+        "short" | "char" => matches!(expected, "int" | "long" | "float" | "double"),
+        "int" => matches!(expected, "long" | "float" | "double"),
+        "long" => matches!(expected, "float" | "double"),
+        "float" => expected == "double",
+        _ => false,
     }
 }
 
@@ -2331,6 +2575,85 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("nested field chain was not resolved"))?;
         assert_eq!(resolved.owner, "demo.Holder");
         assert_eq!(receiver_type.as_deref(), Some("demo.Holder"));
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_static_varargs_overload_with_type_evidence() -> anyhow::Result<()> {
+        let source = r"
+            package demo;
+            class ItemStack {}
+            class Materials {}
+            class Helper {
+                static ItemStack[] convert(Materials material, ItemStack... outputs) { return null; }
+                static ItemStack[] convert(ItemStack... outputs) { return null; }
+            }
+            class Recipe {
+                void run(Materials material, ItemStack stack) {
+                    sink(Helper.convert(material, stack));
+                }
+            }
+        ";
+        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
+        let mut index = super::JavaProjectIndex::default();
+        index.add_analysis(&analysis);
+        let sink = analysis
+            .call_chains
+            .iter()
+            .flat_map(|chain| &chain.calls)
+            .find(|call| call.name == "sink")
+            .ok_or_else(|| anyhow::anyhow!("sink call missing"))?;
+        let expression = sink
+            .argument_expressions
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("sink argument missing"))?;
+        let (resolved, _) = index
+            .resolve_call_at(
+                "Recipe.java",
+                sink.byte_start,
+                expression,
+                &analysis.bindings,
+            )
+            .ok_or_else(|| anyhow::anyhow!("overloaded static call was not resolved"))?;
+        assert_eq!(resolved.owner, "demo.Helper");
+        assert_eq!(resolved.parameters.len(), 2);
+        assert_eq!(resolved.parameters[0].type_name, "Materials");
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_primitive_widening_overload_with_type_evidence() -> anyhow::Result<()> {
+        let source = r"
+            package demo;
+            class ItemStack {}
+            class Holder {
+                ItemStack get(long amount, Object... replacements) { return null; }
+                ItemStack get(String key, Object... replacements) { return null; }
+            }
+            class Recipe { void run(Holder holder) { sink(holder.get(4)); } }
+        ";
+        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
+        let mut index = super::JavaProjectIndex::default();
+        index.add_analysis(&analysis);
+        let sink = analysis
+            .call_chains
+            .iter()
+            .flat_map(|chain| &chain.calls)
+            .find(|call| call.name == "sink")
+            .ok_or_else(|| anyhow::anyhow!("sink call missing"))?;
+        let expression = sink
+            .argument_expressions
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("sink argument missing"))?;
+        let (resolved, _) = index
+            .resolve_call_at(
+                "Recipe.java",
+                sink.byte_start,
+                expression,
+                &analysis.bindings,
+            )
+            .ok_or_else(|| anyhow::anyhow!("primitive overload was not resolved"))?;
+        assert_eq!(resolved.parameters[0].type_name, "long");
         Ok(())
     }
 
