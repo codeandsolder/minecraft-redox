@@ -97,6 +97,7 @@ fn eval_i64(
         | JavaExpression::New { .. }
         | JavaExpression::Array { .. }
         | JavaExpression::Literal(_)
+        | JavaExpression::Lambda { .. }
         | JavaExpression::Raw(_) => None,
     }
 }

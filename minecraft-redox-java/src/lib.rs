@@ -79,6 +79,9 @@ pub enum JavaExpression {
         consequence: Box<JavaExpression>,
         alternative: Box<JavaExpression>,
     },
+    Lambda {
+        body: Box<JavaExpression>,
+    },
     Parenthesized(Box<JavaExpression>),
     Raw(String),
 }
@@ -813,38 +816,9 @@ impl JavaProjectIndex {
                 let element_type = array_element_type(&array_type)?;
                 Some(self.normalize_owner_name(element_type, bindings.package.as_deref()))
             }
-            JavaExpression::Call {
-                receiver,
-                method,
-                arguments,
-            } => self
-                .platform_call_type(
-                    path,
-                    byte_position,
-                    receiver.as_deref(),
-                    method,
-                    arguments,
-                    bindings,
-                )
-                .or_else(|| {
-                    self.standard_library_call_type(
-                        path,
-                        byte_position,
-                        receiver.as_deref(),
-                        method,
-                        arguments,
-                        bindings,
-                    )
-                })
-                .or_else(|| {
-                    self.resolve_call_at(path, byte_position, expression, bindings)
-                        .map(|(resolved, _)| {
-                            self.normalize_type_name(
-                                &resolved.return_type,
-                                resolved.owner.rsplit_once('.').map(|(package, _)| package),
-                            )
-                        })
-                }),
+            JavaExpression::Call { .. } => {
+                self.call_expression_type_at(path, byte_position, expression, bindings)
+            }
             JavaExpression::New { type_name, .. } | JavaExpression::Cast { type_name, .. } => {
                 Some(self.declared_expression_type(type_name, bindings))
             }
@@ -862,11 +836,73 @@ impl JavaProjectIndex {
                 alternative,
                 bindings,
             ),
+            JavaExpression::Parenthesized(_)
+            | JavaExpression::Literal(_)
+            | JavaExpression::Binary { .. }
+            | JavaExpression::Lambda { .. }
+            | JavaExpression::Raw(_) => {
+                self.terminal_expression_type_at(path, byte_position, expression, bindings)
+            }
+        }
+    }
+
+    fn call_expression_type_at(
+        &self,
+        path: &str,
+        byte_position: usize,
+        expression: &JavaExpression,
+        bindings: &JavaBindings,
+    ) -> Option<String> {
+        let JavaExpression::Call {
+            receiver,
+            method,
+            arguments,
+        } = expression
+        else {
+            return None;
+        };
+        self.platform_call_type(
+            path,
+            byte_position,
+            receiver.as_deref(),
+            method,
+            arguments,
+            bindings,
+        )
+        .or_else(|| {
+            self.standard_library_call_type(
+                path,
+                byte_position,
+                receiver.as_deref(),
+                method,
+                arguments,
+                bindings,
+            )
+        })
+        .or_else(|| {
+            self.resolve_call_at(path, byte_position, expression, bindings)
+                .map(|(resolved, _)| {
+                    self.normalize_type_name(
+                        &resolved.return_type,
+                        resolved.owner.rsplit_once('.').map(|(package, _)| package),
+                    )
+                })
+        })
+    }
+
+    fn terminal_expression_type_at(
+        &self,
+        path: &str,
+        byte_position: usize,
+        expression: &JavaExpression,
+        bindings: &JavaBindings,
+    ) -> Option<String> {
+        match expression {
             JavaExpression::Parenthesized(inner) => {
                 self.expression_type_at(path, byte_position, inner, bindings)
             }
             JavaExpression::Literal(value) => Some(literal_java_type(value).to_owned()),
-            JavaExpression::Binary { .. } | JavaExpression::Raw(_) => None,
+            _ => None,
         }
     }
 
@@ -2566,6 +2602,9 @@ pub fn substitute_references(
             consequence: Box::new(substitute_references(consequence, replacements)),
             alternative: Box::new(substitute_references(alternative, replacements)),
         },
+        JavaExpression::Lambda { body } => JavaExpression::Lambda {
+            body: Box::new(substitute_references(body, replacements)),
+        },
         JavaExpression::Parenthesized(inner) => {
             JavaExpression::Parenthesized(Box::new(substitute_references(inner, replacements)))
         }
@@ -2695,6 +2734,7 @@ fn expression(node: Node<'_>, source: &str) -> JavaExpression {
         "cast_expression" => expression_cast(node, source),
         "unary_expression" => expression_unary(node, source),
         "ternary_expression" => expression_ternary(node, source),
+        "lambda_expression" => expression_lambda(node, source),
         "parenthesized_expression" => node.named_child(0).map_or_else(
             || JavaExpression::Raw(node_source(node, source)),
             |child| JavaExpression::Parenthesized(Box::new(expression(child, source))),
@@ -2788,6 +2828,15 @@ fn expression_new(node: Node<'_>, source: &str) -> JavaExpression {
     JavaExpression::New {
         type_name,
         arguments,
+    }
+}
+
+fn expression_lambda(node: Node<'_>, source: &str) -> JavaExpression {
+    let Some(body) = node.child_by_field_name("body") else {
+        return JavaExpression::Raw(node_source(node, source));
+    };
+    JavaExpression::Lambda {
+        body: Box::new(expression(body, source)),
     }
 }
 
@@ -4095,6 +4144,33 @@ mod tests {
             )
             .ok_or_else(|| anyhow::anyhow!("primitive overload was not resolved"))?;
         assert_eq!(resolved.parameters[0].type_name, "long");
+        Ok(())
+    }
+
+    #[test]
+    fn parses_expression_lambda_body() -> anyhow::Result<()> {
+        let source = r"
+            package demo;
+            class Recipe {
+                void run() { sink(() -> Materials.Iron); }
+            }
+        ";
+        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
+        let sink = analysis
+            .call_chains
+            .iter()
+            .flat_map(|chain| &chain.calls)
+            .find(|call| call.name == "sink")
+            .ok_or_else(|| anyhow::anyhow!("sink call missing"))?;
+        let expression = sink
+            .argument_expressions
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("sink argument missing"))?;
+        assert!(matches!(
+            expression,
+            super::JavaExpression::Lambda { body }
+                if matches!(body.as_ref(), super::JavaExpression::FieldAccess { field, .. } if field == "Iron")
+        ));
         Ok(())
     }
 
