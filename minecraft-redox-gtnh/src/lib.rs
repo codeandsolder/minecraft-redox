@@ -286,9 +286,8 @@ fn recognize_recipe(
             continue;
         }
         match call.name.as_str() {
-            "itemInputs" => add_items(
-                &mut recipe.item_inputs,
-                &mut recipe.item_input_semantics,
+            "itemInputs" => add_recipe_items(
+                &mut recipe,
                 call,
                 bindings,
                 project,
@@ -296,9 +295,8 @@ fn recognize_recipe(
                 true,
             ),
             "itemInputsUnsafe" => {
-                add_items(
-                    &mut recipe.item_inputs,
-                    &mut recipe.item_input_semantics,
+                add_recipe_items(
+                    &mut recipe,
                     call,
                     bindings,
                     project,
@@ -307,9 +305,8 @@ fn recognize_recipe(
                 );
                 recipe.modifiers.push(call.into());
             }
-            "itemOutputs" => add_items(
-                &mut recipe.item_outputs,
-                &mut recipe.item_output_semantics,
+            "itemOutputs" => add_recipe_items(
+                &mut recipe,
                 call,
                 bindings,
                 project,
@@ -387,6 +384,85 @@ fn recognize_material(chain: &JavaCallChain) -> Option<MaterialDefinition> {
         }
     }
     Some(material)
+}
+
+fn add_recipe_items(
+    recipe: &mut RecipeDefinition,
+    call: &JavaCall,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+    source_path: &str,
+    input_context: bool,
+) {
+    let mut item_call = call.clone();
+    let chance_overload = project.is_some_and(|project| {
+        is_item_chance_overload(call, bindings, project, source_path, input_context)
+    });
+    if chance_overload {
+        let chance = item_call.arguments.pop();
+        item_call.argument_expressions.pop();
+        if let Some(chance) = chance {
+            if input_context {
+                recipe.input_chances.push(chance);
+            } else {
+                recipe.output_chances.push(chance);
+            }
+        }
+    }
+    if input_context {
+        add_items(
+            &mut recipe.item_inputs,
+            &mut recipe.item_input_semantics,
+            &item_call,
+            bindings,
+            project,
+            source_path,
+            true,
+        );
+    } else {
+        add_items(
+            &mut recipe.item_outputs,
+            &mut recipe.item_output_semantics,
+            &item_call,
+            bindings,
+            project,
+            source_path,
+            false,
+        );
+    }
+}
+
+fn is_item_chance_overload(
+    call: &JavaCall,
+    bindings: &JavaBindings,
+    project: &JavaProjectIndex,
+    source_path: &str,
+    input_context: bool,
+) -> bool {
+    if call.argument_expressions.len() != 2 {
+        return false;
+    }
+    let Some(first) = call.argument_expressions.first() else {
+        return false;
+    };
+    let Some(second) = call.argument_expressions.get(1) else {
+        return false;
+    };
+    let Some(first_type) =
+        project.expression_type_at(source_path, call.byte_start, first, bindings)
+    else {
+        return false;
+    };
+    let Some(second_type) =
+        project.expression_type_at(source_path, call.byte_start, second, bindings)
+    else {
+        return false;
+    };
+    if second_type != "int[]" {
+        return false;
+    }
+    first_type.ends_with("ItemStack[]")
+        || (input_context && matches!(first_type.as_str(), "Object[]" | "java.lang.Object[]"))
 }
 
 fn add_items(
@@ -534,8 +610,8 @@ fn is_known_material_property(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::recover;
-    use minecraft_redox_java::analyze_source;
+    use super::{recover, recover_with_project};
+    use minecraft_redox_java::{JavaProjectIndex, analyze_source};
 
     #[test]
     fn recognizes_gt_recipe_builder() -> anyhow::Result<()> {
@@ -561,6 +637,31 @@ mod tests {
         assert!(recipe.item_input_semantics[0].semantic.is_some());
         assert_eq!(recipe.eut.as_deref(), Some("2"));
         assert_eq!(recipe.unhandled_calls.len(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn separates_builder_item_chance_overload() -> anyhow::Result<()> {
+        let source = r"
+            class ItemStack {}
+            class Recipes {
+                void run(ItemStack[] outputs, int[] chances) {
+                    GTValues.RA.stdBuilder()
+                        .itemOutputs(outputs, chances)
+                        .addTo(compressorRecipes);
+                }
+            }
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let mut project = JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let recovery = recover_with_project(&analysis, &project);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        assert_eq!(recipe.item_output_semantics.len(), 1);
+        assert_eq!(recipe.output_chances, vec![String::from("chances")]);
         Ok(())
     }
 
