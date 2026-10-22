@@ -95,6 +95,8 @@ pub struct GtnhSummary {
     pub recipe_fluid_expressions: usize,
     pub recipe_fluid_semantics_resolved: usize,
     pub recipe_fluid_method_links: usize,
+    pub recipe_fluid_value_links: usize,
+    pub recipe_fluid_typed_expression_links: usize,
     pub recipe_durations: usize,
     pub recipe_durations_resolved_to_ticks: usize,
 }
@@ -118,6 +120,8 @@ impl GtnhSummary {
         self.recipe_fluid_expressions += other.recipe_fluid_expressions;
         self.recipe_fluid_semantics_resolved += other.recipe_fluid_semantics_resolved;
         self.recipe_fluid_method_links += other.recipe_fluid_method_links;
+        self.recipe_fluid_value_links += other.recipe_fluid_value_links;
+        self.recipe_fluid_typed_expression_links += other.recipe_fluid_typed_expression_links;
         self.recipe_durations += other.recipe_durations;
         self.recipe_durations_resolved_to_ticks += other.recipe_durations_resolved_to_ticks;
         merge_counts(
@@ -182,6 +186,12 @@ impl GtnhSummary {
                 match value.semantic {
                     Some(FluidSemantic::LinkedMethod { .. }) => {
                         self.recipe_fluid_method_links += 1;
+                    }
+                    Some(FluidSemantic::LinkedValue { .. }) => {
+                        self.recipe_fluid_value_links += 1;
+                    }
+                    Some(FluidSemantic::TypedExpression { .. }) => {
+                        self.recipe_fluid_typed_expression_links += 1;
                     }
                     Some(_) => self.recipe_fluid_semantics_resolved += 1,
                     None => {}

@@ -125,6 +125,15 @@ pub enum FluidSemantic {
         receiver_type: Option<String>,
         arguments: Vec<JavaExpression>,
     },
+    LinkedValue {
+        value_id: String,
+        value_kind: JavaValueKind,
+        name: String,
+        declared_type: String,
+    },
+    TypedExpression {
+        expression_type: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -550,20 +559,59 @@ fn project_fluid_semantic(
     source_path: &str,
     byte_position: usize,
 ) -> Option<FluidSemantic> {
-    let JavaExpression::Call { arguments, .. } = expression else {
-        return None;
-    };
-    let (resolved, receiver_type) =
-        project.resolve_call_at(source_path, byte_position, expression, bindings)?;
-    if !resolved.return_type.ends_with("FluidStack") {
-        return None;
+    match expression {
+        JavaExpression::Reference(reference) => {
+            let value =
+                project.resolve_value_at(source_path, byte_position, reference, bindings)?;
+            if !is_fluid_value_type(&value.type_name) {
+                return None;
+            }
+            Some(FluidSemantic::LinkedValue {
+                value_id: value.value_id,
+                value_kind: value.kind,
+                name: value.name,
+                declared_type: value.type_name,
+            })
+        }
+        JavaExpression::Call { arguments, .. } => {
+            if let Some((resolved, receiver_type)) =
+                project.resolve_call_at(source_path, byte_position, expression, bindings)
+                && is_fluid_value_type(&resolved.return_type)
+            {
+                return Some(FluidSemantic::LinkedMethod {
+                    method_id: resolved.stable_id(),
+                    return_type: resolved.return_type.clone(),
+                    receiver_type,
+                    arguments: arguments.clone(),
+                });
+            }
+            typed_fluid_expression(expression, bindings, project, source_path, byte_position)
+        }
+        JavaExpression::Parenthesized(inner) => {
+            project_fluid_semantic(inner, bindings, project, source_path, byte_position)
+        }
+        _ => typed_fluid_expression(expression, bindings, project, source_path, byte_position),
     }
-    Some(FluidSemantic::LinkedMethod {
-        method_id: resolved.stable_id(),
-        return_type: resolved.return_type.clone(),
-        receiver_type,
-        arguments: arguments.clone(),
-    })
+}
+
+fn typed_fluid_expression(
+    expression: &JavaExpression,
+    bindings: &JavaBindings,
+    project: &JavaProjectIndex,
+    source_path: &str,
+    byte_position: usize,
+) -> Option<FluidSemantic> {
+    let expression_type =
+        project.expression_type_at(source_path, byte_position, expression, bindings)?;
+    is_fluid_value_type(&expression_type)
+        .then_some(FluidSemantic::TypedExpression { expression_type })
+}
+
+fn is_fluid_value_type(type_name: &str) -> bool {
+    type_name
+        .trim()
+        .trim_end_matches("[]")
+        .ends_with("FluidStack")
 }
 
 fn classify_item_call(
@@ -702,6 +750,21 @@ fn classify_new_item(
 
 fn fluid_semantic(expression: &JavaExpression, bindings: &JavaBindings) -> Option<FluidSemantic> {
     match expression {
+        JavaExpression::Call {
+            receiver: Some(receiver),
+            method,
+            arguments,
+        } if matches!(method.as_str(), "getFluidStack" | "getFluidStackFromName")
+            && arguments.len() >= 2
+            && reference_name(receiver, bindings).is_some_and(|name| {
+                bindings.resolve_reference(&name).ends_with("FluidRegistry")
+            }) =>
+        {
+            Some(FluidSemantic::RegistryFluid {
+                provider: format!("{}.{}", reference_name(receiver, bindings)?, method),
+                arguments: arguments.clone(),
+            })
+        }
         JavaExpression::Call {
             receiver: Some(receiver),
             method,
@@ -1378,6 +1441,53 @@ mod tests {
             &analysis.bindings,
         );
         assert!(recovered[0].semantic.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn recognizes_forge_fluid_registry_and_typed_values() -> anyhow::Result<()> {
+        let source = r#"
+            import java.util.List;
+            import net.minecraftforge.fluids.FluidRegistry;
+            import net.minecraftforge.fluids.FluidStack;
+            class R {
+                void run(FluidStack local, FluidStack[] array, List<FluidStack> list) {
+                    builder.fluidInputs(
+                        FluidRegistry.getFluidStack("water", 1000),
+                        local,
+                        array[0],
+                        list.toArray(new FluidStack[0]));
+                }
+            }
+        "#;
+        let analysis = analyze_source("R.java", "gt5", None, source)?;
+        let mut project = minecraft_redox_java::JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let fluids = recipe_call(&analysis, "fluidInputs")?;
+        let recovered = recover_fluids_with_project(
+            &fluids.arguments,
+            &fluids.argument_expressions,
+            &analysis.bindings,
+            &project,
+            "R.java",
+            fluids.byte_start,
+        );
+        assert!(matches!(
+            recovered[0].semantic,
+            Some(FluidSemantic::RegistryFluid { .. })
+        ));
+        assert!(matches!(
+            recovered[1].semantic,
+            Some(FluidSemantic::LinkedValue { .. })
+        ));
+        assert!(matches!(
+            recovered[2].semantic,
+            Some(FluidSemantic::TypedExpression { .. })
+        ));
+        assert!(matches!(
+            recovered[3].semantic,
+            Some(FluidSemantic::TypedExpression { .. })
+        ));
         Ok(())
     }
 
