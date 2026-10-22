@@ -621,8 +621,12 @@ impl JavaProjectIndex {
         if let Some(receiver_type) =
             self.reference_type_at(site.path, site.byte_position, reference)
         {
-            let receiver_type =
-                self.normalize_owner_name(receiver_type, site.bindings.package.as_deref());
+            let receiver_type = self.normalize_type_name_at(
+                site.path,
+                site.byte_position,
+                receiver_type,
+                site.bindings,
+            );
             return self
                 .resolve_instance_call(&receiver_type, method, site)
                 .map(|resolved| (resolved, Some(receiver_type)));
@@ -689,7 +693,9 @@ impl JavaProjectIndex {
         match expression {
             JavaExpression::Reference(reference) => self
                 .reference_type_at(path, byte_position, reference)
-                .map(|type_name| self.normalize_type_name(type_name, bindings.package.as_deref()))
+                .map(|type_name| {
+                    self.normalize_type_name_at(path, byte_position, type_name, bindings)
+                })
                 .or_else(|| self.imported_static_field_type(bindings, reference)),
             JavaExpression::FieldAccess { receiver, field } => {
                 let static_owner = qualified_reference_name(receiver).and_then(|reference| {
@@ -798,26 +804,13 @@ impl JavaProjectIndex {
         arguments: &[JavaExpression],
         bindings: &JavaBindings,
     ) -> Option<String> {
-        if method != "toArray" || arguments.len() != 1 {
-            return None;
-        }
         let receiver_type = self.expression_type_at(path, byte_position, receiver?, bindings)?;
         let raw_receiver = erase_java_type_syntax(&receiver_type);
-        if !matches!(
-            raw_receiver.as_str(),
-            "java.util.Collection"
-                | "java.util.List"
-                | "java.util.ArrayList"
-                | "java.util.LinkedList"
-                | "java.util.Set"
-                | "java.util.HashSet"
-                | "java.util.LinkedHashSet"
-                | "java.util.SortedSet"
-                | "java.util.TreeSet"
-                | "java.util.Queue"
-                | "java.util.Deque"
-                | "java.util.ArrayDeque"
-        ) {
+        if method == "get" && arguments.len() == 1 && is_java_list_type(&raw_receiver) {
+            let element_type = first_generic_type_argument(&receiver_type)?;
+            return Some(self.normalize_type_name(element_type, bindings.package.as_deref()));
+        }
+        if method != "toArray" || arguments.len() != 1 || !is_java_collection_type(&raw_receiver) {
             return None;
         }
         let argument_type =
@@ -914,17 +907,51 @@ impl JavaProjectIndex {
         bindings: &JavaBindings,
         reference: &str,
     ) -> Option<String> {
+        if self.has_owner(reference) {
+            return Some(reference.to_owned());
+        }
         if let Some(method) = self.enclosing_method(path, byte_position) {
             let mut owner = Some(method.owner.as_str());
             while let Some(current) = owner {
-                let candidate = format!("{current}.{reference}");
-                if self.has_owner(&candidate) {
+                if let Some(candidate) = self.member_type_in_hierarchy(current, reference) {
                     return Some(candidate);
                 }
                 owner = current.rsplit_once('.').map(|(parent, _)| parent);
             }
         }
         self.class_owner_for_reference(bindings, reference)
+    }
+
+    fn member_type_in_hierarchy(&self, owner: &str, reference: &str) -> Option<String> {
+        let mut visited = BTreeSet::new();
+        self.member_type_in_hierarchy_inner(owner, reference, &mut visited)
+    }
+
+    fn member_type_in_hierarchy_inner(
+        &self,
+        owner: &str,
+        reference: &str,
+        visited: &mut BTreeSet<String>,
+    ) -> Option<String> {
+        if !visited.insert(owner.to_owned()) {
+            return None;
+        }
+        let candidate = format!("{owner}.{reference}");
+        if self.has_owner(&candidate) {
+            return Some(candidate);
+        }
+        for supertype in self.supertypes_by_owner.get(owner)? {
+            let normalized = self.normalize_owner_name(
+                supertype,
+                owner.rsplit_once('.').map(|(package, _)| package),
+            );
+            if let Some(candidate) =
+                self.member_type_in_hierarchy_inner(&normalized, reference, visited)
+            {
+                return Some(candidate);
+            }
+        }
+        None
     }
 
     fn class_owner_for_reference(
@@ -937,6 +964,35 @@ impl JavaProjectIndex {
         self.has_owner(&normalized).then_some(normalized)
     }
 
+    fn normalize_type_name_at(
+        &self,
+        path: &str,
+        byte_position: usize,
+        type_name: &str,
+        bindings: &JavaBindings,
+    ) -> String {
+        let mut base = type_name.trim();
+        let mut dimensions = 0usize;
+        while let Some(stripped) = base.strip_suffix("[]") {
+            dimensions += 1;
+            base = stripped.trim_end();
+        }
+        let (raw_type, generic_suffix) = base
+            .find('<')
+            .map_or((base, ""), |index| (&base[..index], &base[index..]));
+        let resolved_reference = bindings.resolve_reference(raw_type.trim());
+        let mut normalized = self
+            .class_owner_for_reference_at(path, byte_position, bindings, &resolved_reference)
+            .unwrap_or_else(|| {
+                self.normalize_owner_name(&resolved_reference, bindings.package.as_deref())
+            });
+        normalized.push_str(generic_suffix);
+        for _ in 0..dimensions {
+            normalized.push_str("[]");
+        }
+        normalized
+    }
+
     fn normalize_type_name(&self, type_name: &str, package: Option<&str>) -> String {
         let mut base = type_name.trim();
         let mut dimensions = 0usize;
@@ -944,7 +1000,11 @@ impl JavaProjectIndex {
             dimensions += 1;
             base = stripped.trim_end();
         }
-        let mut normalized = self.normalize_owner_name(base, package);
+        let (raw_type, generic_suffix) = base
+            .find('<')
+            .map_or((base, ""), |index| (&base[..index], &base[index..]));
+        let mut normalized = self.normalize_owner_name(raw_type.trim(), package);
+        normalized.push_str(generic_suffix);
         for _ in 0..dimensions {
             normalized.push_str("[]");
         }
@@ -1135,6 +1195,55 @@ fn resolve_type_reference(bindings: &JavaBindings, type_name: &str) -> String {
         resolved.push_str("[]");
     }
     resolved
+}
+
+fn is_java_collection_type(type_name: &str) -> bool {
+    matches!(
+        type_name,
+        "java.util.Collection"
+            | "java.util.List"
+            | "java.util.ArrayList"
+            | "java.util.LinkedList"
+            | "java.util.Vector"
+            | "java.util.Stack"
+            | "java.util.Set"
+            | "java.util.HashSet"
+            | "java.util.LinkedHashSet"
+            | "java.util.SortedSet"
+            | "java.util.TreeSet"
+            | "java.util.Queue"
+            | "java.util.Deque"
+            | "java.util.ArrayDeque"
+    )
+}
+
+fn is_java_list_type(type_name: &str) -> bool {
+    matches!(
+        type_name,
+        "java.util.List"
+            | "java.util.ArrayList"
+            | "java.util.LinkedList"
+            | "java.util.Vector"
+            | "java.util.Stack"
+    )
+}
+
+fn first_generic_type_argument(type_name: &str) -> Option<&str> {
+    let start = type_name.find('<')? + 1;
+    let bytes = type_name.as_bytes();
+    let mut depth = 1usize;
+    for (index, byte) in bytes.iter().copied().enumerate().skip(start) {
+        match byte {
+            b'<' => depth += 1,
+            b'>' | b',' if depth == 1 => {
+                let argument = type_name.get(start..index)?.trim();
+                return (!argument.is_empty() && !argument.starts_with('?')).then_some(argument);
+            }
+            b'>' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    None
 }
 
 fn array_element_type(type_name: &str) -> Option<&str> {
@@ -1470,30 +1579,42 @@ fn collect_type_declarations(
     bindings: &JavaBindings,
     declarations: &mut Vec<JavaTypeDeclaration>,
 ) {
-    if matches!(
+    let named_type = matches!(
         node.kind(),
         "class_declaration" | "interface_declaration" | "enum_declaration" | "record_declaration"
-    ) && let Some(owner) = enclosing_type_name(node, source, bindings)
+    );
+    let anonymous_type = is_anonymous_object_creation(node);
+    if (named_type || anonymous_type)
+        && let Some(owner) = enclosing_type_name(node, source, bindings)
     {
         let mut direct_supertypes = Vec::new();
-        if let Some(superclass) = node.child_by_field_name("superclass")
-            && let Some(type_node) = superclass.named_child(0)
-        {
-            direct_supertypes.push(resolve_type_reference(
-                bindings,
-                &node_source(type_node, source),
-            ));
-        }
-        if let Some(interfaces) = node.child_by_field_name("interfaces") {
-            collect_type_list(interfaces, source, bindings, &mut direct_supertypes);
-        }
-        if node.kind() == "interface_declaration" {
-            let mut cursor = node.walk();
-            for child in node
-                .named_children(&mut cursor)
-                .filter(|child| child.kind() == "extends_interfaces")
+        if anonymous_type {
+            if let Some(type_node) = node.child_by_field_name("type") {
+                direct_supertypes.push(resolve_type_reference(
+                    bindings,
+                    &node_source(type_node, source),
+                ));
+            }
+        } else {
+            if let Some(superclass) = node.child_by_field_name("superclass")
+                && let Some(type_node) = superclass.named_child(0)
             {
-                collect_type_list(child, source, bindings, &mut direct_supertypes);
+                direct_supertypes.push(resolve_type_reference(
+                    bindings,
+                    &node_source(type_node, source),
+                ));
+            }
+            if let Some(interfaces) = node.child_by_field_name("interfaces") {
+                collect_type_list(interfaces, source, bindings, &mut direct_supertypes);
+            }
+            if node.kind() == "interface_declaration" {
+                let mut cursor = node.walk();
+                for child in node
+                    .named_children(&mut cursor)
+                    .filter(|child| child.kind() == "extends_interfaces")
+                {
+                    collect_type_list(child, source, bindings, &mut direct_supertypes);
+                }
             }
         }
         declarations.push(JavaTypeDeclaration {
@@ -1709,6 +1830,15 @@ fn spread_parameter(
     })
 }
 
+fn is_anonymous_object_creation(node: Node<'_>) -> bool {
+    if node.kind() != "object_creation_expression" {
+        return false;
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .any(|child| child.kind() == "class_body")
+}
+
 fn enclosing_type_name(node: Node<'_>, source: &str, bindings: &JavaBindings) -> Option<String> {
     let mut names = Vec::new();
     let mut current = Some(node);
@@ -1723,6 +1853,8 @@ fn enclosing_type_name(node: Node<'_>, source: &str, bindings: &JavaBindings) ->
             && let Ok(name) = node_text(name_node, source)
         {
             names.push(name.to_owned());
+        } else if is_anonymous_object_creation(parent) {
+            names.push(format!("$anon${}", parent.start_byte()));
         }
         current = parent.parent();
     }
@@ -2521,6 +2653,41 @@ mod tests {
     }
 
     #[test]
+    fn infers_standard_list_get_type() -> anyhow::Result<()> {
+        let source = r"
+            package demo;
+            import java.util.List;
+            import net.minecraft.item.ItemStack;
+            class Recipe {
+                void run(List<ItemStack> items) { sink(items.get(0)); }
+            }
+        ";
+        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
+        let mut index = super::JavaProjectIndex::default();
+        index.add_analysis(&analysis);
+        let sink = analysis
+            .call_chains
+            .iter()
+            .flat_map(|chain| &chain.calls)
+            .find(|call| call.name == "sink")
+            .ok_or_else(|| anyhow::anyhow!("sink call missing"))?;
+        let expression = sink
+            .argument_expressions
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("sink argument missing"))?;
+        assert_eq!(
+            index.expression_type_at(
+                "Recipe.java",
+                sink.byte_start,
+                expression,
+                &analysis.bindings
+            ),
+            Some(String::from("ItemStack"))
+        );
+        Ok(())
+    }
+
+    #[test]
     fn infers_standard_collection_to_array_type() -> anyhow::Result<()> {
         let source = r"
             package demo;
@@ -2874,6 +3041,51 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("nested field chain was not resolved"))?;
         assert_eq!(resolved.owner, "demo.Holder");
         assert_eq!(receiver_type.as_deref(), Some("demo.Holder"));
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_member_type_inside_anonymous_subclass() -> anyhow::Result<()> {
+        let source = r"
+            package demo;
+            class ItemStack {}
+            abstract class Base {
+                protected static class Iter { ItemStack nextItem() { return null; } }
+                protected abstract void apply(Iter iterator);
+            }
+            class Recipe {
+                void run() {
+                    new Base() {
+                        @Override protected void apply(Iter iterator) {
+                            sink(iterator.nextItem());
+                        }
+                    };
+                }
+            }
+        ";
+        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
+        let mut index = super::JavaProjectIndex::default();
+        index.add_analysis(&analysis);
+        let sink = analysis
+            .call_chains
+            .iter()
+            .flat_map(|chain| &chain.calls)
+            .find(|call| call.name == "sink")
+            .ok_or_else(|| anyhow::anyhow!("sink call missing"))?;
+        let expression = sink
+            .argument_expressions
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("sink argument missing"))?;
+        let (resolved, receiver_type) = index
+            .resolve_call_at(
+                "Recipe.java",
+                sink.byte_start,
+                expression,
+                &analysis.bindings,
+            )
+            .ok_or_else(|| anyhow::anyhow!("anonymous inherited member type was not resolved"))?;
+        assert_eq!(resolved.owner, "demo.Base.Iter");
+        assert_eq!(receiver_type.as_deref(), Some("demo.Base.Iter"));
         Ok(())
     }
 
