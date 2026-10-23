@@ -4,7 +4,9 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use minecraft_redox_gtnh::{GtnhSummary, recover_with_project};
+use minecraft_redox_gtnh::{
+    GtnhSummary, TargetContentRecovery, lower_target_content, recover_with_project,
+};
 use minecraft_redox_java::{JavaProjectIndex, analyze_source, inventory_source};
 use rayon::prelude::*;
 use serde::Serialize;
@@ -15,6 +17,12 @@ struct FileRecovery {
     recovery: minecraft_redox_gtnh::GtnhRecovery,
 }
 
+#[derive(Serialize)]
+struct TargetFileRecovery {
+    path: String,
+    target: TargetContentRecovery,
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     match args.as_slice() {
@@ -22,11 +30,12 @@ fn main() -> Result<()> {
         [_, command, path] if command == "inventory" => print_inventory(path),
         [_, command, path] if command == "chains" => print_chains(path),
         [_, command, path] if command == "gtnh" => print_gtnh(path, false),
+        [_, command, path] if command == "gtnh-target" => print_gtnh_target(path),
         [_, command, flag, path] if command == "gtnh" && flag == "--summary" => {
             print_gtnh(path, true)
         }
         _ => bail!(
-            "usage: minecraft-redox [inventory|chains] <java-file> | gtnh [--summary] <file-or-dir>"
+            "usage: minecraft-redox [inventory|chains] <java-file> | gtnh [--summary] <file-or-dir> | gtnh-target <file-or-dir>"
         ),
     }
 }
@@ -66,6 +75,32 @@ fn print_gtnh(path: &str, summary_only: bool) -> Result<()> {
                 recovery,
             });
         }
+    }
+    println!("{}", serde_json::to_string_pretty(&files)?);
+    Ok(())
+}
+
+fn print_gtnh_target(path: &str) -> Result<()> {
+    let paths = java_paths(Path::new(path))?;
+    let project = build_project_index(&paths)?;
+    let mut files = Vec::new();
+    for source_path in paths {
+        let display = source_path.to_string_lossy().into_owned();
+        let source = read_source(&source_path)?;
+        let analysis = analyze_source(&display, "GTNH", None, &source)?;
+        let recovery = recover_with_project(&analysis, &project);
+        let target = lower_target_content(&analysis, &recovery, &project);
+        if target.materials.is_empty()
+            && target.material_failures.is_empty()
+            && target.recipes.is_empty()
+            && target.recipe_failures.is_empty()
+        {
+            continue;
+        }
+        files.push(TargetFileRecovery {
+            path: display,
+            target,
+        });
     }
     println!("{}", serde_json::to_string_pretty(&files)?);
     Ok(())

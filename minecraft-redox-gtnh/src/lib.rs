@@ -2,16 +2,23 @@
 
 mod recipe_expression;
 mod scalar_expression;
+mod target_material;
 mod target_recipe;
 
 pub use recipe_expression::{
     ExpressionSemantic, FluidSemantic, ItemSemantic, NumericSemantic, RecoveredExpression,
 };
+pub use target_material::{
+    MaterialLoweringBlocker, MaterialLoweringBlockerKind, MaterialLoweringFailure, lower_material,
+};
 pub use target_recipe::{
     RecipeLoweringBlocker, RecipeLoweringBlockerKind, RecipeLoweringFailure, lower_recipe,
 };
 
-use minecraft_redox_core::SourceOrigin;
+use minecraft_redox_core::{
+    SourceOrigin,
+    content::{ContentMaterial, ContentRecipe},
+};
 use minecraft_redox_java::{
     JavaAnalysis, JavaBindings, JavaCall, JavaCallChain, JavaExpression, JavaProjectIndex,
     generic_type_argument,
@@ -102,6 +109,8 @@ pub struct MaterialDefinition {
     pub melting_point: Option<String>,
     pub blast_furnace_temp: Option<String>,
     pub properties: Vec<BuilderCall>,
+    pub definition_calls: Vec<JavaCall>,
+    pub property_calls: Vec<JavaCall>,
     pub unhandled_calls: Vec<BuilderCall>,
 }
 
@@ -109,6 +118,36 @@ pub struct MaterialDefinition {
 pub struct GtnhRecovery {
     pub recipes: Vec<RecipeDefinition>,
     pub materials: Vec<MaterialDefinition>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct TargetContentRecovery {
+    pub materials: Vec<ContentMaterial>,
+    pub material_failures: Vec<MaterialLoweringFailure>,
+    pub recipes: Vec<ContentRecipe>,
+    pub recipe_failures: Vec<RecipeLoweringFailure>,
+}
+
+#[must_use]
+pub fn lower_target_content(
+    analysis: &JavaAnalysis,
+    recovery: &GtnhRecovery,
+    project: &JavaProjectIndex,
+) -> TargetContentRecovery {
+    let mut target = TargetContentRecovery::default();
+    for material in &recovery.materials {
+        match target_material::lower_material_with_project(material, &analysis.bindings, project) {
+            Ok(material) => target.materials.push(material),
+            Err(failure) => target.material_failures.push(*failure),
+        }
+    }
+    for recipe in &recovery.recipes {
+        match target_recipe::lower_recipe_with_project(recipe, &analysis.bindings, project) {
+            Ok(recipe) => target.recipes.push(recipe),
+            Err(failure) => target.recipe_failures.push(*failure),
+        }
+    }
+    target
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
@@ -121,6 +160,8 @@ pub struct GtnhSummary {
     pub recipes_builder_fully_normalized: usize,
     pub materials: usize,
     pub materials_builder_fully_normalized: usize,
+    pub materials_lowered: usize,
+    pub material_lowering_blockers: BTreeMap<String, usize>,
     pub recipes_lowered: usize,
     pub recipe_lowering_blockers: BTreeMap<String, usize>,
     pub recipe_unhandled_methods: BTreeMap<String, usize>,
@@ -190,6 +231,11 @@ impl GtnhSummary {
         self.recipes_builder_fully_normalized += other.recipes_builder_fully_normalized;
         self.materials += other.materials;
         self.materials_builder_fully_normalized += other.materials_builder_fully_normalized;
+        self.materials_lowered += other.materials_lowered;
+        merge_counts(
+            &mut self.material_lowering_blockers,
+            other.material_lowering_blockers,
+        );
         self.recipes_lowered += other.recipes_lowered;
         merge_counts(
             &mut self.recipe_lowering_blockers,
@@ -305,6 +351,36 @@ impl GtnhSummary {
         }
     }
 
+    fn absorb_material_lowering(
+        &mut self,
+        analysis: &JavaAnalysis,
+        recovery: &GtnhRecovery,
+        project: Option<&JavaProjectIndex>,
+    ) {
+        for material in &recovery.materials {
+            let lowered = project.map_or_else(
+                || target_material::lower_material(material, &analysis.bindings),
+                |project| {
+                    target_material::lower_material_with_project(
+                        material,
+                        &analysis.bindings,
+                        project,
+                    )
+                },
+            );
+            match lowered {
+                Ok(_) => self.materials_lowered += 1,
+                Err(failure) => {
+                    let keys: BTreeSet<_> =
+                        failure.blockers.iter().map(material_blocker_key).collect();
+                    for key in keys {
+                        *self.material_lowering_blockers.entry(key).or_default() += 1;
+                    }
+                }
+            }
+        }
+    }
+
     fn absorb_internal(
         &mut self,
         analysis: &JavaAnalysis,
@@ -330,6 +406,7 @@ impl GtnhSummary {
             .filter(|material| material.unhandled_calls.is_empty())
             .count();
         self.absorb_recipe_lowering(analysis, recovery, project);
+        self.absorb_material_lowering(analysis, recovery, project);
         for recipe in &recovery.recipes {
             self.recipe_item_expressions +=
                 recipe.item_input_semantics.len() + recipe.item_output_semantics.len();
@@ -530,6 +607,16 @@ impl GtnhSummary {
                 }
             }
         }
+    }
+}
+
+fn material_blocker_key(blocker: &MaterialLoweringBlocker) -> String {
+    match blocker.kind {
+        MaterialLoweringBlockerKind::UnsupportedProperty
+        | MaterialLoweringBlockerKind::InvalidProperty => {
+            format!("{}:{}", blocker.kind.as_str(), blocker.detail)
+        }
+        _ => blocker.kind.as_str().to_owned(),
     }
 }
 
@@ -936,19 +1023,42 @@ fn recognize_material(chain: &JavaCallChain) -> Option<MaterialDefinition> {
         melting_point: None,
         blast_furnace_temp: None,
         properties: Vec::new(),
+        definition_calls: Vec::new(),
+        property_calls: Vec::new(),
         unhandled_calls: Vec::new(),
     };
 
     for call in &chain.calls {
         match call.name.as_str() {
-            "setName" => material.name = one_argument(call),
-            "setDefaultLocalName" => material.default_local_name = one_argument(call),
-            "setIconSet" => material.icon_set = one_argument(call),
-            "setColor" | "setARGB" => material.color = one_argument(call),
-            "setMeltingPoint" => material.melting_point = one_argument(call),
-            "setBlastFurnaceTemp" => material.blast_furnace_temp = one_argument(call),
+            "setName" => {
+                material.name = one_argument(call);
+                material.definition_calls.push(call.clone());
+            }
+            "setDefaultLocalName" => {
+                material.default_local_name = one_argument(call);
+                material.definition_calls.push(call.clone());
+            }
+            "setIconSet" => {
+                material.icon_set = one_argument(call);
+                material.definition_calls.push(call.clone());
+            }
+            "setColor" | "setARGB" => {
+                material.color = one_argument(call);
+                material.definition_calls.push(call.clone());
+            }
+            "setMeltingPoint" => {
+                material.melting_point = one_argument(call);
+                material.definition_calls.push(call.clone());
+            }
+            "setBlastFurnaceTemp" => {
+                material.blast_furnace_temp = one_argument(call);
+                material.definition_calls.push(call.clone());
+            }
             "constructMaterial" => {}
-            name if is_known_material_property(name) => material.properties.push(call.into()),
+            name if is_known_material_property(name) => {
+                material.properties.push(call.into());
+                material.property_calls.push(call.clone());
+            }
             _ => material.unhandled_calls.push(call.into()),
         }
     }
