@@ -57,6 +57,7 @@ pub struct RecipeMetadataDefinition {
     pub value_expression: JavaExpression,
     pub value_type: Option<String>,
     pub value_semantic: ExpressionSemantic,
+    pub byte_start: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -923,6 +924,7 @@ fn add_recipe_metadata(
         value_expression: value_expression.clone(),
         value_type,
         value_semantic,
+        byte_start: call.byte_start,
     });
 }
 

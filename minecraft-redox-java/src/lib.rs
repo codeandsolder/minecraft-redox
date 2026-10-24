@@ -315,6 +315,11 @@ pub struct JavaProjectIndex {
 }
 
 impl JavaProjectIndex {
+    #[must_use]
+    pub fn type_kind(&self, owner: &str) -> Option<JavaTypeKind> {
+        self.type_kinds_by_owner.get(owner).copied()
+    }
+
     pub fn add_analysis(&mut self, analysis: &JavaAnalysis) {
         self.bindings_by_path
             .insert(analysis.inventory.path.clone(), analysis.bindings.clone());

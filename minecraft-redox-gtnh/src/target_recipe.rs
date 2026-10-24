@@ -6,13 +6,13 @@ use minecraft_redox_core::{
         RecipePolicySpec, RecipeSlotChance,
     },
 };
-use minecraft_redox_java::{JavaBindings, JavaExpression, JavaProjectIndex};
+use minecraft_redox_java::{JavaBindings, JavaExpression, JavaProjectIndex, JavaTypeKind};
 use serde::Serialize;
 
 use crate::{
     FluidSemantic, ItemSemantic, NumericSemantic, RecipeDefinition, RecipeMetadataDefinition,
     RecoveredExpression,
-    recipe_expression::{literal_i64, resolved_reference_name},
+    recipe_expression::{literal_i64, recover_items_with_project, resolved_reference_name},
     scalar_expression::scalar_i64,
 };
 
@@ -227,7 +227,7 @@ fn lower_recipe_metadata(
         .metadata_semantics
         .iter()
         .filter_map(|metadata| {
-            lower_metadata_entry(metadata, bindings, project).or_else(|| {
+            lower_metadata_entry(metadata, &recipe.origin.path, bindings, project).or_else(|| {
                 push_blocker(
                     blockers,
                     RecipeLoweringBlockerKind::Metadata,
@@ -248,6 +248,7 @@ fn lower_recipe_metadata(
 
 fn lower_metadata_entry(
     metadata: &RecipeMetadataDefinition,
+    source_path: &str,
     bindings: &JavaBindings,
     project: Option<&JavaProjectIndex>,
 ) -> Option<RecipeMetadataSpec> {
@@ -255,11 +256,9 @@ fn lower_metadata_entry(
         .unwrap_or_else(|| bindings.resolve_reference(&metadata.key_source));
     let expected = metadata.expected_value_type.as_deref()?;
     let value = if is_java_type(expected, "Integer") || is_java_type(expected, "Long") {
-        let value = project.map_or_else(
-            || literal_i64(&metadata.value_expression),
-            |project| scalar_i64(&metadata.value_expression, bindings, project),
-        )?;
-        RecipeMetadataValue::Integer { value }
+        RecipeMetadataValue::Integer {
+            value: metadata_i64(&metadata.value_expression, bindings, project)?,
+        }
     } else if is_java_type(expected, "Boolean") {
         RecipeMetadataValue::Boolean {
             value: literal_boolean(&metadata.value_expression)?,
@@ -275,12 +274,106 @@ fn lower_metadata_entry(
                 bindings,
             )?),
         }
+    } else if is_java_type(expected, "ItemStack") {
+        lower_item_stack_metadata(metadata, source_path, bindings, project)?
+    } else if is_java_type(expected, "Scanning") {
+        lower_scanning_metadata(&metadata.value_expression, bindings, project)?
+    } else if is_java_type(expected, "Sievert") {
+        lower_sievert_metadata(&metadata.value_expression, bindings, project)?
+    } else if project.is_some_and(|project| {
+        let owner = bindings.resolve_reference(expected);
+        project.type_kind(&owner) == Some(JavaTypeKind::Enum)
+    }) {
+        RecipeMetadataValue::ContentRef {
+            id: ContentId::new(resolved_reference_name(
+                &metadata.value_expression,
+                bindings,
+            )?),
+        }
     } else {
         return None;
     };
     Some(RecipeMetadataSpec {
         key: ContentId::new(key),
         value,
+    })
+}
+
+fn lower_item_stack_metadata(
+    metadata: &RecipeMetadataDefinition,
+    source_path: &str,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+) -> Option<RecipeMetadataValue> {
+    let source = [metadata.value_source.clone()];
+    let expression = [metadata.value_expression.clone()];
+    let recovered = if let Some(project) = project {
+        recover_items_with_project(
+            &source,
+            &expression,
+            bindings,
+            project,
+            source_path,
+            metadata.byte_start,
+        )
+    } else {
+        crate::recipe_expression::recover_items(&source, &expression, bindings)
+    };
+    let stack = lower_recovered_stack(recovered.first()?, bindings)?;
+    Some(RecipeMetadataValue::ItemStack { value: stack })
+}
+
+fn metadata_i64(
+    expression: &JavaExpression,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+) -> Option<i64> {
+    project.map_or_else(
+        || literal_i64(expression),
+        |project| scalar_i64(expression, bindings, project),
+    )
+}
+
+fn lower_scanning_metadata(
+    expression: &JavaExpression,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+) -> Option<RecipeMetadataValue> {
+    let JavaExpression::New {
+        type_name,
+        arguments,
+    } = expression
+    else {
+        return None;
+    };
+    if !is_java_type(type_name, "Scanning") || arguments.len() != 2 {
+        return None;
+    }
+    Some(RecipeMetadataValue::Scanning {
+        duration_ticks: u64::try_from(metadata_i64(&arguments[0], bindings, project)?).ok()?,
+        voltage: metadata_i64(&arguments[1], bindings, project)?,
+    })
+}
+
+fn lower_sievert_metadata(
+    expression: &JavaExpression,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+) -> Option<RecipeMetadataValue> {
+    let JavaExpression::New {
+        type_name,
+        arguments,
+    } = expression
+    else {
+        return None;
+    };
+    if !is_java_type(type_name, "Sievert") || !(1..=2).contains(&arguments.len()) {
+        return None;
+    }
+    let exact = arguments.get(1).map_or(Some(false), literal_boolean)?;
+    Some(RecipeMetadataValue::Sievert {
+        value: metadata_i64(&arguments[0], bindings, project)?,
+        exact,
     })
 }
 
@@ -767,6 +860,94 @@ mod tests {
                 .map(minecraft_redox_core::content::ContentId::as_str),
             Some("RecipeCategory.SPECIAL")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn lowers_scanning_and_sievert_metadata() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+            import gregtech.api.enums.GTValues;
+            class RecipeMetadataKey<T> {}
+            class Scanning { Scanning(int time, long voltage) {} }
+            class Sievert { Sievert(int value, boolean exact) {} }
+            class Keys {
+                static RecipeMetadataKey<Scanning> SCAN;
+                static RecipeMetadataKey<Sievert> SIEVERT;
+            }
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .metadata(Keys.SCAN, new Scanning(2 * 20, 128L))
+                    .metadata(Keys.SIEVERT, new Sievert(100, true))
+                    .duration(20)
+                    .eut(2)
+                    .addTo(compressorRecipes);
+            }}
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let mut project = JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let recovery = crate::recover_with_project(&analysis, &project);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let lowered = super::lower_recipe_with_project(recipe, &analysis.bindings, &project)
+            .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
+        assert!(matches!(
+            lowered.metadata[0].value,
+            RecipeMetadataValue::Scanning {
+                duration_ticks: 40,
+                voltage: 128
+            }
+        ));
+        assert!(matches!(
+            lowered.metadata[1].value,
+            RecipeMetadataValue::Sievert {
+                value: 100,
+                exact: true
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn lowers_item_stack_metadata_through_item_semantics() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+            import gregtech.api.enums.GTValues;
+            import net.minecraft.item.ItemStack;
+            class RecipeMetadataKey<T> {}
+            class ItemList {
+                static ItemList Research;
+                ItemStack get(long amount) { return null; }
+            }
+            class Keys { static RecipeMetadataKey<ItemStack> RESEARCH; }
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .metadata(Keys.RESEARCH, ItemList.Research.get(1L))
+                    .duration(20)
+                    .eut(2)
+                    .addTo(compressorRecipes);
+            }}
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let mut project = JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let recovery = crate::recover_with_project(&analysis, &project);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let lowered = super::lower_recipe_with_project(recipe, &analysis.bindings, &project)
+            .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
+        assert!(matches!(
+            &lowered.metadata[0].value,
+            RecipeMetadataValue::ItemStack { value }
+                if value.amount == 1
+                    && matches!(&value.selector, ItemSelector::Named { id, variant: None }
+                        if id.as_str() == "ItemList.Research")
+        ));
         Ok(())
     }
 

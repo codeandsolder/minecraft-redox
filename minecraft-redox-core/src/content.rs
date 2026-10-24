@@ -114,6 +114,9 @@ pub enum RecipeMetadataValue {
     Boolean { value: bool },
     Text { value: String },
     ContentRef { id: ContentId },
+    ItemStack { value: ItemStackSpec },
+    Scanning { duration_ticks: u64, voltage: i64 },
+    Sievert { value: i64, exact: bool },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
