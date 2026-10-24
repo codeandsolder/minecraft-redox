@@ -100,6 +100,12 @@ pub struct RecipeSlotChance {
     pub chance_10000: u16,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RecipeSpecialSpec {
+    ItemStack { value: ItemStackSpec },
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RecipePolicySpec {
     pub conditions: Vec<RecipeCondition>,
@@ -146,6 +152,8 @@ pub struct ContentRecipe {
     pub item_output_production_chances: Vec<RecipeSlotChance>,
     pub metadata: Vec<RecipeMetadataSpec>,
     pub category: Option<ContentId>,
+    pub special: Option<RecipeSpecialSpec>,
+    pub special_value: Option<i64>,
     pub policy: RecipePolicySpec,
 }
 

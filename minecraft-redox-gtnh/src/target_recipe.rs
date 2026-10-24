@@ -3,7 +3,7 @@ use minecraft_redox_core::{
     content::{
         ContentId, ContentRecipe, FluidSelector, FluidStackSpec, ItemInputSpec, ItemSelector,
         ItemStackSpec, RecipeBehavior, RecipeCondition, RecipeMetadataSpec, RecipeMetadataValue,
-        RecipePolicySpec, RecipeSlotChance,
+        RecipePolicySpec, RecipeSlotChance, RecipeSpecialSpec,
     },
 };
 use minecraft_redox_java::{JavaBindings, JavaExpression, JavaProjectIndex, JavaTypeKind};
@@ -139,9 +139,7 @@ fn lower_recipe_internal(
         }
     };
 
-    let policy = lower_recipe_policy(recipe, bindings, &mut blockers);
-    let metadata = lower_recipe_metadata(recipe, bindings, project, &mut blockers);
-    let category = lower_recipe_category(recipe, bindings, &mut blockers);
+    let extras = lower_recipe_extras(recipe, bindings, project, &mut blockers);
     let mut item_inputs = lower_inputs(recipe, bindings, &mut blockers);
     item_inputs.extend(lower_integrated_circuits(recipe, &mut blockers));
     let item_outputs = lower_outputs(recipe, bindings, &mut blockers);
@@ -186,9 +184,11 @@ fn lower_recipe_internal(
             eut,
             item_input_consumption_chances,
             item_output_production_chances,
-            metadata,
-            category,
-            policy,
+            metadata: extras.metadata,
+            category: extras.category,
+            special: extras.special,
+            special_value: extras.special_value,
+            policy: extras.policy,
         });
     }
 
@@ -198,15 +198,31 @@ fn lower_recipe_internal(
     }))
 }
 
+struct LoweredRecipeExtras {
+    policy: RecipePolicySpec,
+    metadata: Vec<RecipeMetadataSpec>,
+    category: Option<ContentId>,
+    special: Option<RecipeSpecialSpec>,
+    special_value: Option<i64>,
+}
+
+fn lower_recipe_extras(
+    recipe: &RecipeDefinition,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+    blockers: &mut Vec<RecipeLoweringBlocker>,
+) -> LoweredRecipeExtras {
+    LoweredRecipeExtras {
+        policy: lower_recipe_policy(recipe, bindings, blockers),
+        metadata: lower_recipe_metadata(recipe, bindings, project, blockers),
+        category: lower_recipe_category(recipe, bindings, blockers),
+        special: lower_recipe_special(recipe, bindings, project, blockers),
+        special_value: lower_recipe_special_value(recipe, blockers),
+    }
+}
+
 fn structural_blockers(recipe: &RecipeDefinition) -> Vec<RecipeLoweringBlocker> {
     let mut blockers = Vec::new();
-    if recipe.special.is_some() || recipe.special_value.is_some() {
-        push_blocker(
-            &mut blockers,
-            RecipeLoweringBlockerKind::Special,
-            "special item/value is not in target recipe IR v1",
-        );
-    }
     if !recipe.post_add_calls.is_empty() || !recipe.unhandled_calls.is_empty() {
         push_blocker(
             &mut blockers,
@@ -472,6 +488,65 @@ fn lower_slot_chances(
             Some(RecipeSlotChance { slot, chance_10000 })
         })
         .collect()
+}
+
+fn lower_recipe_special(
+    recipe: &RecipeDefinition,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+    blockers: &mut Vec<RecipeLoweringBlocker>,
+) -> Option<RecipeSpecialSpec> {
+    let (Some(source), Some(expression)) = (&recipe.special, &recipe.special_expression) else {
+        return None;
+    };
+    let sources = [source.clone()];
+    let expressions = [expression.clone()];
+    let recovered = if let Some(project) = project {
+        recover_items_with_project(
+            &sources,
+            &expressions,
+            bindings,
+            project,
+            &recipe.origin.path,
+            recipe.special_byte_start.unwrap_or_default(),
+        )
+    } else {
+        crate::recipe_expression::recover_items(&sources, &expressions, bindings)
+    };
+    if let Some(stack) = recovered
+        .first()
+        .and_then(|value| lower_recovered_stack(value, bindings))
+    {
+        return Some(RecipeSpecialSpec::ItemStack { value: stack });
+    }
+    push_blocker(
+        blockers,
+        RecipeLoweringBlockerKind::Special,
+        format!("unsupported special payload: {source}"),
+    );
+    None
+}
+
+fn lower_recipe_special_value(
+    recipe: &RecipeDefinition,
+    blockers: &mut Vec<RecipeLoweringBlocker>,
+) -> Option<i64> {
+    recipe.special_value.as_ref()?;
+    if let Some(value) = recipe.special_value_exact {
+        return Some(value);
+    }
+    push_blocker(
+        blockers,
+        RecipeLoweringBlockerKind::Special,
+        format!(
+            "non-constant special value: {}",
+            recipe
+                .special_value
+                .as_deref()
+                .unwrap_or("<missing source>")
+        ),
+    );
+    None
 }
 
 fn lower_recipe_policy(
@@ -948,6 +1023,82 @@ mod tests {
                     && matches!(&value.selector, ItemSelector::Named { id, variant: None }
                         if id.as_str() == "ItemList.Research")
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn lowers_item_special_and_exact_special_value() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+            import gregtech.api.enums.GTValues;
+            import net.minecraft.item.ItemStack;
+            class ItemList {
+                static ItemList DataStick;
+                ItemStack get(long amount) { return null; }
+            }
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .special(ItemList.DataStick.get(1L))
+                    .specialValue(42)
+                    .duration(20)
+                    .eut(2)
+                    .addTo(compressorRecipes);
+            }}
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let mut project = JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let recovery = crate::recover_with_project(&analysis, &project);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let lowered = super::lower_recipe_with_project(recipe, &analysis.bindings, &project)
+            .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
+        assert!(matches!(
+            &lowered.special,
+            Some(minecraft_redox_core::content::RecipeSpecialSpec::ItemStack { value })
+                if value.amount == 1
+                    && matches!(&value.selector, ItemSelector::Named { id, variant: None }
+                        if id.as_str() == "ItemList.DataStick")
+        ));
+        assert_eq!(lowered.special_value, Some(42));
+        Ok(())
+    }
+
+    #[test]
+    fn blocks_custom_or_runtime_special_payloads() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+            import gregtech.api.enums.GTValues;
+            class CustomSpecial {}
+            class Recipes { void run(int value) {
+                GTValues.RA.stdBuilder()
+                    .special(new CustomSpecial())
+                    .specialValue(value)
+                    .duration(20)
+                    .eut(2)
+                    .addTo(compressorRecipes);
+            }}
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let mut project = JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let recovery = crate::recover_with_project(&analysis, &project);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let Err(failure) = super::lower_recipe_with_project(recipe, &analysis.bindings, &project)
+        else {
+            return Err(anyhow::anyhow!("custom special unexpectedly lowered"));
+        };
+        assert!(
+            failure
+                .blockers
+                .iter()
+                .any(|blocker| blocker.kind == RecipeLoweringBlockerKind::Special)
+        );
         Ok(())
     }
 

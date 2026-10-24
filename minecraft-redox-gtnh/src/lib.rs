@@ -93,6 +93,7 @@ pub struct RecipeDefinition {
     pub special: Option<String>,
     pub special_expression: Option<JavaExpression>,
     pub special_semantic: Option<ExpressionSemantic>,
+    pub special_byte_start: Option<usize>,
     pub metadata: Vec<BuilderCall>,
     pub metadata_semantics: Vec<RecipeMetadataDefinition>,
     pub recipe_categories: Vec<RecoveredExpression<ExpressionSemantic>>,
@@ -690,6 +691,7 @@ fn new_recipe_definition(
         special: None,
         special_expression: None,
         special_semantic: None,
+        special_byte_start: None,
         metadata: Vec::new(),
         metadata_semantics: Vec::new(),
         recipe_categories: Vec::new(),
@@ -800,6 +802,7 @@ fn set_special(
     recipe.special = Some(source);
     recipe.special_expression = Some(expression);
     recipe.special_semantic = Some(semantic);
+    recipe.special_byte_start = Some(call.byte_start);
 }
 
 struct NumericCallRecovery {
