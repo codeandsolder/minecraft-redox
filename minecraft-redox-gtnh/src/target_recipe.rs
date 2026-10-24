@@ -2,7 +2,7 @@ use minecraft_redox_core::{
     SourceOrigin,
     content::{
         ContentId, ContentRecipe, FluidSelector, FluidStackSpec, ItemInputSpec, ItemSelector,
-        ItemStackSpec, RecipeBehavior, RecipeCondition, RecipePolicySpec,
+        ItemStackSpec, RecipeBehavior, RecipeCondition, RecipePolicySpec, RecipeSlotChance,
     },
 };
 use minecraft_redox_java::{JavaBindings, JavaExpression, JavaProjectIndex};
@@ -141,6 +141,18 @@ fn lower_recipe_internal(
     let mut item_inputs = lower_inputs(recipe, bindings, &mut blockers);
     item_inputs.extend(lower_integrated_circuits(recipe, &mut blockers));
     let item_outputs = lower_outputs(recipe, bindings, &mut blockers);
+    let item_input_consumption_chances = lower_slot_chances(
+        &recipe.input_chance_semantics,
+        recipe.item_input_semantics.len() + recipe.integrated_circuits.len(),
+        "item input consumption",
+        &mut blockers,
+    );
+    let item_output_production_chances = lower_slot_chances(
+        &recipe.output_chance_semantics,
+        recipe.item_output_semantics.len(),
+        "item output production",
+        &mut blockers,
+    );
     let fluid_inputs = lower_fluids(
         &recipe.fluid_input_semantics,
         bindings,
@@ -168,6 +180,8 @@ fn lower_recipe_internal(
             fluid_outputs,
             duration_ticks,
             eut,
+            item_input_consumption_chances,
+            item_output_production_chances,
             policy,
         });
     }
@@ -180,13 +194,6 @@ fn lower_recipe_internal(
 
 fn structural_blockers(recipe: &RecipeDefinition) -> Vec<RecipeLoweringBlocker> {
     let mut blockers = Vec::new();
-    if !recipe.input_chances.is_empty() || !recipe.output_chances.is_empty() {
-        push_blocker(
-            &mut blockers,
-            RecipeLoweringBlockerKind::Chances,
-            "item chances are not in target recipe IR v1",
-        );
-    }
     if !recipe.metadata.is_empty() {
         push_blocker(
             &mut blockers,
@@ -209,6 +216,71 @@ fn structural_blockers(recipe: &RecipeDefinition) -> Vec<RecipeLoweringBlocker> 
         );
     }
     blockers
+}
+
+fn lower_slot_chances(
+    recovered: &[RecoveredExpression<NumericSemantic>],
+    slot_count: usize,
+    description: &str,
+    blockers: &mut Vec<RecipeLoweringBlocker>,
+) -> Vec<RecipeSlotChance> {
+    if recovered.is_empty() {
+        return Vec::new();
+    }
+    if recovered.len() != slot_count {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Chances,
+            format!(
+                "{description} chance count {} does not match recovered slot count {slot_count}",
+                recovered.len()
+            ),
+        );
+        return Vec::new();
+    }
+
+    recovered
+        .iter()
+        .enumerate()
+        .filter_map(|(slot, recovered)| {
+            let Some(NumericSemantic::ExactValue { value }) = recovered.semantic.as_ref() else {
+                push_blocker(
+                    blockers,
+                    RecipeLoweringBlockerKind::Chances,
+                    format!(
+                        "dynamic {description} chance for slot {slot}: {}",
+                        recovered.source
+                    ),
+                );
+                return None;
+            };
+            let Ok(chance_10000) = u16::try_from(*value) else {
+                push_blocker(
+                    blockers,
+                    RecipeLoweringBlockerKind::Chances,
+                    format!("invalid {description} chance for slot {slot}: {value}"),
+                );
+                return None;
+            };
+            if chance_10000 > 10_000 {
+                push_blocker(
+                    blockers,
+                    RecipeLoweringBlockerKind::Chances,
+                    format!("invalid {description} chance for slot {slot}: {value}"),
+                );
+                return None;
+            }
+            let Ok(slot) = u32::try_from(slot) else {
+                push_blocker(
+                    blockers,
+                    RecipeLoweringBlockerKind::Chances,
+                    format!("{description} slot index does not fit u32: {slot}"),
+                );
+                return None;
+            };
+            Some(RecipeSlotChance { slot, chance_10000 })
+        })
+        .collect()
 }
 
 fn lower_recipe_policy(
@@ -588,6 +660,82 @@ mod tests {
             ItemSelector::Named { id, variant: None }
                 if id.as_str() == "net.minecraft.init.Blocks.netherrack"
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn lowers_item_input_and_output_chances() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+            import gregtech.api.enums.GTValues;
+            import net.minecraft.init.Blocks;
+            import net.minecraft.item.ItemStack;
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .itemInputs(new ItemStack(Blocks.dirt))
+                    .inputChances(2_500)
+                    .itemOutputs(new ItemStack(Blocks.stone))
+                    .outputChances(10_000)
+                    .duration(20)
+                    .eut(2)
+                    .addTo(compressorRecipes);
+            }}
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let recovery = recover(&analysis);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let lowered = lower_recipe(recipe, &analysis.bindings)
+            .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
+
+        assert_eq!(lowered.item_input_consumption_chances.len(), 1);
+        assert_eq!(lowered.item_input_consumption_chances[0].slot, 0);
+        assert_eq!(
+            lowered.item_input_consumption_chances[0].chance_10000,
+            2_500
+        );
+        assert_eq!(lowered.item_output_production_chances.len(), 1);
+        assert_eq!(lowered.item_output_production_chances[0].slot, 0);
+        assert_eq!(
+            lowered.item_output_production_chances[0].chance_10000,
+            10_000
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn blocks_dynamic_item_output_chance() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+            import gregtech.api.enums.GTValues;
+            import net.minecraft.init.Blocks;
+            import net.minecraft.item.ItemStack;
+            class Recipes { void run(int chance) {
+                GTValues.RA.stdBuilder()
+                    .itemOutputs(new ItemStack(Blocks.stone))
+                    .outputChances(chance)
+                    .duration(20)
+                    .eut(2)
+                    .addTo(compressorRecipes);
+            }}
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let recovery = recover(&analysis);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let Err(failure) = lower_recipe(recipe, &analysis.bindings) else {
+            return Err(anyhow::anyhow!("dynamic chance lowered as static content"));
+        };
+        assert!(failure.blockers.iter().any(|blocker| {
+            blocker.kind == RecipeLoweringBlockerKind::Chances
+                && blocker
+                    .detail
+                    .contains("dynamic item output production chance")
+        }));
         Ok(())
     }
 

@@ -93,6 +93,13 @@ pub enum RecipeBehavior {
     NoBuffer,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RecipeSlotChance {
+    pub slot: u32,
+    /// Chance on GT scale 0..=10000, where 10000 is 100%.
+    pub chance_10000: u16,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RecipePolicySpec {
     pub conditions: Vec<RecipeCondition>,
@@ -115,6 +122,10 @@ pub struct ContentRecipe {
     pub fluid_outputs: Vec<FluidStackSpec>,
     pub duration_ticks: u64,
     pub eut: i64,
+    /// Explicit input-consumption chances. Omitted slots consume at 100%.
+    pub item_input_consumption_chances: Vec<RecipeSlotChance>,
+    /// Explicit output-production chances. Omitted slots produce at 100%.
+    pub item_output_production_chances: Vec<RecipeSlotChance>,
     pub policy: RecipePolicySpec,
 }
 
