@@ -961,7 +961,6 @@ fn add_unsafe_recipe_inputs(
     source_path: &str,
 ) {
     add_recipe_items(recipe, call, bindings, project, source_path, true);
-    recipe.modifiers.push(call.into());
 }
 
 fn is_recipe_modifier(name: &str) -> bool {

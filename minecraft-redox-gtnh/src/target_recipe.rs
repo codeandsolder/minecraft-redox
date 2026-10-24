@@ -2,7 +2,7 @@ use minecraft_redox_core::{
     SourceOrigin,
     content::{
         ContentId, ContentRecipe, FluidSelector, FluidStackSpec, ItemInputSpec, ItemSelector,
-        ItemStackSpec,
+        ItemStackSpec, RecipeBehavior, RecipeCondition, RecipePolicySpec,
     },
 };
 use minecraft_redox_java::{JavaBindings, JavaExpression, JavaProjectIndex};
@@ -137,6 +137,7 @@ fn lower_recipe_internal(
         }
     };
 
+    let policy = lower_recipe_policy(recipe, bindings, &mut blockers);
     let mut item_inputs = lower_inputs(recipe, bindings, &mut blockers);
     item_inputs.extend(lower_integrated_circuits(recipe, &mut blockers));
     let item_outputs = lower_outputs(recipe, bindings, &mut blockers);
@@ -167,6 +168,7 @@ fn lower_recipe_internal(
             fluid_outputs,
             duration_ticks,
             eut,
+            policy,
         });
     }
 
@@ -192,13 +194,6 @@ fn structural_blockers(recipe: &RecipeDefinition) -> Vec<RecipeLoweringBlocker> 
             "recipe metadata is not in target recipe IR v1",
         );
     }
-    if !recipe.modifiers.is_empty() {
-        push_blocker(
-            &mut blockers,
-            RecipeLoweringBlockerKind::Modifiers,
-            "recipe modifiers are not in target recipe IR v1",
-        );
-    }
     if recipe.special.is_some() || recipe.special_value.is_some() {
         push_blocker(
             &mut blockers,
@@ -214,6 +209,58 @@ fn structural_blockers(recipe: &RecipeDefinition) -> Vec<RecipeLoweringBlocker> 
         );
     }
     blockers
+}
+
+fn lower_recipe_policy(
+    recipe: &RecipeDefinition,
+    bindings: &JavaBindings,
+    blockers: &mut Vec<RecipeLoweringBlocker>,
+) -> RecipePolicySpec {
+    let mut policy = RecipePolicySpec::default();
+    for modifier in &recipe.modifiers {
+        match modifier.name.as_str() {
+            "requiresCleanRoom" if modifier.arguments.is_empty() => {
+                policy.conditions.push(RecipeCondition::CleanRoom);
+            }
+            "requiresLowGravity" if modifier.arguments.is_empty() => {
+                policy.conditions.push(RecipeCondition::LowGravity);
+            }
+            "requireMods" => {
+                policy.required_mods.extend(
+                    modifier
+                        .arguments
+                        .iter()
+                        .map(|argument| ContentId::new(bindings.resolve_reference(argument))),
+                );
+            }
+            "fake" if modifier.arguments.is_empty() => {
+                policy.behaviors.push(RecipeBehavior::Fake);
+            }
+            "hidden" if modifier.arguments.is_empty() => {
+                policy.behaviors.push(RecipeBehavior::Hidden);
+            }
+            "disabled" if modifier.arguments.is_empty() => {
+                policy.behaviors.push(RecipeBehavior::Disabled);
+            }
+            "ignoreCollision" if modifier.arguments.is_empty() => {
+                policy.behaviors.push(RecipeBehavior::IgnoreCollision);
+            }
+            "nbtSensitive" if modifier.arguments.is_empty() => {
+                policy.behaviors.push(RecipeBehavior::NbtSensitive);
+            }
+            "noBuffer" if modifier.arguments.is_empty() => {
+                policy.behaviors.push(RecipeBehavior::NoBuffer);
+            }
+            name => {
+                push_blocker(
+                    blockers,
+                    RecipeLoweringBlockerKind::Modifiers,
+                    format!("unsupported recipe modifier: {name}"),
+                );
+            }
+        }
+    }
+    policy
 }
 
 fn lower_inputs(
@@ -480,7 +527,9 @@ fn push_blocker(
 
 #[cfg(test)]
 mod tests {
-    use minecraft_redox_core::content::{FluidSelector, ItemInputSpec, ItemSelector};
+    use minecraft_redox_core::content::{
+        FluidSelector, ItemInputSpec, ItemSelector, RecipeBehavior, RecipeCondition,
+    };
     use minecraft_redox_java::{JavaProjectIndex, analyze_source};
 
     use super::{RecipeLoweringBlockerKind, lower_recipe};
@@ -539,6 +588,108 @@ mod tests {
             ItemSelector::Named { id, variant: None }
                 if id.as_str() == "net.minecraft.init.Blocks.netherrack"
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn lowers_recipe_policy_modifiers() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Mods;
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .requiresCleanRoom()
+                    .requiresLowGravity()
+                    .requireMods(Mods.Forestry, Mods.Railcraft)
+                    .fake()
+                    .hidden()
+                    .disabled()
+                    .ignoreCollision()
+                    .nbtSensitive()
+                    .noBuffer()
+                    .duration(20)
+                    .eut(2)
+                    .addTo(compressorRecipes);
+            }}
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let recovery = recover(&analysis);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let lowered = lower_recipe(recipe, &analysis.bindings)
+            .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
+
+        assert_eq!(
+            lowered.policy.conditions,
+            vec![RecipeCondition::CleanRoom, RecipeCondition::LowGravity]
+        );
+        assert_eq!(
+            lowered
+                .policy
+                .required_mods
+                .iter()
+                .map(minecraft_redox_core::content::ContentId::as_str)
+                .collect::<Vec<_>>(),
+            vec![
+                "gregtech.api.enums.Mods.Forestry",
+                "gregtech.api.enums.Mods.Railcraft"
+            ]
+        );
+        assert!(lowered.policy.behaviors.contains(&RecipeBehavior::Fake));
+        assert!(lowered.policy.behaviors.contains(&RecipeBehavior::Hidden));
+        assert!(lowered.policy.behaviors.contains(&RecipeBehavior::Disabled));
+        assert!(
+            lowered
+                .policy
+                .behaviors
+                .contains(&RecipeBehavior::IgnoreCollision)
+        );
+        assert!(
+            lowered
+                .policy
+                .behaviors
+                .contains(&RecipeBehavior::NbtSensitive)
+        );
+        assert!(lowered.policy.behaviors.contains(&RecipeBehavior::NoBuffer));
+        Ok(())
+    }
+
+    #[test]
+    fn lowers_unsafe_oversized_item_input_without_legacy_modifier() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+            import gregtech.api.enums.GTValues;
+            import net.minecraft.init.Blocks;
+            import net.minecraft.item.ItemStack;
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .itemInputsUnsafe(new ItemStack(Blocks.dirt, 128))
+                    .duration(20)
+                    .eut(2)
+                    .addTo(compressorRecipes);
+            }}
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let recovery = recover(&analysis);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        assert!(
+            recipe
+                .modifiers
+                .iter()
+                .all(|modifier| modifier.name != "itemInputsUnsafe")
+        );
+        let lowered = lower_recipe(recipe, &analysis.bindings)
+            .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
+        let ItemInputSpec::Stack(input) = &lowered.item_inputs[0] else {
+            return Err(anyhow::anyhow!("unsafe input was not a stack"));
+        };
+        assert_eq!(input.amount, 128);
         Ok(())
     }
 

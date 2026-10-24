@@ -75,6 +75,31 @@ pub enum ItemInputSpec {
     Alternatives { choices: Vec<ItemStackSpec> },
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecipeCondition {
+    CleanRoom,
+    LowGravity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecipeBehavior {
+    Fake,
+    Hidden,
+    Disabled,
+    IgnoreCollision,
+    NbtSensitive,
+    NoBuffer,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RecipePolicySpec {
+    pub conditions: Vec<RecipeCondition>,
+    pub behaviors: Vec<RecipeBehavior>,
+    pub required_mods: Vec<ContentId>,
+}
+
 /// Minimal target recipe IR.
 ///
 /// This deliberately starts smaller than GTNH's full recipe vocabulary. A source
@@ -90,6 +115,7 @@ pub struct ContentRecipe {
     pub fluid_outputs: Vec<FluidStackSpec>,
     pub duration_ticks: u64,
     pub eut: i64,
+    pub policy: RecipePolicySpec,
 }
 
 /// Coarse material form groups generated together by the legacy material builder.
