@@ -1,9 +1,9 @@
 use minecraft_redox_core::{
     SourceOrigin,
     content::{
-        ContentId, ContentRecipe, FluidSelector, FluidStackSpec, ItemInputSpec, ItemSelector,
-        ItemStackSpec, RecipeBehavior, RecipeCondition, RecipeMetadataSpec, RecipeMetadataValue,
-        RecipePolicySpec, RecipeSlotChance, RecipeSpecialSpec,
+        ContentId, ContentRecipe, FluidInputSpec, FluidSelector, FluidStackSpec, ItemInputSpec,
+        ItemSelector, ItemStackSpec, RecipeBehavior, RecipeCondition, RecipeMetadataSpec,
+        RecipeMetadataValue, RecipePolicySpec, RecipeSlotChance, RecipeSpecialSpec,
     },
 };
 use minecraft_redox_java::{JavaBindings, JavaExpression, JavaProjectIndex, JavaTypeKind};
@@ -155,18 +155,16 @@ fn lower_recipe_internal(
         "item output production",
         &mut blockers,
     );
-    let fluid_inputs = lower_fluids(
+    let fluid_inputs = lower_fluid_inputs(
         &recipe.fluid_input_semantics,
         bindings,
         project,
-        "input",
         &mut blockers,
     );
-    let fluid_outputs = lower_fluids(
+    let fluid_outputs = lower_fluid_outputs(
         &recipe.fluid_output_semantics,
         bindings,
         project,
-        "output",
         &mut blockers,
     );
 
@@ -749,11 +747,40 @@ fn lower_item_semantic(semantic: &ItemSemantic, bindings: &JavaBindings) -> Opti
     }
 }
 
-fn lower_fluids(
+fn lower_fluid_inputs(
     recovered: &[RecoveredExpression<FluidSemantic>],
     bindings: &JavaBindings,
     project: Option<&JavaProjectIndex>,
-    direction: &str,
+    blockers: &mut Vec<RecipeLoweringBlocker>,
+) -> Vec<FluidInputSpec> {
+    recovered
+        .iter()
+        .enumerate()
+        .filter_map(|(index, recovered)| {
+            lower_substitute_fluid_input(recovered, bindings, project)
+                .or_else(|| {
+                    recovered
+                        .semantic
+                        .as_ref()
+                        .and_then(|semantic| lower_fluid_semantic(semantic, bindings, project))
+                        .map(FluidInputSpec::Stack)
+                })
+                .or_else(|| {
+                    push_blocker(
+                        blockers,
+                        RecipeLoweringBlockerKind::Fluids,
+                        format!("fluid input {index}: {}", recovered.source),
+                    );
+                    None
+                })
+        })
+        .collect()
+}
+
+fn lower_fluid_outputs(
+    recovered: &[RecoveredExpression<FluidSemantic>],
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
     blockers: &mut Vec<RecipeLoweringBlocker>,
 ) -> Vec<FluidStackSpec> {
     recovered
@@ -768,12 +795,49 @@ fn lower_fluids(
                     push_blocker(
                         blockers,
                         RecipeLoweringBlockerKind::Fluids,
-                        format!("fluid {direction} {index}: {}", recovered.source),
+                        format!("fluid output {index}: {}", recovered.source),
                     );
                     None
                 })
         })
         .collect()
+}
+
+fn lower_substitute_fluid_input(
+    recovered: &RecoveredExpression<FluidSemantic>,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+) -> Option<FluidInputSpec> {
+    let FluidSemantic::LinkedMethod {
+        method_id,
+        arguments,
+        ..
+    } = recovered.semantic.as_ref()?
+    else {
+        return None;
+    };
+    if method_id != "gregtech.api.objects.SubstituteFluidStack#soldering(long)"
+        || arguments.len() != 1
+    {
+        return None;
+    }
+    let base = scalar_amount_u64(arguments.first()?, bindings, project)?;
+    let choice = |material: &str, multiplier: u64| -> Option<FluidStackSpec> {
+        Some(FluidStackSpec {
+            selector: FluidSelector::MaterialForm {
+                material: ContentId::new(format!("gregtech.api.enums.Materials.{material}")),
+                form: ContentId::new("molten"),
+            },
+            amount: base.checked_mul(multiplier)?,
+        })
+    };
+    Some(FluidInputSpec::Alternatives {
+        choices: vec![
+            choice("SolderingAlloy", 1)?,
+            choice("Tin", 2)?,
+            choice("Lead", 4)?,
+        ],
+    })
 }
 
 fn lower_fluid_semantic(
@@ -866,8 +930,8 @@ fn push_blocker(
 #[cfg(test)]
 mod tests {
     use minecraft_redox_core::content::{
-        FluidSelector, ItemInputSpec, ItemSelector, RecipeBehavior, RecipeCondition,
-        RecipeMetadataValue,
+        FluidInputSpec, FluidSelector, ItemInputSpec, ItemSelector, RecipeBehavior,
+        RecipeCondition, RecipeMetadataValue,
     };
     use minecraft_redox_java::{JavaProjectIndex, analyze_source};
 
@@ -1446,6 +1510,58 @@ mod tests {
     }
 
     #[test]
+    fn lowers_soldering_substitute_as_one_fluid_alternative_slot() -> anyhow::Result<()> {
+        let substitute = analyze_source(
+            "SubstituteFluidStack.java",
+            "gt5",
+            None,
+            r"
+                package gregtech.api.objects;
+                class SubstituteFluidStack {
+                    static SubstituteFluidStack soldering(long amount) { return null; }
+                }
+            ",
+        )?;
+        let source = r"
+            import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.objects.SubstituteFluidStack;
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .fluidInputs(SubstituteFluidStack.soldering(72))
+                    .duration(20)
+                    .eut(2)
+                    .addTo(compressorRecipes);
+            }}
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let mut project = JavaProjectIndex::default();
+        project.add_analysis(&substitute);
+        project.add_analysis(&analysis);
+        let recovery = crate::recover_with_project(&analysis, &project);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let lowered = super::lower_recipe_with_project(recipe, &analysis.bindings, &project)
+            .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
+        let FluidInputSpec::Alternatives { choices } = &lowered.fluid_inputs[0] else {
+            return Err(anyhow::anyhow!("soldering input was not alternatives"));
+        };
+        assert_eq!(choices.len(), 3);
+        assert_eq!(choices[0].amount, 72);
+        assert_eq!(choices[1].amount, 144);
+        assert_eq!(choices[2].amount, 288);
+        assert!(matches!(
+            &choices[0].selector,
+            FluidSelector::MaterialForm { material, form }
+                if material.as_str() == "gregtech.api.enums.Materials.SolderingAlloy"
+                    && form.as_str() == "molten"
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn lowers_material_and_registry_fluids_with_project_amounts() -> anyhow::Result<()> {
         let constants = analyze_source(
             "GTRecipeBuilder.java",
@@ -1483,9 +1599,12 @@ mod tests {
         let lowered = super::lower_recipe_with_project(recipe, &analysis.bindings, &project)
             .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
         assert_eq!(lowered.fluid_inputs.len(), 1);
-        assert_eq!(lowered.fluid_inputs[0].amount, 288);
+        let FluidInputSpec::Stack(input) = &lowered.fluid_inputs[0] else {
+            return Err(anyhow::anyhow!("fluid input was not a stack"));
+        };
+        assert_eq!(input.amount, 288);
         assert!(matches!(
-            &lowered.fluid_inputs[0].selector,
+            &input.selector,
             FluidSelector::MaterialForm { material, form }
                 if material.as_str() == "gregtech.api.enums.Materials.Iron"
                     && form.as_str() == "molten"
