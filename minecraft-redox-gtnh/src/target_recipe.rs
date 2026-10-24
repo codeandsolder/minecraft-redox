@@ -9,7 +9,7 @@ use minecraft_redox_java::{JavaBindings, JavaExpression, JavaProjectIndex};
 use serde::Serialize;
 
 use crate::{
-    FluidSemantic, ItemSemantic, RecipeDefinition, RecoveredExpression,
+    FluidSemantic, ItemSemantic, NumericSemantic, RecipeDefinition, RecoveredExpression,
     recipe_expression::{literal_i64, resolved_reference_name},
     scalar_expression::scalar_i64,
 };
@@ -137,7 +137,8 @@ fn lower_recipe_internal(
         }
     };
 
-    let item_inputs = lower_inputs(recipe, bindings, &mut blockers);
+    let mut item_inputs = lower_inputs(recipe, bindings, &mut blockers);
+    item_inputs.extend(lower_integrated_circuits(recipe, &mut blockers));
     let item_outputs = lower_outputs(recipe, bindings, &mut blockers);
     let fluid_inputs = lower_fluids(
         &recipe.fluid_input_semantics,
@@ -235,6 +236,37 @@ fn lower_inputs(
                     );
                     None
                 })
+        })
+        .collect()
+}
+
+fn lower_integrated_circuits(
+    recipe: &RecipeDefinition,
+    blockers: &mut Vec<RecipeLoweringBlocker>,
+) -> Vec<ItemInputSpec> {
+    recipe
+        .integrated_circuits
+        .iter()
+        .filter_map(|recovered| {
+            if let Some(NumericSemantic::ExactValue { value }) = recovered.semantic.as_ref() {
+                Some(ItemInputSpec::Stack(ItemStackSpec {
+                    selector: ItemSelector::Named {
+                        id: ContentId::new("gregtech.api.enums.ItemList.Circuit_Integrated"),
+                        variant: Some(*value),
+                    },
+                    amount: 0,
+                }))
+            } else {
+                push_blocker(
+                    blockers,
+                    RecipeLoweringBlockerKind::ItemInput,
+                    format!(
+                        "dynamic integrated circuit configuration: {}",
+                        recovered.source
+                    ),
+                );
+                None
+            }
         })
         .collect()
 }
@@ -451,7 +483,7 @@ mod tests {
     use minecraft_redox_core::content::{FluidSelector, ItemInputSpec, ItemSelector};
     use minecraft_redox_java::{JavaProjectIndex, analyze_source};
 
-    use super::lower_recipe;
+    use super::{RecipeLoweringBlockerKind, lower_recipe};
     use crate::recover;
 
     #[test]
@@ -507,6 +539,79 @@ mod tests {
             ItemSelector::Named { id, variant: None }
                 if id.as_str() == "net.minecraft.init.Blocks.netherrack"
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn lowers_integrated_circuit_as_non_consumed_input() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+            import gregtech.api.enums.GTValues;
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .circuit(7)
+                    .duration(20)
+                    .eut(2)
+                    .addTo(compressorRecipes);
+            }}
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let recovery = recover(&analysis);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        assert_eq!(recipe.integrated_circuits.len(), 1);
+        assert!(
+            recipe
+                .modifiers
+                .iter()
+                .all(|modifier| modifier.name != "circuit")
+        );
+
+        let lowered = lower_recipe(recipe, &analysis.bindings)
+            .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
+        assert_eq!(lowered.item_inputs.len(), 1);
+        let ItemInputSpec::Stack(input) = &lowered.item_inputs[0] else {
+            return Err(anyhow::anyhow!("circuit input was not a stack"));
+        };
+        assert_eq!(input.amount, 0);
+        assert!(matches!(
+            &input.selector,
+            ItemSelector::Named { id, variant: Some(7) }
+                if id.as_str() == "gregtech.api.enums.ItemList.Circuit_Integrated"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn blocks_dynamic_integrated_circuit_configuration() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+            import gregtech.api.enums.GTValues;
+            class Recipes { void run(int configuration) {
+                GTValues.RA.stdBuilder()
+                    .circuit(configuration)
+                    .duration(20)
+                    .eut(2)
+                    .addTo(compressorRecipes);
+            }}
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let recovery = recover(&analysis);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let Err(failure) = lower_recipe(recipe, &analysis.bindings) else {
+            return Err(anyhow::anyhow!("dynamic circuit lowered as static content"));
+        };
+        assert!(failure.blockers.iter().any(|blocker| {
+            blocker.kind == RecipeLoweringBlockerKind::ItemInput
+                && blocker
+                    .detail
+                    .contains("dynamic integrated circuit configuration")
+        }));
         Ok(())
     }
 

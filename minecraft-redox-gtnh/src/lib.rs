@@ -66,6 +66,7 @@ pub struct RecipeDefinition {
     pub recipe_map: String,
     pub item_inputs: Vec<String>,
     pub item_input_semantics: Vec<RecoveredExpression<ItemSemantic>>,
+    pub integrated_circuits: Vec<RecoveredExpression<NumericSemantic>>,
     pub item_outputs: Vec<String>,
     pub item_output_semantics: Vec<RecoveredExpression<ItemSemantic>>,
     pub fluid_inputs: Vec<String>,
@@ -662,6 +663,7 @@ fn new_recipe_definition(
         recipe_map,
         item_inputs: Vec::new(),
         item_input_semantics: Vec::new(),
+        integrated_circuits: Vec::new(),
         item_outputs: Vec::new(),
         item_output_semantics: Vec::new(),
         fluid_inputs: Vec::new(),
@@ -725,6 +727,9 @@ fn recognize_recipe(
             ),
             "itemInputsUnsafe" => {
                 add_unsafe_recipe_inputs(&mut recipe, call, bindings, project, &chain.origin.path);
+            }
+            "circuit" => {
+                add_integrated_circuit(&mut recipe, call, bindings, project, &chain.origin.path);
             }
             "itemOutputs" => add_recipe_items(
                 &mut recipe,
@@ -836,6 +841,24 @@ fn recover_numeric_call(
         semantic,
         exact_value,
     })
+}
+
+fn add_integrated_circuit(
+    recipe: &mut RecipeDefinition,
+    call: &JavaCall,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+    source_path: &str,
+) {
+    let Some(recovered) = recover_numeric_call(call, bindings, project, source_path) else {
+        recipe.unhandled_calls.push(call.into());
+        return;
+    };
+    recipe.integrated_circuits.push(RecoveredExpression {
+        source: recovered.source,
+        expression: recovered.expression,
+        semantic: Some(recovered.semantic),
+    });
 }
 
 fn add_recipe_metadata_call(
@@ -956,7 +979,6 @@ fn is_recipe_modifier(name: &str) -> bool {
             | "nbtSensitive"
             | "noBuffer"
             | "setNEIDesc"
-            | "circuit"
     )
 }
 
