@@ -2,14 +2,16 @@ use minecraft_redox_core::{
     SourceOrigin,
     content::{
         ContentId, ContentRecipe, FluidSelector, FluidStackSpec, ItemInputSpec, ItemSelector,
-        ItemStackSpec, RecipeBehavior, RecipeCondition, RecipePolicySpec, RecipeSlotChance,
+        ItemStackSpec, RecipeBehavior, RecipeCondition, RecipeMetadataSpec, RecipeMetadataValue,
+        RecipePolicySpec, RecipeSlotChance,
     },
 };
 use minecraft_redox_java::{JavaBindings, JavaExpression, JavaProjectIndex};
 use serde::Serialize;
 
 use crate::{
-    FluidSemantic, ItemSemantic, NumericSemantic, RecipeDefinition, RecoveredExpression,
+    FluidSemantic, ItemSemantic, NumericSemantic, RecipeDefinition, RecipeMetadataDefinition,
+    RecoveredExpression,
     recipe_expression::{literal_i64, resolved_reference_name},
     scalar_expression::scalar_i64,
 };
@@ -138,6 +140,8 @@ fn lower_recipe_internal(
     };
 
     let policy = lower_recipe_policy(recipe, bindings, &mut blockers);
+    let metadata = lower_recipe_metadata(recipe, bindings, project, &mut blockers);
+    let category = lower_recipe_category(recipe, bindings, &mut blockers);
     let mut item_inputs = lower_inputs(recipe, bindings, &mut blockers);
     item_inputs.extend(lower_integrated_circuits(recipe, &mut blockers));
     let item_outputs = lower_outputs(recipe, bindings, &mut blockers);
@@ -182,6 +186,8 @@ fn lower_recipe_internal(
             eut,
             item_input_consumption_chances,
             item_output_production_chances,
+            metadata,
+            category,
             policy,
         });
     }
@@ -194,13 +200,6 @@ fn lower_recipe_internal(
 
 fn structural_blockers(recipe: &RecipeDefinition) -> Vec<RecipeLoweringBlocker> {
     let mut blockers = Vec::new();
-    if !recipe.metadata.is_empty() {
-        push_blocker(
-            &mut blockers,
-            RecipeLoweringBlockerKind::Metadata,
-            "recipe metadata is not in target recipe IR v1",
-        );
-    }
     if recipe.special.is_some() || recipe.special_value.is_some() {
         push_blocker(
             &mut blockers,
@@ -216,6 +215,105 @@ fn structural_blockers(recipe: &RecipeDefinition) -> Vec<RecipeLoweringBlocker> 
         );
     }
     blockers
+}
+
+fn lower_recipe_metadata(
+    recipe: &RecipeDefinition,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+    blockers: &mut Vec<RecipeLoweringBlocker>,
+) -> Vec<RecipeMetadataSpec> {
+    recipe
+        .metadata_semantics
+        .iter()
+        .filter_map(|metadata| {
+            lower_metadata_entry(metadata, bindings, project).or_else(|| {
+                push_blocker(
+                    blockers,
+                    RecipeLoweringBlockerKind::Metadata,
+                    format!(
+                        "unsupported metadata payload {}: {}",
+                        metadata
+                            .expected_value_type
+                            .as_deref()
+                            .unwrap_or("<unknown>"),
+                        metadata.value_source
+                    ),
+                );
+                None
+            })
+        })
+        .collect()
+}
+
+fn lower_metadata_entry(
+    metadata: &RecipeMetadataDefinition,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+) -> Option<RecipeMetadataSpec> {
+    let key = resolved_reference_name(&metadata.key_expression, bindings)
+        .unwrap_or_else(|| bindings.resolve_reference(&metadata.key_source));
+    let expected = metadata.expected_value_type.as_deref()?;
+    let value = if is_java_type(expected, "Integer") || is_java_type(expected, "Long") {
+        let value = project.map_or_else(
+            || literal_i64(&metadata.value_expression),
+            |project| scalar_i64(&metadata.value_expression, bindings, project),
+        )?;
+        RecipeMetadataValue::Integer { value }
+    } else if is_java_type(expected, "Boolean") {
+        RecipeMetadataValue::Boolean {
+            value: literal_boolean(&metadata.value_expression)?,
+        }
+    } else if is_java_type(expected, "String") {
+        RecipeMetadataValue::Text {
+            value: simple_string_literal(&metadata.value_expression)?,
+        }
+    } else if is_java_type(expected, "Materials") {
+        RecipeMetadataValue::ContentRef {
+            id: ContentId::new(resolved_reference_name(
+                &metadata.value_expression,
+                bindings,
+            )?),
+        }
+    } else {
+        return None;
+    };
+    Some(RecipeMetadataSpec {
+        key: ContentId::new(key),
+        value,
+    })
+}
+
+fn lower_recipe_category(
+    recipe: &RecipeDefinition,
+    bindings: &JavaBindings,
+    blockers: &mut Vec<RecipeLoweringBlocker>,
+) -> Option<ContentId> {
+    let category = recipe.recipe_categories.last()?;
+    let Some(id) = resolved_reference_name(&category.expression, bindings) else {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            format!("unresolved recipe category: {}", category.source),
+        );
+        return None;
+    };
+    Some(ContentId::new(id))
+}
+
+fn is_java_type(type_name: &str, simple_name: &str) -> bool {
+    type_name == simple_name || type_name.ends_with(&format!(".{simple_name}"))
+}
+
+fn literal_boolean(expression: &JavaExpression) -> Option<bool> {
+    match expression {
+        JavaExpression::Literal(value) if value == "true" => Some(true),
+        JavaExpression::Literal(value) if value == "false" => Some(false),
+        JavaExpression::Parenthesized(inner) | JavaExpression::Cast { value: inner, .. } => {
+            literal_boolean(inner)
+        }
+        _ => None,
+    }
 }
 
 fn lower_slot_chances(
@@ -601,11 +699,112 @@ fn push_blocker(
 mod tests {
     use minecraft_redox_core::content::{
         FluidSelector, ItemInputSpec, ItemSelector, RecipeBehavior, RecipeCondition,
+        RecipeMetadataValue,
     };
     use minecraft_redox_java::{JavaProjectIndex, analyze_source};
 
     use super::{RecipeLoweringBlockerKind, lower_recipe};
     use crate::recover;
+
+    #[test]
+    fn lowers_primitive_metadata_and_recipe_category() -> anyhow::Result<()> {
+        let source = r#"
+            import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            class RecipeMetadataKey<T> {}
+            class RecipeCategory { static RecipeCategory SPECIAL; }
+            class Keys {
+                static RecipeMetadataKey<Integer> HEAT;
+                static RecipeMetadataKey<Boolean> FLAG;
+                static RecipeMetadataKey<String> NAME;
+                static RecipeMetadataKey<Materials> MATERIAL;
+            }
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .metadata(Keys.HEAT, 1700)
+                    .metadata(Keys.FLAG, true)
+                    .metadata(Keys.NAME, "demo")
+                    .metadata(Keys.MATERIAL, Materials.Iron)
+                    .recipeCategory(RecipeCategory.SPECIAL)
+                    .duration(20)
+                    .eut(2)
+                    .addTo(compressorRecipes);
+            }}
+        "#;
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let mut project = JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let recovery = crate::recover_with_project(&analysis, &project);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let lowered = super::lower_recipe_with_project(recipe, &analysis.bindings, &project)
+            .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
+        assert_eq!(lowered.metadata.len(), 4);
+        assert!(matches!(
+            lowered.metadata[0].value,
+            RecipeMetadataValue::Integer { value: 1700 }
+        ));
+        assert!(matches!(
+            lowered.metadata[1].value,
+            RecipeMetadataValue::Boolean { value: true }
+        ));
+        assert!(matches!(
+            &lowered.metadata[2].value,
+            RecipeMetadataValue::Text { value } if value == "demo"
+        ));
+        assert!(matches!(
+            &lowered.metadata[3].value,
+            RecipeMetadataValue::ContentRef { id }
+                if id.as_str() == "gregtech.api.enums.Materials.Iron"
+        ));
+        assert_eq!(
+            lowered
+                .category
+                .as_ref()
+                .map(minecraft_redox_core::content::ContentId::as_str),
+            Some("RecipeCategory.SPECIAL")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn blocks_runtime_numeric_metadata() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+            import gregtech.api.enums.GTValues;
+            class RecipeMetadataKey<T> {}
+            class Keys { static RecipeMetadataKey<Integer> HEAT; }
+            class Recipes { void run(int heat) {
+                GTValues.RA.stdBuilder()
+                    .metadata(Keys.HEAT, heat)
+                    .duration(20)
+                    .eut(2)
+                    .addTo(compressorRecipes);
+            }}
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let mut project = JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let recovery = crate::recover_with_project(&analysis, &project);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let Err(failure) = super::lower_recipe_with_project(recipe, &analysis.bindings, &project)
+        else {
+            return Err(anyhow::anyhow!("runtime metadata unexpectedly lowered"));
+        };
+        assert!(
+            failure
+                .blockers
+                .iter()
+                .any(|blocker| blocker.kind == RecipeLoweringBlockerKind::Metadata)
+        );
+        Ok(())
+    }
 
     #[test]
     fn lowers_literal_compressor_recipe() -> anyhow::Result<()> {

@@ -107,6 +107,21 @@ pub struct RecipePolicySpec {
     pub required_mods: Vec<ContentId>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RecipeMetadataValue {
+    Integer { value: i64 },
+    Boolean { value: bool },
+    Text { value: String },
+    ContentRef { id: ContentId },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RecipeMetadataSpec {
+    pub key: ContentId,
+    pub value: RecipeMetadataValue,
+}
+
 /// Minimal target recipe IR.
 ///
 /// This deliberately starts smaller than GTNH's full recipe vocabulary. A source
@@ -126,6 +141,8 @@ pub struct ContentRecipe {
     pub item_input_consumption_chances: Vec<RecipeSlotChance>,
     /// Explicit output-production chances. Omitted slots produce at 100%.
     pub item_output_production_chances: Vec<RecipeSlotChance>,
+    pub metadata: Vec<RecipeMetadataSpec>,
+    pub category: Option<ContentId>,
     pub policy: RecipePolicySpec,
 }
 

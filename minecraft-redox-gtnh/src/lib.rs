@@ -933,7 +933,6 @@ fn add_recipe_category(
     project: Option<&JavaProjectIndex>,
     source_path: &str,
 ) {
-    recipe.metadata.push(call.into());
     let (Some(source), Some(expression)) =
         (call.arguments.first(), call.argument_expressions.first())
     else {
