@@ -786,3 +786,24 @@ Full GT5 result after this hardening pass is intentionally unchanged:
 - chance blockers: **50**.
 
 A wrong-map regression now verifies that a syntactically valid static capability level cannot silently acquire semantics on an unrelated recipe map.
+
+### Cell-free derivative suppression as registration policy
+
+`GTRecipeConstants.SKIP_CELL_RECIPE_GENERATION` is now treated as source registration policy rather than runtime recipe semantics. The only source consumer is GT++'s post-load `RecipeGenMultisUsingFluidInsteadOfCells.generateRecipesNotUsingCells`, which scans selected input recipe maps and skips marked recipes while synthesizing cell-free derivatives into separate maps. The metadata does not affect execution of the original process.
+
+The importer therefore validates and consumes the marker without emitting a target runtime requirement. It accepts a static boolean only on the six maps actually scanned by the source generator: centrifuge, electrolyzer, mixer, chemical dehydrator, cold trap, and reactor processing unit. Dynamic marker values and use on unrelated maps remain fail-closed.
+
+The pinned corpus contains exactly **six** direct uses, all literal `true` on `RecipeMaps.centrifugeRecipes` in `FissionFuelLoader`; the loader also defines the intended explicit non-cell counterparts. All six annotated source recipes become fully lowerable.
+
+Full GT5 result after this pass:
+
+- target recipes lowered: **3,868 / 5,791 (66.79%)**, up from 3,862 / 5,791 (66.69%);
+- metadata blockers: **383**, down from 389;
+- modifier blockers: **6**;
+- item-input blockers: **1,218**;
+- item-output blockers: **961**;
+- fluid blockers: **457**;
+- non-constant EU/t blockers: **417**;
+- missing-duration blockers: **332**;
+- missing-EU/t blockers: **24**;
+- chance blockers: **50**.

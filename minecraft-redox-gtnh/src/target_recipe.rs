@@ -521,6 +521,8 @@ fn collect_metadata_entry<'a>(
         state.fuel_type = Some((call, value));
     } else if key == "gregtech.api.util.GTRecipeConstants.RECYCLE" {
         state.recycle = Some((call, value));
+    } else if key == "gregtech.api.util.GTRecipeConstants.SKIP_CELL_RECIPE_GENERATION" {
+        lower_skip_cell_recipe_generation(recipe, call, value, blockers);
     } else if key == "gregtech.api.util.GTRecipeConstants.ADDITIVE_AMOUNT"
         && recipe.recipe_map == "gregtech.api.util.GTRecipeConstants.UniversalArcFurnace"
     {
@@ -813,6 +815,43 @@ fn capture_assembly_line_research<'a>(
         *research_item = Some((call, value));
     } else {
         *scanning = Some(value);
+    }
+}
+
+fn lower_skip_cell_recipe_generation(
+    recipe: &RecipeDefinition,
+    call: &crate::BuilderCall,
+    value: &JavaExpression,
+    blockers: &mut Vec<RecipeLoweringBlocker>,
+) {
+    const GENERATED_FROM: &[&str] = &[
+        "gregtech.api.recipe.RecipeMaps.centrifugeRecipes",
+        "gregtech.api.recipe.RecipeMaps.electrolyzerRecipes",
+        "gregtech.api.recipe.RecipeMaps.mixerRecipes",
+        "gregtech.api.recipe.RecipeMaps.chemicalDehydratorRecipes",
+        "gregtech.api.recipe.RecipeMaps.coldTrapRecipes",
+        "gregtech.api.recipe.RecipeMaps.reactorProcessingUnitRecipes",
+    ];
+    if !GENERATED_FROM.contains(&recipe.recipe_map.as_str()) {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            format!(
+                "SKIP_CELL_RECIPE_GENERATION used on recipe map not consumed by the source cell-free generator: {}",
+                recipe.recipe_map
+            ),
+        );
+        return;
+    }
+    if literal_boolean(value).is_none() {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            format!(
+                "SKIP_CELL_RECIPE_GENERATION is not a static boolean registration policy: {}",
+                call.arguments.join(", ")
+            ),
+        );
     }
 }
 
@@ -4193,6 +4232,75 @@ mod tests {
             blocker.kind == RecipeLoweringBlockerKind::Metadata
                 && blocker.detail.contains("not a static boolean")
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn cell_free_generation_marker_is_registration_policy_only() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.recipe.RecipeMaps.centrifugeRecipes;
+            import static gregtech.api.util.GTRecipeConstants.SKIP_CELL_RECIPE_GENERATION;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .itemInputs(Materials.Iron.getDust(1))
+                    .itemOutputs(Materials.Steel.getDust(1))
+                    .metadata(SKIP_CELL_RECIPE_GENERATION, true)
+                    .duration(20).eut(2).addTo(centrifugeRecipes);
+            }}
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let recovery = recover(&analysis);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let lowered = lower_recipe(recipe, &analysis.bindings)
+            .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
+        assert_eq!(lowered.requirements, []);
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_cell_free_generation_marker_stays_fail_closed() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.recipe.RecipeMaps.centrifugeRecipes;
+            import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+            import static gregtech.api.util.GTRecipeConstants.SKIP_CELL_RECIPE_GENERATION;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            class Recipes {
+                void dynamic(boolean skip) {
+                    GTValues.RA.stdBuilder()
+                        .itemInputs(Materials.Iron.getDust(1))
+                        .itemOutputs(Materials.Steel.getDust(1))
+                        .metadata(SKIP_CELL_RECIPE_GENERATION, skip)
+                        .duration(20).eut(2).addTo(centrifugeRecipes);
+                }
+                void wrongMap() {
+                    GTValues.RA.stdBuilder()
+                        .itemInputs(Materials.Iron.getDust(1))
+                        .itemOutputs(Materials.Steel.getDust(1))
+                        .metadata(SKIP_CELL_RECIPE_GENERATION, true)
+                        .duration(20).eut(2).addTo(compressorRecipes);
+                }
+            }
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let recovery = recover(&analysis);
+        assert_eq!(recovery.recipes.len(), 2);
+        for recipe in &recovery.recipes {
+            let failure = lower_recipe(recipe, &analysis.bindings)
+                .err()
+                .ok_or_else(|| anyhow::anyhow!("invalid marker unexpectedly lowered"))?;
+            assert!(
+                failure
+                    .blockers
+                    .iter()
+                    .any(|blocker| blocker.kind == RecipeLoweringBlockerKind::Metadata)
+            );
+        }
         Ok(())
     }
 
