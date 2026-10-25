@@ -928,3 +928,25 @@ Full pinned-corpus result:
 - missing-EU/t blockers: **24**;
 - post-add blockers: **7**;
 - modifier blockers: **6**.
+
+
+### Foundry module metadata as reference-only presentation
+
+`GTRecipeConstants.FOUNDRY_MODULE` is now accepted only on the Exo Foundry's fake module-cost recipe map, and only when the source recipe is explicitly `.fake()` / reference-only. Source inspection shows all seven corpus uses are static `FoundryModule.*` enum constants on `RecipeMaps.foundryFakeModuleCostRecipes`; the metadata is consumed by `FoundryModuleFrontend` solely to render the module shorthand/color in the recipe browser.
+
+The `FoundryModule` enum itself has real machine effects when modules are installed, but those effects are not driven by these fake recipe annotations. The target therefore validates and consumes this metadata without inventing process semantics. Executable recipes, wrong recipe maps, or non-static module values remain fail-closed.
+
+Full pinned-corpus result:
+
+- target recipes lowered: **3,957 / 5,791 (68.33%)**, up from 3,951 / 5,791 (68.23%);
+- metadata blockers: **350**, down from 357;
+- fluid blockers: **388**;
+- item-input blockers: **1,218**;
+- item-output blockers: **961**;
+- non-constant EU/t blockers: **417**;
+- missing-duration blockers: **332**;
+- chance blockers: **50**;
+- special blockers: **31**;
+- missing-EU/t blockers: **24**;
+- post-add blockers: **7**;
+- modifier blockers: **6**.

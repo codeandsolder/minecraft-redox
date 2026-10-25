@@ -525,6 +525,8 @@ fn collect_metadata_entry<'a>(
         {
             state.progress_override = Some(progress);
         }
+    } else if key == "gregtech.api.util.GTRecipeConstants.FOUNDRY_MODULE" {
+        lower_foundry_reference_metadata(recipe, call, value, bindings, blockers);
     } else if key == "gregtech.api.util.GTRecipeConstants.FUSION_THRESHOLD" {
         if let Some(value) =
             lower_fusion_startup_energy(recipe, call, value, bindings, project, blockers)
@@ -562,6 +564,56 @@ fn collect_metadata_entry<'a>(
             blockers,
             RecipeLoweringBlockerKind::Metadata,
             format!("unsupported recipe metadata key: {key}"),
+        );
+    }
+}
+
+fn lower_foundry_reference_metadata(
+    recipe: &RecipeDefinition,
+    call: &crate::BuilderCall,
+    value: &JavaExpression,
+    bindings: &JavaBindings,
+    blockers: &mut Vec<RecipeLoweringBlocker>,
+) {
+    const FOUNDRY_MAP: &str = "gregtech.api.recipe.RecipeMaps.foundryFakeModuleCostRecipes";
+    const MODULE_PREFIX: &str =
+        "gregtech.common.tileentities.machines.multi.foundry.FoundryModule.";
+
+    if recipe.recipe_map != FOUNDRY_MAP {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            format!(
+                "FOUNDRY_MODULE used on unsupported recipe map {}",
+                recipe.recipe_map
+            ),
+        );
+        return;
+    }
+    if lower_execution_mode(recipe) != RecipeExecutionMode::ReferenceOnly {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            "FOUNDRY_MODULE is only presentation metadata on fake module-cost recipes",
+        );
+        return;
+    }
+    let Some(module) = resolved_reference_name(value, bindings) else {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            format!(
+                "FOUNDRY_MODULE value is not statically identifiable: {}",
+                call.arguments.join(", ")
+            ),
+        );
+        return;
+    };
+    if !module.starts_with(MODULE_PREFIX) || module.len() == MODULE_PREFIX.len() {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            format!("unexpected FOUNDRY_MODULE value: {module}"),
         );
     }
 }
@@ -4458,6 +4510,88 @@ mod tests {
         let lowered = lower_recipe(recipe, &analysis.bindings)
             .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
         assert_eq!(lowered.execution_mode, RecipeExecutionMode::ReferenceOnly);
+        Ok(())
+    }
+
+    #[test]
+    fn foundry_module_metadata_is_reference_presentation_only() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.util.GTRecipeConstants.FOUNDRY_MODULE;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            import gregtech.api.recipe.RecipeMaps;
+            import gregtech.common.tileentities.machines.multi.foundry.FoundryModule;
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .itemInputs(Materials.Iron.getDust(1))
+                    .itemOutputs(Materials.Steel.getDust(1))
+                    .metadata(FOUNDRY_MODULE, FoundryModule.EXTRA_CASTING_BASINS)
+                    .fake()
+                    .duration(1)
+                    .eut(1)
+                    .addTo(RecipeMaps.foundryFakeModuleCostRecipes);
+            }}
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let mut project = JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let recovery = crate::recover_with_project(&analysis, &project);
+        let lowered = super::lower_recipe_with_project(
+            recovery
+                .recipes
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("recipe missing"))?,
+            &analysis.bindings,
+            &project,
+        )
+        .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
+        assert_eq!(lowered.execution_mode, RecipeExecutionMode::ReferenceOnly);
+        Ok(())
+    }
+
+    #[test]
+    fn foundry_module_metadata_requires_fake_foundry_reference_recipe() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.util.GTRecipeConstants.FOUNDRY_MODULE;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            import gregtech.api.recipe.RecipeMaps;
+            import gregtech.common.tileentities.machines.multi.foundry.FoundryModule;
+            class Recipes {
+                void executable() {
+                    GTValues.RA.stdBuilder()
+                        .itemInputs(Materials.Iron.getDust(1))
+                        .itemOutputs(Materials.Steel.getDust(1))
+                        .metadata(FOUNDRY_MODULE, FoundryModule.EXTRA_CASTING_BASINS)
+                        .duration(1).eut(1)
+                        .addTo(RecipeMaps.foundryFakeModuleCostRecipes);
+                }
+                void wrongMap() {
+                    GTValues.RA.stdBuilder()
+                        .itemInputs(Materials.Iron.getDust(1))
+                        .itemOutputs(Materials.Steel.getDust(1))
+                        .metadata(FOUNDRY_MODULE, FoundryModule.EXTRA_CASTING_BASINS)
+                        .fake().duration(1).eut(1)
+                        .addTo(RecipeMaps.compressorRecipes);
+                }
+            }
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let mut project = JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let recovery = crate::recover_with_project(&analysis, &project);
+        assert_eq!(recovery.recipes.len(), 2);
+        for recipe in &recovery.recipes {
+            let failure = super::lower_recipe_with_project(recipe, &analysis.bindings, &project)
+                .err()
+                .ok_or_else(|| anyhow::anyhow!("invalid foundry metadata unexpectedly lowered"))?;
+            assert!(
+                failure
+                    .blockers
+                    .iter()
+                    .any(|blocker| blocker.kind == RecipeLoweringBlockerKind::Metadata)
+            );
+        }
         Ok(())
     }
 
