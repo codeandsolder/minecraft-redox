@@ -574,3 +574,28 @@ Full GT5 result after this pass:
 - chance blockers: **50**.
 
 The three tier adapters remove 32 metadata blockers but do not independently complete any recipes because all affected corpus entries overlap other blockers. Separating source-only builder policy unlocks 11 complete recipes while preserving the original annotations for archaeology and migration tooling.
+
+### Runtime environment requirements
+
+Cleanroom and low-gravity annotations now lower to the source-independent `RecipeRequirement::RequiredEnvironment` variant rather than remaining opaque builder modifiers. Current environment identities are `environment.cleanroom` and `environment.low_gravity`.
+
+The recipe IR deliberately stores only the requirement to execute in that environment. Environment quality and the machine-specific consequences of that quality stay outside the recipe. In GT5 basic machines, for example, a cleanroom recipe requires a valid cleanroom with nonzero cleanness, then cleanroom cleanness applies an additional per-item-output survival roll after the recipe's normal output chance. Fluid output is not subjected to that cleanroom roll in the inspected basic-machine path. Encoding that algorithm as a fixed recipe probability would therefore be wrong.
+
+The importer reproduces two legacy builder details that matter to the effective requirement. First, explicit `.metadata(CLEANROOM, ...)` and the shorthand `.requiresCleanRoom()` participate in source order, so a later `CLEANROOM=false` cancels an earlier shorthand. GregTech's chained-call source ranges share a start offset, so the importer uses each call's cumulative end offset for this ordering. Second, `GTRecipeBuilder.applyDefaultSpecialValues` encodes cleanroom/low-gravity in `mSpecialValue`, then allows any numeric `SPECIAL_VALUE_ALIASES` metadata to overwrite that encoding. If such an alias is present, the target does not invent an environment requirement that the source recipe would no longer enforce through that legacy path.
+
+Dynamic environment booleans remain fail-closed. The corpus has no `requiresLowGravity()` shorthand calls, but the equivalent target semantic is supported and regression-tested alongside cleanroom.
+
+Full GT5 result after this pass:
+
+- target recipes lowered: **3,782 / 5,791 (65.31%)**, up from 3,706 / 5,791 (64.00%);
+- modifier blockers: **66**, down from 161;
+- metadata blockers: **472**;
+- item-input blockers: **1,218**;
+- item-output blockers: **961**;
+- fluid blockers: **457**;
+- non-constant EU/t blockers: **417**;
+- missing-duration blockers: **332**;
+- missing-EU/t blockers: **24**;
+- chance blockers: **50**.
+
+This adds 76 fully lowered recipes while keeping cleanroom quality effects as machine/environment behavior rather than source-specific recipe constants.

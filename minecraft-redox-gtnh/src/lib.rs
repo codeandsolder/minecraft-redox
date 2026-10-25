@@ -75,6 +75,8 @@ pub struct RecipeDefinition {
     pub registration_calls: Vec<BuilderCall>,
     /// Source runtime optimization hints with no process-semantic effect.
     pub execution_hints: Vec<BuilderCall>,
+    /// Source shorthand calls that declare runtime environment requirements.
+    pub environment_calls: Vec<BuilderCall>,
     pub modifiers: Vec<BuilderCall>,
     pub post_add_calls: Vec<BuilderCall>,
     pub unhandled_calls: Vec<BuilderCall>,
@@ -359,6 +361,7 @@ fn empty_recipe_definition(
         presentation_calls: Vec::new(),
         registration_calls: Vec::new(),
         execution_hints: Vec::new(),
+        environment_calls: Vec::new(),
         modifiers: Vec::new(),
         post_add_calls: Vec::new(),
         unhandled_calls: Vec::new(),
@@ -447,8 +450,10 @@ fn recognize_recipe(
             "hidden" | "setNEIDesc" => recipe.presentation_calls.push(call.into()),
             "ignoreCollision" => recipe.registration_calls.push(call.into()),
             "noBuffer" => recipe.execution_hints.push(call.into()),
-            "noOptimize" | "fake" | "enabled" | "disabled" | "requiresCleanRoom"
-            | "requiresLowGravity" | "requireMods" | "nbtSensitive" => {
+            "requiresCleanRoom" | "requiresLowGravity" => {
+                recipe.environment_calls.push(call.into());
+            }
+            "noOptimize" | "fake" | "enabled" | "disabled" | "requireMods" | "nbtSensitive" => {
                 recipe.modifiers.push(call.into());
             }
             "addTo" => after_add = true,

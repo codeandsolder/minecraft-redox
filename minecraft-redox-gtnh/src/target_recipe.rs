@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use minecraft_redox_core::{
     SourceOrigin,
@@ -340,13 +340,16 @@ fn lower_metadata(
     let mut fuel_type = None;
     let mut research_item = None;
     let mut scanning = None;
+    let mut environment_metadata = Vec::new();
 
     for call in &recipe.metadata {
         let Some((key, value)) = lower_metadata_call(call, bindings, blockers) else {
             continue;
         };
 
-        if key == "gregtech.api.util.GTRecipeConstants.COIL_HEAT" {
+        if let Some(environment) = environment_metadata_key(&key) {
+            environment_metadata.push((call, environment, value));
+        } else if key == "gregtech.api.util.GTRecipeConstants.COIL_HEAT" {
             if let Some(kelvin) = lower_coil_heat(call, value, bindings, project, blockers) {
                 minimum_heat_kelvin = Some(kelvin);
             }
@@ -388,7 +391,13 @@ fn lower_metadata(
         }
     }
 
-    let requirements = lower_recipe_requirements(minimum_heat_kelvin, minimum_capabilities);
+    let required_environments =
+        lower_environment_requirements(recipe, environment_metadata, bindings, blockers);
+    let requirements = lower_recipe_requirements(
+        minimum_heat_kelvin,
+        minimum_capabilities,
+        required_environments,
+    );
     let unlock =
         lower_assembly_line_unlock(recipe, research_item, scanning, bindings, project, blockers);
     let (fuel_energy_eu_per_liter, recipe_map_override) =
@@ -700,9 +709,150 @@ fn is_eu_per_liter_fuel_map(recipe_map: &str) -> bool {
     )
 }
 
+enum EnvironmentSetting<'a> {
+    Required,
+    Expression {
+        call: &'a crate::BuilderCall,
+        value: &'a JavaExpression,
+    },
+}
+
+fn environment_metadata_key(key: &str) -> Option<ContentId> {
+    match key {
+        "gregtech.api.util.GTRecipeConstants.CLEANROOM" => {
+            Some(ContentId::new("environment.cleanroom"))
+        }
+        "gregtech.api.util.GTRecipeConstants.LOW_GRAVITY" => {
+            Some(ContentId::new("environment.low_gravity"))
+        }
+        _ => None,
+    }
+}
+
+fn environment_shorthand(name: &str) -> Option<ContentId> {
+    match name {
+        "requiresCleanRoom" => Some(ContentId::new("environment.cleanroom")),
+        "requiresLowGravity" => Some(ContentId::new("environment.low_gravity")),
+        _ => None,
+    }
+}
+
+fn lower_environment_requirements<'a>(
+    recipe: &'a RecipeDefinition,
+    metadata: Vec<(&'a crate::BuilderCall, ContentId, &'a JavaExpression)>,
+    bindings: &JavaBindings,
+    blockers: &mut Vec<RecipeLoweringBlocker>,
+) -> BTreeSet<ContentId> {
+    if special_value_alias_overrides_environment(recipe, bindings) {
+        return BTreeSet::new();
+    }
+
+    let mut latest: BTreeMap<ContentId, (usize, EnvironmentSetting<'a>)> = BTreeMap::new();
+    for (call, environment, value) in metadata {
+        let replace = latest
+            .get(&environment)
+            .is_none_or(|(byte_end, _)| call.byte_end >= *byte_end);
+        if replace {
+            latest.insert(
+                environment,
+                (
+                    call.byte_end,
+                    EnvironmentSetting::Expression { call, value },
+                ),
+            );
+        }
+    }
+    for call in &recipe.environment_calls {
+        let Some(environment) = environment_shorthand(&call.name) else {
+            push_blocker(
+                blockers,
+                RecipeLoweringBlockerKind::Modifiers,
+                format!("unsupported environment shorthand: {}", call.name),
+            );
+            continue;
+        };
+        let replace = latest
+            .get(&environment)
+            .is_none_or(|(byte_end, _)| call.byte_end >= *byte_end);
+        if replace {
+            latest.insert(environment, (call.byte_end, EnvironmentSetting::Required));
+        }
+    }
+
+    let mut required = BTreeSet::new();
+    for (environment, (_, setting)) in latest {
+        match setting {
+            EnvironmentSetting::Required => {
+                required.insert(environment);
+            }
+            EnvironmentSetting::Expression { call, value } => match literal_boolean(value) {
+                Some(true) => {
+                    required.insert(environment);
+                }
+                Some(false) => {}
+                None => push_blocker(
+                    blockers,
+                    RecipeLoweringBlockerKind::Metadata,
+                    format!(
+                        "environment requirement is not a static boolean: {}",
+                        call.arguments.join(", ")
+                    ),
+                ),
+            },
+        }
+    }
+    required
+}
+
+fn literal_boolean(expression: &JavaExpression) -> Option<bool> {
+    let JavaExpression::Literal(value) = expression else {
+        return None;
+    };
+    match value.trim() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
+fn special_value_alias_overrides_environment(
+    recipe: &RecipeDefinition,
+    bindings: &JavaBindings,
+) -> bool {
+    recipe.metadata.iter().any(|call| {
+        let [key, _] = call.argument_expressions.as_slice() else {
+            return false;
+        };
+        let Some(key) = resolved_reference_name(key, bindings) else {
+            return false;
+        };
+        matches!(
+            key.as_str(),
+            "gregtech.api.util.GTRecipeConstants.COIL_HEAT"
+                | "gregtech.api.util.GTRecipeConstants.FUEL_VALUE"
+                | "gregtech.api.util.GTRecipeConstants.NANO_FORGE_TIER"
+                | "gregtech.api.util.GTRecipeConstants.FOG_EXOTIC_TIER"
+                | "gregtech.api.util.GTRecipeConstants.FOG_PLASMA_TIER"
+                | "gregtech.api.util.GTRecipeConstants.DEFC_CASING_TIER"
+                | "gregtech.api.util.GTRecipeConstants.CHEMPLANT_CASING_TIER"
+                | "gregtech.api.util.GTRecipeConstants.ALGAE_POND_TIER"
+                | "gregtech.api.util.GTRecipeConstants.QFT_FOCUS_TIER"
+                | "gregtech.api.util.GTRecipeConstants.DISSOLUTION_TANK_RATIO"
+                | "gregtech.api.util.GTRecipeConstants.RTG_DURATION_IN_DAYS"
+                | "gregtech.api.util.GTRecipeConstants.LNG_BASIC_OUTPUT"
+                | "gregtech.api.util.GTRecipeConstants.NFR_COIL_TIER"
+                | "gregtech.api.util.GTRecipeConstants.NKE_RANGE"
+                | "gregtech.api.util.GTRecipeConstants.PRECISE_ASSEMBLER_CASING_TIER"
+                | "gregtech.api.util.GTRecipeConstants.COAL_CASING_TIER"
+                | "gregtech.api.util.GTRecipeConstants.RESEARCH_STATION_DATA"
+        )
+    })
+}
+
 fn lower_recipe_requirements(
     minimum_heat_kelvin: Option<u64>,
     minimum_capabilities: BTreeMap<ContentId, u64>,
+    required_environments: BTreeSet<ContentId>,
 ) -> Vec<RecipeRequirement> {
     let mut requirements = Vec::new();
     if let Some(kelvin) = minimum_heat_kelvin {
@@ -712,6 +862,11 @@ fn lower_recipe_requirements(
         minimum_capabilities
             .into_iter()
             .map(|(capability, level)| RecipeRequirement::MinimumCapability { capability, level }),
+    );
+    requirements.extend(
+        required_environments
+            .into_iter()
+            .map(|environment| RecipeRequirement::RequiredEnvironment { environment }),
     );
     requirements
 }
@@ -3005,6 +3160,121 @@ mod tests {
                 .iter()
                 .any(|blocker| blocker.kind == RecipeLoweringBlockerKind::Modifiers)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn lowers_effective_environment_requirements() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+            import static gregtech.api.util.GTRecipeConstants.CLEANROOM;
+            import static gregtech.api.util.GTRecipeConstants.COIL_HEAT;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            class Recipes {
+                void cleanroom() {
+                    GTValues.RA.stdBuilder()
+                        .itemInputs(Materials.Iron.getDust(1))
+                        .itemOutputs(Materials.Steel.getDust(1))
+                        .requiresCleanRoom()
+                        .duration(20).eut(2).addTo(compressorRecipes);
+                }
+                void lowGravity() {
+                    GTValues.RA.stdBuilder()
+                        .itemInputs(Materials.Iron.getDust(1))
+                        .itemOutputs(Materials.Steel.getDust(1))
+                        .requiresLowGravity()
+                        .duration(20).eut(2).addTo(compressorRecipes);
+                }
+                void cleared() {
+                    GTValues.RA.stdBuilder()
+                        .itemInputs(Materials.Iron.getDust(1))
+                        .itemOutputs(Materials.Steel.getDust(1))
+                        .requiresCleanRoom()
+                        .metadata(CLEANROOM, false)
+                        .duration(20).eut(2).addTo(compressorRecipes);
+                }
+                void explicit() {
+                    GTValues.RA.stdBuilder()
+                        .itemInputs(Materials.Iron.getDust(1))
+                        .itemOutputs(Materials.Steel.getDust(1))
+                        .metadata(CLEANROOM, true)
+                        .duration(20).eut(2).addTo(compressorRecipes);
+                }
+                void aliasOverride() {
+                    GTValues.RA.stdBuilder()
+                        .itemInputs(Materials.Iron.getDust(1))
+                        .itemOutputs(Materials.Steel.getDust(1))
+                        .requiresCleanRoom()
+                        .metadata(COIL_HEAT, 1800)
+                        .duration(20).eut(2).addTo(compressorRecipes);
+                }
+            }
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let recovery = recover(&analysis);
+        assert_eq!(recovery.recipes.len(), 5);
+
+        let lowered: Vec<_> = recovery
+            .recipes
+            .iter()
+            .map(|recipe| {
+                lower_recipe(recipe, &analysis.bindings)
+                    .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))
+            })
+            .collect::<anyhow::Result<_>>()?;
+
+        assert!(matches!(
+            lowered[0].requirements.as_slice(),
+            [RecipeRequirement::RequiredEnvironment { environment }]
+                if environment.as_str() == "environment.cleanroom"
+        ));
+        assert!(matches!(
+            lowered[1].requirements.as_slice(),
+            [RecipeRequirement::RequiredEnvironment { environment }]
+                if environment.as_str() == "environment.low_gravity"
+        ));
+        assert_eq!(lowered[2].requirements, []);
+        assert!(matches!(
+            lowered[3].requirements.as_slice(),
+            [RecipeRequirement::RequiredEnvironment { environment }]
+                if environment.as_str() == "environment.cleanroom"
+        ));
+        assert_eq!(
+            lowered[4].requirements,
+            [RecipeRequirement::MinimumHeat { kelvin: 1800 }]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dynamic_environment_metadata_remains_fail_closed() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+            import static gregtech.api.util.GTRecipeConstants.CLEANROOM;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            class Recipes { void run(boolean cleanroom) {
+                GTValues.RA.stdBuilder()
+                    .itemInputs(Materials.Iron.getDust(1))
+                    .itemOutputs(Materials.Steel.getDust(1))
+                    .metadata(CLEANROOM, cleanroom)
+                    .duration(20).eut(2).addTo(compressorRecipes);
+            }}
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let recovery = recover(&analysis);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let failure = lower_recipe(recipe, &analysis.bindings)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("dynamic cleanroom requirement unexpectedly lowered"))?;
+        assert!(failure.blockers.iter().any(|blocker| {
+            blocker.kind == RecipeLoweringBlockerKind::Metadata
+                && blocker.detail.contains("not a static boolean")
+        }));
         Ok(())
     }
 
