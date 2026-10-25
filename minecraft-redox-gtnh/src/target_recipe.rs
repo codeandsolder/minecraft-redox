@@ -2382,7 +2382,8 @@ fn lower_item_semantic(
         ItemSemantic::OreDictUnify {
             inner: Some(inner), ..
         }
-        | ItemSemantic::InlinedMethod { result: inner, .. } => {
+        | ItemSemantic::InlinedMethod { result: inner, .. }
+        | ItemSemantic::InlinedValue { result: inner, .. } => {
             lower_item_semantic(inner, bindings, project)
         }
         ItemSemantic::ItemList {
@@ -3030,6 +3031,9 @@ fn lower_fluid_semantic(
             arguments,
             ..
         } => lower_transparent_linked_fluid_helper(method_id, arguments, bindings, project),
+        FluidSemantic::InlinedValue { result, .. } => {
+            lower_fluid_semantic(result, bindings, project)
+        }
         FluidSemantic::RegistryFluid { .. } | FluidSemantic::SolderingSubstitute { .. } => None,
     }
 }
@@ -6076,6 +6080,57 @@ mod tests {
                 .iter()
                 .any(|blocker| blocker.kind == RecipeLoweringBlockerKind::Metadata)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn lowers_effectively_final_local_recipe_aliases() -> anyhow::Result<()> {
+        let source = r#"
+            import static gregtech.api.recipe.RecipeMaps.mixerRecipes;
+            import static net.minecraftforge.fluids.FluidRegistry.getFluidStack;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            import gregtech.api.objects.OreDictItemStack;
+            import net.minecraftforge.fluids.FluidStack;
+            class Recipes { void run() {
+                var logWood16 = new OreDictItemStack("logWood", 16);
+                FluidStack death = getFluidStack("fluiddeath", 30);
+                GTValues.RA.stdBuilder()
+                    .itemInputs(logWood16)
+                    .itemOutputs(Materials.Charcoal.getGems(1))
+                    .fluidInputs(death)
+                    .duration(20).eut(2).addTo(mixerRecipes);
+            }}
+        "#;
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let mut project = JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let recovery = crate::recover_with_project(&analysis, &project);
+        let lowered = super::lower_recipe_with_project(
+            recovery
+                .recipes
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("recipe missing"))?,
+            &analysis.bindings,
+            &project,
+        )
+        .map_err(|failure| anyhow::anyhow!("local alias lowering failed: {failure:?}"))?;
+        let ItemInputSpec::Stack(item) = &lowered.item_inputs[0] else {
+            return Err(anyhow::anyhow!("local ore-dict alias was not a stack"));
+        };
+        assert_eq!(item.amount, 16);
+        assert!(matches!(
+            &item.selector,
+            ItemSelector::OreKey { key } if key.as_str() == "logWood"
+        ));
+        let FluidInputSpec::Stack(fluid) = &lowered.fluid_inputs[0] else {
+            return Err(anyhow::anyhow!("local fluid alias was not a stack"));
+        };
+        assert_eq!(fluid.amount, 30);
+        assert!(matches!(
+            &fluid.selector,
+            FluidSelector::Named { id } if id.as_str() == "fluiddeath"
+        ));
         Ok(())
     }
 

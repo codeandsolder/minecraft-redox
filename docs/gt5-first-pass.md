@@ -1081,3 +1081,32 @@ Full pinned-corpus result:
 - missing-EU/t blockers: **24**;
 - post-add blockers: **7**;
 - modifier blockers: **6**.
+
+### Effectively-final local recipe aliases
+
+The Java project index now retains local initializer expressions and exposes them at a use site only while the local remains semantically stable. GT recipe recovery records such aliases as `InlinedValue` provenance instead of erasing the local declaration.
+
+The stability check is deliberately conservative. A local initializer may be inlined only when, between declaration and use, the local has not been rebound, updated, assigned through a field or array element, passed through an unrecognized mutating/escaping receiver call, or otherwise written. Known read-only receiver calls used by the source guard logic remain safe. Parameters and enhanced-for variables remain dynamic.
+
+This generalizes source recovery for ordinary local aliases rather than special-casing recipe variable names. In the pinned corpus it resolves examples such as:
+
+- `var logWood16 = new OreDictItemStack("logWood", 16)` used by pyrolysis recipes;
+- `FluidStack tFD = getFluidStack("fluiddeath", 30)` used after its non-null/read-only validation guard.
+
+The target lowerer recursively lowers `InlinedValue` item and fluid semantics exactly as the initializer would be lowered inline. Reassigned or potentially mutated aliases remain fail-closed.
+
+Full pinned-corpus result after the conservative escape/mutation check:
+
+- target recipes lowered: **4,056 / 5,791 (70.04%)**, up from 4,022 / 5,791 (69.45%);
+- item-input blockers: **1,194**, down from 1,218;
+- item-output blockers: **945**, down from 961;
+- fluid blockers: **306**, down from 323;
+- item linked-value expressions: **310**, down from 401 before this pass;
+- metadata blockers: **331**;
+- non-constant EU/t blockers: **417**;
+- missing-duration blockers: **332**;
+- chance blockers: **50**;
+- special blockers: **31**;
+- missing-EU/t blockers: **24**;
+- post-add blockers: **7**;
+- modifier blockers: **6**.

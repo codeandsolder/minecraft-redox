@@ -139,6 +139,9 @@ pub struct JavaLocalVariable {
     pub name: String,
     pub declaration_byte: usize,
     pub scope_end_byte: usize,
+    pub initializer: Option<JavaExpression>,
+    pub initializer_source: Option<String>,
+    pub write_bytes: Vec<usize>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -753,6 +756,35 @@ impl JavaProjectIndex {
         })
     }
 
+    /// Return the initializer for the nearest in-scope local when its binding has not
+    /// been reassigned or updated between declaration and `byte_position`.
+    #[must_use]
+    pub fn stable_local_initializer_at(
+        &self,
+        path: &str,
+        byte_position: usize,
+        reference_name: &str,
+    ) -> Option<JavaExpression> {
+        let method = self.enclosing_method(path, byte_position)?;
+        let local = method
+            .local_variables
+            .iter()
+            .filter(|local| {
+                local.name == reference_name
+                    && local.declaration_byte <= byte_position
+                    && byte_position < local.scope_end_byte
+            })
+            .max_by_key(|local| local.declaration_byte)?;
+        if local
+            .write_bytes
+            .iter()
+            .any(|write_byte| *write_byte < byte_position)
+        {
+            return None;
+        }
+        local.initializer.clone()
+    }
+
     #[must_use]
     pub fn reference_type_at(
         &self,
@@ -1185,6 +1217,7 @@ fn method_from_node(
     if let Some(body) = node.child_by_field_name("body") {
         collect_returns(body, source, path, artifact, version, &name, &mut returns);
         collect_local_variables(body, source, bindings, &mut local_variables);
+        collect_local_writes(body, source, &mut local_variables);
     }
     Some(JavaMethod {
         owner,
@@ -1326,6 +1359,9 @@ fn collect_local_variables(
                 name: name.to_owned(),
                 declaration_byte: name_node.start_byte(),
                 scope_end_byte: body.end_byte(),
+                initializer: None,
+                initializer_source: None,
+                write_bytes: Vec::new(),
             });
             collect_local_variables(body, source, bindings, variables);
         }
@@ -1351,11 +1387,15 @@ fn collect_local_variables(
                     } else {
                         declared_type.clone()
                     };
+                    let value = declarator.child_by_field_name("value");
                     variables.push(JavaLocalVariable {
                         type_name,
                         name: name.to_owned(),
                         declaration_byte: declarator.start_byte(),
                         scope_end_byte,
+                        initializer: value.map(|value| expression(value, source)),
+                        initializer_source: value.map(|value| node_source(value, source)),
+                        write_bytes: Vec::new(),
                     });
                 }
             }
@@ -1377,6 +1417,81 @@ fn collect_local_variables(
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         collect_local_variables(child, source, bindings, variables);
+    }
+}
+
+fn collect_local_writes(node: Node<'_>, source: &str, variables: &mut [JavaLocalVariable]) {
+    if node.kind() == "assignment_expression"
+        && let Some(left) = node.child_by_field_name("left")
+        && let Some(name) = assignment_target_root(left, source)
+    {
+        record_local_write(&name, node.start_byte(), variables);
+    } else if node.kind() == "update_expression"
+        && let Some(target) = first_named_child(node)
+        && let Some(name) = assignment_target_root(target, source)
+    {
+        record_local_write(&name, node.start_byte(), variables);
+    } else if node.kind() == "method_invocation"
+        && let JavaExpression::Call {
+            receiver: Some(receiver),
+            method,
+            ..
+        } = expression(node, source)
+        && !looks_read_only_receiver_method(&method)
+        && let Some(name) = expression_root_reference(&receiver)
+    {
+        record_local_write(&name, node.start_byte(), variables);
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_local_writes(child, source, variables);
+    }
+}
+
+fn looks_read_only_receiver_method(method: &str) -> bool {
+    method.starts_with("get")
+        || method.starts_with("is")
+        || method.starts_with("has")
+        || matches!(method, "equals" | "hashCode" | "toString")
+}
+
+fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor).next()
+}
+
+fn assignment_target_root(node: Node<'_>, source: &str) -> Option<String> {
+    match expression(node, source) {
+        JavaExpression::Reference(reference) => Some(reference),
+        JavaExpression::FieldAccess { receiver, .. } => expression_root_reference(&receiver),
+        JavaExpression::ArrayAccess { array, .. } => expression_root_reference(&array),
+        JavaExpression::Parenthesized(inner) => expression_root_reference(&inner),
+        _ => None,
+    }
+}
+
+fn expression_root_reference(expression: &JavaExpression) -> Option<String> {
+    match expression {
+        JavaExpression::Reference(reference) => Some(reference.clone()),
+        JavaExpression::FieldAccess { receiver, .. } => expression_root_reference(receiver),
+        JavaExpression::ArrayAccess { array, .. } => expression_root_reference(array),
+        JavaExpression::Parenthesized(inner) => expression_root_reference(inner),
+        _ => None,
+    }
+}
+
+fn record_local_write(name: &str, byte_position: usize, variables: &mut [JavaLocalVariable]) {
+    if let Some(local) = variables
+        .iter_mut()
+        .filter(|local| {
+            local.name == name
+                && local.declaration_byte < byte_position
+                && byte_position < local.scope_end_byte
+        })
+        .max_by_key(|local| local.declaration_byte)
+    {
+        local.write_bytes.push(byte_position);
     }
 }
 
@@ -2239,6 +2354,65 @@ mod tests {
             assert_eq!(resolved.name, "get");
             assert_eq!(receiver_type.as_deref(), Some("demo.Holder"));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn exposes_only_unmodified_local_initializers_at_use_site() -> anyhow::Result<()> {
+        let source = r"
+            package demo;
+            class ItemStack {
+                int amount;
+                ItemStack(int amount) {}
+                ItemStack getCopy() { return this; }
+                void mutate() {}
+            }
+            class Recipe {
+                void run() {
+                    var stable = new ItemStack(1);
+                    stable.getCopy();
+                    sink(stable);
+                    var reassigned = new ItemStack(2);
+                    reassigned = new ItemStack(3);
+                    sink(reassigned);
+                    var fieldMutated = new ItemStack(4);
+                    fieldMutated.amount = 5;
+                    sink(fieldMutated);
+                    var methodMutated = new ItemStack(6);
+                    methodMutated.mutate();
+                    sink(methodMutated);
+                }
+            }
+        ";
+        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
+        let mut index = super::JavaProjectIndex::default();
+        index.add_analysis(&analysis);
+        let calls: Vec<_> = analysis
+            .call_chains
+            .iter()
+            .flat_map(|chain| &chain.calls)
+            .filter(|call| call.name == "sink")
+            .collect();
+        assert_eq!(calls.len(), 4);
+        assert!(matches!(
+            index.stable_local_initializer_at("Recipe.java", calls[0].byte_start, "stable"),
+            Some(super::JavaExpression::New { .. })
+        ));
+        assert!(
+            index
+                .stable_local_initializer_at("Recipe.java", calls[1].byte_start, "reassigned")
+                .is_none()
+        );
+        assert!(
+            index
+                .stable_local_initializer_at("Recipe.java", calls[2].byte_start, "fieldMutated")
+                .is_none()
+        );
+        assert!(
+            index
+                .stable_local_initializer_at("Recipe.java", calls[3].byte_start, "methodMutated")
+                .is_none()
+        );
         Ok(())
     }
 

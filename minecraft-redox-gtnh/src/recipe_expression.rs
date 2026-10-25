@@ -79,6 +79,10 @@ pub enum ItemSemantic {
         method_id: String,
         result: Box<ItemSemantic>,
     },
+    InlinedValue {
+        value_id: String,
+        result: Box<ItemSemantic>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -106,6 +110,10 @@ pub enum FluidSemantic {
         receiver: Option<JavaExpression>,
         receiver_type: Option<String>,
         arguments: Vec<JavaExpression>,
+    },
+    InlinedValue {
+        value_id: String,
+        result: Box<FluidSemantic>,
     },
 }
 
@@ -364,6 +372,15 @@ fn project_item_semantic(
             if !is_item_value_type(&value.type_name) {
                 return None;
             }
+            if let Some(initializer) =
+                project.stable_local_initializer_at(source_path, byte_position, reference)
+                && let Some(result) = item_semantic(&initializer, bindings)
+            {
+                return Some(ItemSemantic::InlinedValue {
+                    value_id: value.value_id,
+                    result: Box::new(result),
+                });
+            }
             Some(ItemSemantic::LinkedValue {
                 value_id: value.value_id,
                 value_kind: value.kind,
@@ -463,6 +480,16 @@ fn enrich_item_semantic_with_project(
                 byte_position,
             )),
         },
+        ItemSemantic::InlinedValue { value_id, result } => ItemSemantic::InlinedValue {
+            value_id,
+            result: Box::new(enrich_item_semantic_with_project(
+                *result,
+                bindings,
+                project,
+                source_path,
+                byte_position,
+            )),
+        },
         semantic => semantic,
     }
 }
@@ -526,26 +553,41 @@ fn project_fluid_semantic(
     source_path: &str,
     byte_position: usize,
 ) -> Option<FluidSemantic> {
-    let JavaExpression::Call {
-        receiver,
-        arguments,
-        ..
-    } = expression
-    else {
-        return None;
-    };
-    let (resolved, receiver_type) =
-        project.resolve_call_at(source_path, byte_position, expression, bindings)?;
-    if !resolved.return_type.ends_with("FluidStack") {
-        return None;
+    match expression {
+        JavaExpression::Reference(reference) => {
+            let value =
+                project.resolve_value_at(source_path, byte_position, reference, bindings)?;
+            let initializer =
+                project.stable_local_initializer_at(source_path, byte_position, reference)?;
+            let result = fluid_semantic(&initializer, bindings)?;
+            Some(FluidSemantic::InlinedValue {
+                value_id: value.value_id,
+                result: Box::new(result),
+            })
+        }
+        JavaExpression::Call {
+            receiver,
+            arguments,
+            ..
+        } => {
+            let (resolved, receiver_type) =
+                project.resolve_call_at(source_path, byte_position, expression, bindings)?;
+            if !resolved.return_type.ends_with("FluidStack") {
+                return None;
+            }
+            Some(FluidSemantic::LinkedMethod {
+                method_id: resolved.stable_id(),
+                return_type: resolved.return_type.clone(),
+                receiver: receiver.as_deref().cloned(),
+                receiver_type,
+                arguments: arguments.clone(),
+            })
+        }
+        JavaExpression::Parenthesized(inner) => {
+            project_fluid_semantic(inner, bindings, project, source_path, byte_position)
+        }
+        _ => None,
     }
-    Some(FluidSemantic::LinkedMethod {
-        method_id: resolved.stable_id(),
-        return_type: resolved.return_type.clone(),
-        receiver: receiver.as_deref().cloned(),
-        receiver_type,
-        arguments: arguments.clone(),
-    })
 }
 
 fn classify_item_call(
@@ -925,7 +967,7 @@ mod tests {
         recover_fluids_with_project, recover_item_inputs, recover_item_inputs_with_project,
         recover_items,
     };
-    use minecraft_redox_java::{JavaExpression, analyze_source};
+    use minecraft_redox_java::{JavaExpression, JavaProjectIndex, analyze_source};
 
     fn recipe_call<'a>(
         analysis: &'a minecraft_redox_java::JavaAnalysis,
@@ -1020,6 +1062,43 @@ mod tests {
             return Err(anyhow::anyhow!("local method was not linked"));
         };
         assert_eq!(method_id, "R#get(String,int)");
+        Ok(())
+    }
+
+    #[test]
+    fn inlines_effectively_final_local_item_and_fluid_initializers() -> anyhow::Result<()> {
+        let source = r#"
+            import static net.minecraftforge.fluids.FluidRegistry.getFluidStack;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            import gregtech.api.objects.OreDictItemStack;
+            import net.minecraftforge.fluids.FluidStack;
+            class Recipes { void run() {
+                var logWood16 = new OreDictItemStack("logWood", 16);
+                FluidStack death = getFluidStack("fluiddeath", 30);
+                GTValues.RA.stdBuilder()
+                    .itemInputs(logWood16)
+                    .itemOutputs(Materials.Charcoal.getGems(1))
+                    .fluidInputs(death)
+                    .duration(20).eut(2).addTo(mixerRecipes);
+            }}
+        "#;
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let mut project = JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let recovery = crate::recover_with_project(&analysis, &project);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        assert!(matches!(
+            recipe.item_input_semantics[0].semantic,
+            Some(ItemSemantic::InlinedValue { .. })
+        ));
+        assert!(matches!(
+            recipe.fluid_input_semantics[0].semantic,
+            Some(FluidSemantic::InlinedValue { .. })
+        ));
         Ok(())
     }
 
