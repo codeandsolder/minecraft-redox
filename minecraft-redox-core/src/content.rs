@@ -110,6 +110,14 @@ pub struct FluidStackSpec {
     pub amount: u64,
 }
 
+/// One fluid input slot. Alternatives can require different amounts per substitute.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FluidInputSpec {
+    Stack(FluidStackSpec),
+    Alternatives { choices: Vec<FluidStackSpec> },
+}
+
 /// One concrete item stack in normalized content.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ItemStackSpec {
@@ -206,7 +214,7 @@ pub struct ContentRecipe {
     pub execution_mode: RecipeExecutionMode,
     pub item_inputs: Vec<ItemInputSpec>,
     pub item_outputs: Vec<ItemOutputSpec>,
-    pub fluid_inputs: Vec<FluidStackSpec>,
+    pub fluid_inputs: Vec<FluidInputSpec>,
     pub fluid_outputs: Vec<FluidStackSpec>,
     pub requirements: Vec<RecipeRequirement>,
     pub unlock: Option<RecipeUnlock>,

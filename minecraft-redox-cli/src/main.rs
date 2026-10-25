@@ -1,10 +1,11 @@
 use std::{
+    collections::BTreeMap,
     env, fs,
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, bail};
-use minecraft_redox_gtnh::{GtnhSummary, recover_with_project};
+use minecraft_redox_gtnh::{GtnhSummary, lower_recipe_with_project, recover_with_project};
 use minecraft_redox_java::{JavaProjectIndex, analyze_source, inventory_source};
 use rayon::prelude::*;
 use serde::Serialize;
@@ -13,6 +14,21 @@ use serde::Serialize;
 struct FileRecovery {
     path: String,
     recovery: minecraft_redox_gtnh::GtnhRecovery,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+struct BlockerDetailCensus {
+    kind: String,
+    detail: String,
+    recipes: usize,
+    sole_blocker_recipes: usize,
+    examples: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+struct BlockerCensus {
+    failed_recipes: usize,
+    details: Vec<BlockerDetailCensus>,
 }
 
 fn main() -> Result<()> {
@@ -25,8 +41,11 @@ fn main() -> Result<()> {
         [_, command, flag, path] if command == "gtnh" && flag == "--summary" => {
             print_gtnh(path, true)
         }
+        [_, command, flag, path] if command == "gtnh" && flag == "--blockers" => {
+            print_gtnh_blockers(path)
+        }
         _ => bail!(
-            "usage: minecraft-redox [inventory|chains] <java-file> | gtnh [--summary] <file-or-dir>"
+            "usage: minecraft-redox [inventory|chains] <java-file> | gtnh [--summary|--blockers] <file-or-dir>"
         ),
     }
 }
@@ -69,6 +88,62 @@ fn print_gtnh(path: &str, summary_only: bool) -> Result<()> {
     }
     println!("{}", serde_json::to_string_pretty(&files)?);
     Ok(())
+}
+
+fn print_gtnh_blockers(path: &str) -> Result<()> {
+    let paths = java_paths(Path::new(path))?;
+    let project = build_project_index(&paths)?;
+    let census = blocker_census(&paths, &project)?;
+    println!("{}", serde_json::to_string_pretty(&census)?);
+    Ok(())
+}
+
+fn blocker_census(paths: &[PathBuf], project: &JavaProjectIndex) -> Result<BlockerCensus> {
+    let mut details: BTreeMap<(String, String), BlockerDetailCensus> = BTreeMap::new();
+    let mut failed_recipes = 0usize;
+    for source_path in paths {
+        let display = source_path.to_string_lossy().into_owned();
+        let source = read_source(source_path)?;
+        let analysis = analyze_source(&display, "GTNH", None, &source)?;
+        let recovery = recover_with_project(&analysis, project);
+        for recipe in &recovery.recipes {
+            let Err(failure) = lower_recipe_with_project(recipe, &analysis.bindings, project)
+            else {
+                continue;
+            };
+            failed_recipes += 1;
+            let sole = failure.blockers.len() == 1;
+            for blocker in &failure.blockers {
+                let kind = blocker.kind.as_str().to_owned();
+                let detail = blocker.detail.clone();
+                let entry = details
+                    .entry((kind.clone(), detail.clone()))
+                    .or_insert_with(|| BlockerDetailCensus {
+                        kind,
+                        detail,
+                        ..BlockerDetailCensus::default()
+                    });
+                entry.recipes += 1;
+                entry.sole_blocker_recipes += usize::from(sole);
+                if entry.examples.len() < 3 && !entry.examples.contains(&display) {
+                    entry.examples.push(display.clone());
+                }
+            }
+        }
+    }
+    let mut details: Vec<_> = details.into_values().collect();
+    details.sort_by(|left, right| {
+        right
+            .sole_blocker_recipes
+            .cmp(&left.sole_blocker_recipes)
+            .then_with(|| right.recipes.cmp(&left.recipes))
+            .then_with(|| left.kind.cmp(&right.kind))
+            .then_with(|| left.detail.cmp(&right.detail))
+    });
+    Ok(BlockerCensus {
+        failed_recipes,
+        details,
+    })
 }
 
 fn build_project_index(paths: &[PathBuf]) -> Result<JavaProjectIndex> {

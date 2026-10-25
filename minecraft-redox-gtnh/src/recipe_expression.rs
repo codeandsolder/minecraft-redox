@@ -97,6 +97,9 @@ pub enum FluidSemantic {
         provider: String,
         arguments: Vec<JavaExpression>,
     },
+    SolderingSubstitute {
+        base_amount: Option<JavaExpression>,
+    },
     LinkedMethod {
         method_id: String,
         return_type: String,
@@ -684,6 +687,19 @@ fn fluid_semantic(expression: &JavaExpression, bindings: &JavaBindings) -> Optio
             Some(FluidSemantic::RegistryFluid {
                 provider,
                 arguments: arguments.clone(),
+            })
+        }
+        JavaExpression::Call {
+            receiver: Some(receiver),
+            method,
+            arguments,
+        } if method == "soldering"
+            && arguments.len() <= 1
+            && reference_name(receiver, bindings)?
+                == "gregtech.api.objects.SubstituteFluidStack" =>
+        {
+            Some(FluidSemantic::SolderingSubstitute {
+                base_amount: arguments.first().cloned(),
             })
         }
         JavaExpression::Call {

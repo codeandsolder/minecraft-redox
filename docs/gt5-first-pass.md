@@ -829,3 +829,42 @@ This pass does not increase the fully lowered recipe count because those BioVat 
 - chance blockers: **50**.
 
 The separate `SIEVERT` path is intentionally not folded into this capability: BioVat supports both minimum and exact radiation matching, and the only explicit SIEVERT metadata use in this pinned corpus is on a fake radio-hatch display recipe.
+
+
+### Fluid input alternatives and soldering substitutes
+
+Target recipe IR now distinguishes concrete fluid inputs from one-slot fluid alternatives:
+
+```rust
+pub enum FluidInputSpec {
+    Stack(FluidStackSpec),
+    Alternatives { choices: Vec<FluidStackSpec> },
+}
+```
+
+Alternatives deliberately carry a full stack per choice because substitute fluids can require different quantities. Fluid outputs remain concrete stacks.
+
+GT5's `SubstituteFluidStack.soldering(baseAmount)` is the first source adapter. Source inspection shows the helper iterates exactly Soldering Alloy, Tin, and Lead and multiplies the requested base amount by soldering quality: Soldering Alloy is tagged `SOLDERING_MATERIAL_GOOD` and uses 1x, Tin has only `SOLDERING_MATERIAL` and uses 2x, and Lead is tagged `SOLDERING_MATERIAL_BAD` and uses 4x. `soldering()` delegates to one ingot (144 material units). The target therefore lowers one source fluid slot to three exact molten-material alternatives with independently scaled amounts.
+
+Static base-amount expressions are evaluated through the existing project scalar evaluator. Dynamic amounts remain a fluid blocker; the importer does not guess. This pass removes all currently static soldering-helper blockers that can be proven from the source.
+
+Full pinned-corpus result:
+
+- target recipes lowered: **3,916 / 5,791 (67.62%)**, up from 3,868 / 5,791 (66.79%);
+- fluid blockers: **401**, down from 457;
+- metadata blockers: **379**;
+- item-input blockers: **1,218**;
+- item-output blockers: **961**;
+- non-constant EU/t blockers: **417**;
+- missing-duration blockers: **332**;
+- chance blockers: **50**;
+- special blockers: **31**;
+- missing-EU/t blockers: **24**;
+- post-add blockers: **7**;
+- modifier blockers: **6**.
+
+### Sole-blocker census
+
+The CLI now has `gtnh --blockers <file-or-dir>` for project-aware lowering diagnostics. It groups exact blocker details, counts both total affected recipes and recipes for which that detail is the sole remaining blocker, retains a few source examples, and sorts by sole-blocker value first. This makes lowering work prioritize semantic wins rather than raw source frequency.
+
+After the soldering pass there are **1,875** failed recipes, exactly 5,791 - 3,916. The leading sole blockers are Beam Crafter metadata (22), `ADDITIVE_AMOUNT` (18), `GTUtility.copyAmount(1, aStack)` item provenance (13), dynamic iron-ingot output amount (12), `NKE_RANGE` (12), `logWood16` item provenance (11), distilled-water helpers (10+5 for the two largest exact forms), and dissolution-tank ratio (9).

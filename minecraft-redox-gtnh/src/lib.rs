@@ -7,6 +7,7 @@ mod target_recipe;
 pub use recipe_expression::{FluidSemantic, ItemSemantic, RecoveredExpression};
 pub use target_recipe::{
     RecipeLoweringBlocker, RecipeLoweringBlockerKind, RecipeLoweringFailure, lower_recipe,
+    lower_recipe_with_project,
 };
 
 use minecraft_redox_core::SourceOrigin;
