@@ -343,3 +343,29 @@ Full GT5 result after this pass:
 - chance blockers: **50**.
 
 The pass adds 93 fully lowered recipes and removes metadata as a blocker from 177 recipes while leaving every non-heat metadata family untouched. The next metadata families must be derived from their runtime consumers rather than generalized by name: fuel value/type, scanning/research, and machine casing tiers have distinct semantics.
+
+
+### Named minimum machine capabilities
+
+Three casing-tier metadata families are now normalized into a generic source-independent recipe requirement: `MinimumCapability { capability, level }`. Source/runtime inspection proves that all three are threshold checks against a machine capability, even though their internal block-tier offsets differ:
+
+- `COAL_CASING_TIER` -> `machine_capability.component_assembly_line_casing`; the Component Assembly Line requires `recipe level <= casingTier + 1` and also uses surplus capability levels to reduce duration by powers of two;
+- `CHEMPLANT_CASING_TIER` -> `machine_capability.chemical_plant_solid_casing`; the Chemical Plant requires `recipe level <= mSolidCasingTier`;
+- `PRECISE_ASSEMBLER_CASING_TIER` -> `machine_capability.precise_assembler_casing`; Precise mode requires `recipe level <= casingTier + 1`.
+
+The target requirement stores the normalized capability level that recipe execution compares against, not source block metadata or source field names. This leaves machine-specific policy such as the Component Assembly Line's surplus-tier speed bonus in the machine executor while making the recipe requirement reusable.
+
+`ALGAE_POND_TIER` is explicitly *not* lowered into this family. The Algae Pond searches for a recipe whose legacy special value equals the current pond tier; that is exact variant selection, not a minimum capability threshold. A characterization test protects this distinction. As with heat metadata, repeated values for the same capability inherit GT metadata storage's last-write-wins behavior.
+
+Full GT5 result after this pass:
+
+- target recipes lowered: **3,235 / 5,791 (55.86%)**, up from 3,157 / 5,791 (54.52%);
+- metadata blockers: **872**, down from 979;
+- item-input blockers: **1,403**;
+- item-output blockers: **1,126**;
+- fluid blockers: **457**;
+- non-constant EU/t blockers: **417**;
+- modifier blockers: **178**;
+- chance blockers: **50**.
+
+This adds 78 fully lowered recipes and removes metadata as a blocker from 107 recipes. Fuel metadata is intentionally deferred because `FUEL_TYPE` dispatches builders into different fuel recipe maps and `FUEL_VALUE` then becomes generator fuel semantics; treating those as generic requirements would be wrong. `RESEARCH_ITEM` plus `SCANNING` likewise form one Assembly Line research/unlock process and should eventually become a dedicated target research primitive rather than unrelated metadata fields.

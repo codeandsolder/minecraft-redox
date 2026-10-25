@@ -146,6 +146,8 @@ pub enum ItemInputSpec {
 pub enum RecipeRequirement {
     /// Minimum process heat required by the recipe, in Kelvin.
     MinimumHeat { kelvin: u64 },
+    /// Minimum named machine capability required to process the recipe.
+    MinimumCapability { capability: ContentId, level: u64 },
 }
 
 /// Minimal target recipe IR.

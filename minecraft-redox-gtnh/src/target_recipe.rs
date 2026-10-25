@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use minecraft_redox_core::{
     SourceOrigin,
     content::{
@@ -237,6 +239,7 @@ fn lower_metadata(
     blockers: &mut Vec<RecipeLoweringBlocker>,
 ) -> Vec<RecipeRequirement> {
     let mut minimum_heat_kelvin = None;
+    let mut minimum_capabilities = BTreeMap::new();
 
     for call in &recipe.metadata {
         if call.name != "metadata" {
@@ -284,6 +287,20 @@ fn lower_metadata(
                     ),
                 ),
             }
+        } else if let Some(capability) = casing_capability(&key) {
+            match lower_nonnegative_scalar(value, bindings, project) {
+                Some(level) => {
+                    minimum_capabilities.insert(capability, level);
+                }
+                None => push_blocker(
+                    blockers,
+                    RecipeLoweringBlockerKind::Metadata,
+                    format!(
+                        "casing requirement is not a static non-negative capability level: {}",
+                        call.arguments.join(", ")
+                    ),
+                ),
+            }
         } else {
             push_blocker(
                 blockers,
@@ -293,9 +310,32 @@ fn lower_metadata(
         }
     }
 
-    minimum_heat_kelvin
-        .map(|kelvin| vec![RecipeRequirement::MinimumHeat { kelvin }])
-        .unwrap_or_default()
+    let mut requirements = Vec::new();
+    if let Some(kelvin) = minimum_heat_kelvin {
+        requirements.push(RecipeRequirement::MinimumHeat { kelvin });
+    }
+    requirements.extend(
+        minimum_capabilities
+            .into_iter()
+            .map(|(capability, level)| RecipeRequirement::MinimumCapability { capability, level }),
+    );
+    requirements
+}
+
+fn casing_capability(key: &str) -> Option<ContentId> {
+    let capability = match key {
+        "gregtech.api.util.GTRecipeConstants.COAL_CASING_TIER" => {
+            "machine_capability.component_assembly_line_casing"
+        }
+        "gregtech.api.util.GTRecipeConstants.CHEMPLANT_CASING_TIER" => {
+            "machine_capability.chemical_plant_solid_casing"
+        }
+        "gregtech.api.util.GTRecipeConstants.PRECISE_ASSEMBLER_CASING_TIER" => {
+            "machine_capability.precise_assembler_casing"
+        }
+        _ => return None,
+    };
+    Some(ContentId::new(capability))
 }
 
 fn lower_nonnegative_scalar(
@@ -1260,6 +1300,96 @@ mod tests {
         assert_eq!(
             lowered.requirements,
             [RecipeRequirement::MinimumHeat { kelvin: 2400 }]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn lowers_casing_metadata_to_named_machine_capabilities() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+            import static gregtech.api.util.GTRecipeConstants.CHEMPLANT_CASING_TIER;
+            import static gregtech.api.util.GTRecipeConstants.COAL_CASING_TIER;
+            import static gregtech.api.util.GTRecipeConstants.PRECISE_ASSEMBLER_CASING_TIER;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            class Recipes {
+                void component() {
+                    GTValues.RA.stdBuilder()
+                        .itemInputs(Materials.Iron.getDust(1))
+                        .itemOutputs(Materials.Steel.getDust(1))
+                        .metadata(COAL_CASING_TIER, 6)
+                        .duration(20).eut(2).addTo(compressorRecipes);
+                }
+                void chemical() {
+                    GTValues.RA.stdBuilder()
+                        .itemInputs(Materials.Iron.getDust(1))
+                        .itemOutputs(Materials.Steel.getDust(1))
+                        .metadata(CHEMPLANT_CASING_TIER, 3)
+                        .duration(20).eut(2).addTo(compressorRecipes);
+                }
+                void precise() {
+                    GTValues.RA.stdBuilder()
+                        .itemInputs(Materials.Iron.getDust(1))
+                        .itemOutputs(Materials.Steel.getDust(1))
+                        .metadata(PRECISE_ASSEMBLER_CASING_TIER, 2)
+                        .duration(20).eut(2).addTo(compressorRecipes);
+                }
+            }
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let recovery = recover(&analysis);
+        let expected = [
+            ("machine_capability.component_assembly_line_casing", 6),
+            ("machine_capability.chemical_plant_solid_casing", 3),
+            ("machine_capability.precise_assembler_casing", 2),
+        ];
+        assert_eq!(recovery.recipes.len(), expected.len());
+        for (recipe, (capability, level)) in recovery.recipes.iter().zip(expected) {
+            let lowered = lower_recipe(recipe, &analysis.bindings)
+                .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
+            assert_eq!(
+                lowered.requirements,
+                [RecipeRequirement::MinimumCapability {
+                    capability: minecraft_redox_core::content::ContentId::new(capability),
+                    level,
+                }]
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn algae_pond_tier_is_not_a_minimum_machine_capability() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+            import static gregtech.api.util.GTRecipeConstants.ALGAE_POND_TIER;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .itemInputs(Materials.Iron.getDust(1))
+                    .itemOutputs(Materials.Steel.getDust(1))
+                    .metadata(ALGAE_POND_TIER, 4)
+                    .duration(20).eut(2).addTo(compressorRecipes);
+            }}
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let recovery = recover(&analysis);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let Err(failure) = lower_recipe(recipe, &analysis.bindings) else {
+            return Err(anyhow::anyhow!(
+                "algae selector unexpectedly lowered as a requirement"
+            ));
+        };
+        assert!(
+            failure
+                .blockers
+                .iter()
+                .any(|blocker| blocker.kind == RecipeLoweringBlockerKind::Metadata)
         );
         Ok(())
     }
