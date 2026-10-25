@@ -53,6 +53,52 @@ pub enum FluidSelector {
     },
 }
 
+/// Exact probability used by normalized content semantics.
+///
+/// Importers reduce source-specific probability scales into this rational form,
+/// so the runtime does not need to know whether a source used basis points,
+/// percentages, or another fixed scale.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Probability {
+    pub numerator: u64,
+    pub denominator: u64,
+}
+
+impl Probability {
+    pub const ZERO: Self = Self {
+        numerator: 0,
+        denominator: 1,
+    };
+    pub const ONE: Self = Self {
+        numerator: 1,
+        denominator: 1,
+    };
+
+    #[must_use]
+    pub fn new(numerator: u64, denominator: u64) -> Option<Self> {
+        if denominator == 0 || numerator > denominator {
+            return None;
+        }
+        if numerator == 0 {
+            return Some(Self::ZERO);
+        }
+        let divisor = greatest_common_divisor(numerator, denominator);
+        Some(Self {
+            numerator: numerator / divisor,
+            denominator: denominator / divisor,
+        })
+    }
+}
+
+fn greatest_common_divisor(mut left: u64, mut right: u64) -> u64 {
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    left
+}
+
 /// One concrete fluid stack in normalized content.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FluidStackSpec {
@@ -69,14 +115,21 @@ pub struct ItemStackSpec {
 
 /// One concrete item requirement in a recipe input slot.
 ///
-/// `amount` is how many matching items must be present. `consumed` is separate
-/// because some recipe systems use catalysts/configuration items that are
-/// required for matching but survive a successful recipe execution.
+/// `amount` is how many matching items must be present. Consumption probability is
+/// independent of matching, so catalysts/configuration items can be required while
+/// surviving execution and probabilistic consumables remain explicit.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ItemInputStackSpec {
     pub selector: ItemSelector,
     pub amount: u64,
-    pub consumed: bool,
+    pub consumption_probability: Probability,
+}
+
+/// One concrete item production slot in a recipe.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ItemOutputSpec {
+    pub stack: ItemStackSpec,
+    pub production_probability: Probability,
 }
 
 /// One recipe input slot. Alternatives occupy one slot, not several inputs.
@@ -97,7 +150,7 @@ pub struct ContentRecipe {
     pub origin: SourceOrigin,
     pub recipe_map: ContentId,
     pub item_inputs: Vec<ItemInputSpec>,
-    pub item_outputs: Vec<ItemStackSpec>,
+    pub item_outputs: Vec<ItemOutputSpec>,
     pub fluid_inputs: Vec<FluidStackSpec>,
     pub fluid_outputs: Vec<FluidStackSpec>,
     pub duration_ticks: u64,

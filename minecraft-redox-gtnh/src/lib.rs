@@ -50,7 +50,9 @@ pub struct RecipeDefinition {
     pub fluid_outputs: Vec<String>,
     pub fluid_output_semantics: Vec<RecoveredExpression<FluidSemantic>>,
     pub input_chances: Vec<String>,
+    pub input_chance_expressions: Vec<JavaExpression>,
     pub output_chances: Vec<String>,
+    pub output_chance_expressions: Vec<JavaExpression>,
     pub duration: Option<String>,
     pub duration_ticks: Option<i64>,
     pub eut: Option<String>,
@@ -310,17 +312,12 @@ fn recover_internal(analysis: &JavaAnalysis, project: Option<&JavaProjectIndex>)
     }
 }
 
-fn recognize_recipe(
+fn empty_recipe_definition(
     chain: &JavaCallChain,
     bindings: &JavaBindings,
-    project: Option<&JavaProjectIndex>,
-) -> Option<RecipeDefinition> {
-    if chain.calls.first()?.name != "stdBuilder" {
-        return None;
-    }
-    let add_to = chain.calls.iter().rfind(|call| call.name == "addTo")?;
-    let recipe_map = bindings.resolve_reference(add_to.arguments.first()?);
-    let mut recipe = RecipeDefinition {
+    recipe_map: String,
+) -> RecipeDefinition {
+    RecipeDefinition {
         origin: chain.origin.clone(),
         builder_root: bindings.resolve_reference(&chain.root),
         recipe_map,
@@ -333,7 +330,9 @@ fn recognize_recipe(
         fluid_outputs: Vec::new(),
         fluid_output_semantics: Vec::new(),
         input_chances: Vec::new(),
+        input_chance_expressions: Vec::new(),
         output_chances: Vec::new(),
+        output_chance_expressions: Vec::new(),
         duration: None,
         duration_ticks: None,
         eut: None,
@@ -345,7 +344,20 @@ fn recognize_recipe(
         modifiers: Vec::new(),
         post_add_calls: Vec::new(),
         unhandled_calls: Vec::new(),
-    };
+    }
+}
+
+fn recognize_recipe(
+    chain: &JavaCallChain,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+) -> Option<RecipeDefinition> {
+    if chain.calls.first()?.name != "stdBuilder" {
+        return None;
+    }
+    let add_to = chain.calls.iter().rfind(|call| call.name == "addTo")?;
+    let recipe_map = bindings.resolve_reference(add_to.arguments.first()?);
+    let mut recipe = empty_recipe_definition(chain, bindings, recipe_map);
 
     let mut after_add = false;
     let mut integrated_circuit_inputs = Vec::new();
@@ -389,8 +401,18 @@ fn recognize_recipe(
                 project,
                 &chain.origin.path,
             ),
-            "inputChances" => recipe.input_chances.extend(call.arguments.clone()),
-            "outputChances" => recipe.output_chances.extend(call.arguments.clone()),
+            "inputChances" => {
+                recipe.input_chances.extend(call.arguments.clone());
+                recipe
+                    .input_chance_expressions
+                    .extend(chance_expressions(call));
+            }
+            "outputChances" => {
+                recipe.output_chances.extend(call.arguments.clone());
+                recipe
+                    .output_chance_expressions
+                    .extend(chance_expressions(call));
+            }
             "duration" => set_duration(&mut recipe, call, bindings),
             "eut" => set_eut(&mut recipe, call, bindings, project),
             "specialValue" => recipe.special_value = one_argument(call),
@@ -415,6 +437,13 @@ fn recognize_recipe(
         recipe.item_input_semantics.push(input);
     }
     Some(recipe)
+}
+
+fn chance_expressions(call: &JavaCall) -> Vec<JavaExpression> {
+    if let [JavaExpression::Array { elements, .. }] = call.argument_expressions.as_slice() {
+        return elements.clone();
+    }
+    call.argument_expressions.clone()
 }
 
 fn integrated_circuit_input(call: &JavaCall) -> Option<RecoveredExpression<ItemSemantic>> {

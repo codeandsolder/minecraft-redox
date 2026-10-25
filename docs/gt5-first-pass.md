@@ -263,9 +263,9 @@ A source census shows the `modifiers` bucket is itself highly skewed: `circuit(.
 GT5 encodes catalyst/configuration inputs by constructing an `ItemStack` with `stackSize == 0`. In particular, `GTRecipeBuilder.circuit(int)` calls `GTUtility.getIntegratedCircuit(config)`, which returns `ItemList.Circuit_Integrated.getWithDamage(0, config)`. Carrying that sentinel convention into the target engine would make a source-runtime accident part of the new recipe model, so target input IR now separates the amount required for matching from whether that amount is consumed:
 
 - `ItemInputStackSpec.amount` is the required count;
-- `ItemInputStackSpec.consumed` records whether successful execution removes it;
-- ordinary positive source stack sizes become `consumed: true`;
-- a GT source input with stack size zero becomes required amount 1 with `consumed: false`.
+- `ItemInputStackSpec.consumption_probability` records the probability that a matched input is removed;
+- ordinary positive source stack sizes default to exact probability 1;
+- a GT source input with stack size zero becomes required amount 1 with exact probability 0.
 
 This also makes `circuit(...)` ordinary target input semantics instead of an opaque recipe modifier. `itemInputsUnsafe(...)` is likewise no longer a modifier: the GT5 source differs only by allowing stack sizes greater than 64, while target quantities are already represented as `u64`.
 
@@ -294,3 +294,32 @@ Full GT5 result after this batch:
 The largest single gain is circuit normalization: before `itemInputsUnsafe` cleanup and registry-item/helper lowering, the circuit pass alone raised fully lowered recipes from 1,268 to 2,492 and collapsed modifier blockers from 2,496 to 286. `itemInputsUnsafe` then reduced modifier blockers to 178 without changing complete-recipe count, showing those recipes had independent blockers. Registry item lowering raised complete recipes to 2,807; receiver-aware linked helpers then reached 2,911.
 
 The next priority should be selected by blocker semantics rather than the old modifier count. Item inputs/outputs remain large, but metadata is now comparable in scale and contains real machine behavior (`COIL_HEAT`, `SCANNING`, research/fuel/casing requirements). Generic metadata must not be discarded merely to improve coverage. Output/input chance arrays are smaller but structurally clean core recipe semantics and are a good candidate for a dedicated target-IR pass after the next item-helper census.
+
+
+### Exact item consumption and production probabilities
+
+GT5's recipe chance arrays are now lowered as behavior rather than left as an opaque blocker. Source inspection confirms that GT uses an integer scale of 1–10,000 where 10,000 is 100%, but that source convention does not leak into core content. `minecraft-redox-core` now represents probabilities as exact reduced rationals (`Probability { numerator, denominator }`), so `2500/10000` becomes `1/4` and `1250/10000` becomes `1/8`.
+
+The target semantics distinguish matching from stochastic execution:
+
+- item inputs are always required for recipe matching; `consumption_probability` controls whether a matched quantity is consumed;
+- item outputs carry `production_probability`;
+- zero-stack GT catalyst/configuration inputs remain required amount 1 with consumption probability 0, regardless of a source chance entry;
+- absent chance arrays mean exact probability 1;
+- GT's runtime behavior for a chance array shorter than the final slot array is preserved by defaulting trailing entries to probability 1. This matters for the two corpus `inputChances(...)` recipes, which append an integrated circuit after setting the chance array;
+- dynamic, out-of-range, or oversized chance arrays remain fail-closed `chances` blockers.
+
+The only two direct `inputChances(...)` call sites in the current GT5 corpus each have one ordinary input plus a subsequently appended circuit, so GT's runtime merging of identical item-input types does not introduce a hidden correlation mismatch in the chance-bearing input corpus. There are 427 direct `outputChances(...)` sites. No direct `fluidInputChances(...)` or `fluidOutputChances(...)` call sites were found, so fluid probability IR is intentionally deferred until source evidence requires it.
+
+Full GT5 result after this pass:
+
+- target recipes lowered: **3,064 / 5,791 (52.91%)**, up from 2,911 / 5,791 (50.27%);
+- chance blockers: **50**, down from 418;
+- item-input blockers: **1,403**;
+- metadata blockers: **1,156**;
+- item-output blockers: **1,126**;
+- fluid blockers: **457**;
+- non-constant EU/t blockers: **417**;
+- modifier blockers: **178**.
+
+The remaining chance tail is now too small to justify chance-specific overfitting. The next pass should return to the large semantic blocker families: concrete item helpers/selectors and typed machine metadata.

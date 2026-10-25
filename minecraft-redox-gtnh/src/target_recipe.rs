@@ -2,7 +2,7 @@ use minecraft_redox_core::{
     SourceOrigin,
     content::{
         ContentId, ContentRecipe, FluidSelector, FluidStackSpec, ItemInputSpec, ItemInputStackSpec,
-        ItemSelector, ItemStackSpec,
+        ItemOutputSpec, ItemSelector, ItemStackSpec, Probability,
     },
 };
 use minecraft_redox_java::{JavaBindings, JavaExpression, JavaProjectIndex};
@@ -137,8 +137,7 @@ fn lower_recipe_internal(
         }
     };
 
-    let item_inputs = lower_inputs(recipe, bindings, project, &mut blockers);
-    let item_outputs = lower_outputs(recipe, bindings, project, &mut blockers);
+    let (item_inputs, item_outputs) = lower_item_io(recipe, bindings, project, &mut blockers);
     let fluid_inputs = lower_fluids(
         &recipe.fluid_input_semantics,
         bindings,
@@ -175,15 +174,36 @@ fn lower_recipe_internal(
     }))
 }
 
+fn lower_item_io(
+    recipe: &RecipeDefinition,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+    blockers: &mut Vec<RecipeLoweringBlocker>,
+) -> (Vec<ItemInputSpec>, Vec<ItemOutputSpec>) {
+    let input_probabilities = lower_chances(
+        &recipe.input_chance_expressions,
+        recipe.item_input_semantics.len(),
+        bindings,
+        project,
+        "input",
+        blockers,
+    );
+    let output_probabilities = lower_chances(
+        &recipe.output_chance_expressions,
+        recipe.item_output_semantics.len(),
+        bindings,
+        project,
+        "output",
+        blockers,
+    );
+    (
+        lower_inputs(recipe, &input_probabilities, bindings, project, blockers),
+        lower_outputs(recipe, &output_probabilities, bindings, project, blockers),
+    )
+}
+
 fn structural_blockers(recipe: &RecipeDefinition) -> Vec<RecipeLoweringBlocker> {
     let mut blockers = Vec::new();
-    if !recipe.input_chances.is_empty() || !recipe.output_chances.is_empty() {
-        push_blocker(
-            &mut blockers,
-            RecipeLoweringBlockerKind::Chances,
-            "item chances are not in target recipe IR v1",
-        );
-    }
     if !recipe.metadata.is_empty() {
         push_blocker(
             &mut blockers,
@@ -215,8 +235,63 @@ fn structural_blockers(recipe: &RecipeDefinition) -> Vec<RecipeLoweringBlocker> 
     blockers
 }
 
+fn lower_chances(
+    expressions: &[JavaExpression],
+    expected_slots: usize,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+    label: &str,
+    blockers: &mut Vec<RecipeLoweringBlocker>,
+) -> Vec<Probability> {
+    if expressions.is_empty() {
+        return vec![Probability::ONE; expected_slots];
+    }
+    if expressions.len() > expected_slots {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Chances,
+            format!(
+                "{label} chance count {} exceeds {expected_slots} slots",
+                expressions.len()
+            ),
+        );
+        return vec![Probability::ONE; expected_slots];
+    }
+
+    let mut probabilities: Vec<_> = expressions
+        .iter()
+        .enumerate()
+        .map(|(index, expression)| {
+            lower_gt_probability(expression, bindings, project).unwrap_or_else(|| {
+                push_blocker(
+                    blockers,
+                    RecipeLoweringBlockerKind::Chances,
+                    format!("{label} chance {index} is not a static GT probability"),
+                );
+                Probability::ONE
+            })
+        })
+        .collect();
+    probabilities.resize(expected_slots, Probability::ONE);
+    probabilities
+}
+
+fn lower_gt_probability(
+    expression: &JavaExpression,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+) -> Option<Probability> {
+    let value = project.map_or_else(
+        || literal_i64(expression),
+        |project| scalar_i64(expression, bindings, project),
+    )?;
+    let numerator = u64::try_from(value).ok()?;
+    Probability::new(numerator, 10_000)
+}
+
 fn lower_inputs(
     recipe: &RecipeDefinition,
+    probabilities: &[Probability],
     bindings: &JavaBindings,
     project: Option<&JavaProjectIndex>,
     blockers: &mut Vec<RecipeLoweringBlocker>,
@@ -224,10 +299,11 @@ fn lower_inputs(
     recipe
         .item_input_semantics
         .iter()
+        .zip(probabilities)
         .enumerate()
-        .filter_map(|(index, recovered)| {
+        .filter_map(|(index, (recovered, probability))| {
             lower_recovered_stack(recovered, bindings, project)
-                .map(input_stack_spec)
+                .map(|stack| input_stack_spec(stack, *probability))
                 .map(ItemInputSpec::Stack)
                 .or_else(|| {
                     push_blocker(
@@ -241,41 +317,51 @@ fn lower_inputs(
         .collect()
 }
 
-fn input_stack_spec(stack: ItemStackSpec) -> ItemInputStackSpec {
+fn input_stack_spec(
+    stack: ItemStackSpec,
+    consumption_probability: Probability,
+) -> ItemInputStackSpec {
     if stack.amount == 0 {
         ItemInputStackSpec {
             selector: stack.selector,
             amount: 1,
-            consumed: false,
+            consumption_probability: Probability::ZERO,
         }
     } else {
         ItemInputStackSpec {
             selector: stack.selector,
             amount: stack.amount,
-            consumed: true,
+            consumption_probability,
         }
     }
 }
 
 fn lower_outputs(
     recipe: &RecipeDefinition,
+    probabilities: &[Probability],
     bindings: &JavaBindings,
     project: Option<&JavaProjectIndex>,
     blockers: &mut Vec<RecipeLoweringBlocker>,
-) -> Vec<ItemStackSpec> {
+) -> Vec<ItemOutputSpec> {
     recipe
         .item_output_semantics
         .iter()
+        .zip(probabilities)
         .enumerate()
-        .filter_map(|(index, recovered)| {
-            lower_recovered_stack(recovered, bindings, project).or_else(|| {
-                push_blocker(
-                    blockers,
-                    RecipeLoweringBlockerKind::ItemOutput,
-                    format!("output {index}: {}", recovered.source),
-                );
-                None
-            })
+        .filter_map(|(index, (recovered, probability))| {
+            lower_recovered_stack(recovered, bindings, project)
+                .map(|stack| ItemOutputSpec {
+                    stack,
+                    production_probability: *probability,
+                })
+                .or_else(|| {
+                    push_blocker(
+                        blockers,
+                        RecipeLoweringBlockerKind::ItemOutput,
+                        format!("output {index}: {}", recovered.source),
+                    );
+                    None
+                })
         })
         .collect()
 }
@@ -717,7 +803,7 @@ fn push_blocker(
 
 #[cfg(test)]
 mod tests {
-    use minecraft_redox_core::content::{FluidSelector, ItemInputSpec, ItemSelector};
+    use minecraft_redox_core::content::{FluidSelector, ItemInputSpec, ItemSelector, Probability};
     use minecraft_redox_java::{JavaProjectIndex, analyze_source};
 
     use super::{RecipeLoweringBlockerKind, lower_recipe};
@@ -763,7 +849,7 @@ mod tests {
             return Err(anyhow::anyhow!("input was not a stack"));
         };
         assert_eq!(input.amount, 4);
-        assert!(input.consumed);
+        assert_eq!(input.consumption_probability, Probability::ONE);
         assert!(matches!(
             &input.selector,
             ItemSelector::MaterialForm { material, form }
@@ -771,9 +857,9 @@ mod tests {
                     && form.as_str() == "gregtech.api.enums.OrePrefixes.dust"
         ));
         assert_eq!(lowered.item_outputs.len(), 1);
-        assert_eq!(lowered.item_outputs[0].amount, 3);
+        assert_eq!(lowered.item_outputs[0].stack.amount, 3);
         assert!(matches!(
-            &lowered.item_outputs[0].selector,
+            &lowered.item_outputs[0].stack.selector,
             ItemSelector::Named { id, variant: None }
                 if id.as_str() == "net.minecraft.init.Blocks.netherrack"
         ));
@@ -812,23 +898,23 @@ mod tests {
             return Err(anyhow::anyhow!("material input was not a stack"));
         };
         assert_eq!(input.amount, 2);
-        assert!(input.consumed);
+        assert_eq!(input.consumption_probability, Probability::ONE);
         assert!(matches!(
             &input.selector,
             ItemSelector::MaterialForm { material, form }
                 if material.as_str() == "gregtech.api.enums.Materials.Iron"
                     && form.as_str() == "gregtech.api.enums.OrePrefixes.dust"
         ));
-        assert_eq!(lowered.item_outputs[0].amount, 3);
+        assert_eq!(lowered.item_outputs[0].stack.amount, 3);
         assert!(matches!(
-            &lowered.item_outputs[0].selector,
+            &lowered.item_outputs[0].stack.selector,
             ItemSelector::MaterialForm { material, form }
                 if material.as_str() == "bartworks.system.material.WerkstoffLoader.Example"
                     && form.as_str() == "gregtech.api.enums.OrePrefixes.plateDense"
         ));
-        assert_eq!(lowered.item_outputs[1].amount, 5);
+        assert_eq!(lowered.item_outputs[1].stack.amount, 5);
         assert!(matches!(
-            &lowered.item_outputs[1].selector,
+            &lowered.item_outputs[1].stack.selector,
             ItemSelector::MaterialForm { material, form }
                 if material.as_str() == "gtPlusPlus.core.material.MaterialsAlloy.INCONEL_792"
                     && form.as_str() == "gregtech.api.enums.OrePrefixes.wireGt04"
@@ -865,13 +951,13 @@ mod tests {
             return Err(anyhow::anyhow!("material input was not a stack"));
         };
         assert_eq!(material.amount, 128);
-        assert!(material.consumed);
+        assert_eq!(material.consumption_probability, Probability::ONE);
 
         let ItemInputSpec::Stack(circuit) = &lowered.item_inputs[1] else {
             return Err(anyhow::anyhow!("circuit input was not a stack"));
         };
         assert_eq!(circuit.amount, 1);
-        assert!(!circuit.consumed);
+        assert_eq!(circuit.consumption_probability, Probability::ZERO);
         assert!(matches!(
             &circuit.selector,
             ItemSelector::Named {
@@ -939,9 +1025,9 @@ mod tests {
                 if material.as_str() == "gregtech.api.enums.Materials.Iron"
                     && form.as_str() == "gregtech.api.enums.OrePrefixes.plateDense"
         ));
-        assert_eq!(lowered.item_outputs[0].amount, 3);
+        assert_eq!(lowered.item_outputs[0].stack.amount, 3);
         assert!(matches!(
-            &lowered.item_outputs[0].selector,
+            &lowered.item_outputs[0].stack.selector,
             ItemSelector::Named { id, variant: None }
                 if id.as_str() == "goodgenerator.util.ItemRefer.Radiation_Protection_Plate"
         ));
@@ -976,7 +1062,7 @@ mod tests {
             return Err(anyhow::anyhow!("mod input was not a stack"));
         };
         assert_eq!(input.amount, 1);
-        assert!(!input.consumed);
+        assert_eq!(input.consumption_probability, Probability::ZERO);
         assert!(matches!(
             &input.selector,
             ItemSelector::Named {
@@ -985,9 +1071,9 @@ mod tests {
             } if id.as_str() == "dreamcraft:MysteriousCrystalLens"
         ));
 
-        assert_eq!(lowered.item_outputs[0].amount, 2);
+        assert_eq!(lowered.item_outputs[0].stack.amount, 2);
         assert!(matches!(
-            &lowered.item_outputs[0].selector,
+            &lowered.item_outputs[0].stack.selector,
             ItemSelector::Named {
                 id,
                 variant: Some(1),
@@ -1027,6 +1113,112 @@ mod tests {
                 .blockers
                 .iter()
                 .any(|blocker| blocker.kind == RecipeLoweringBlockerKind::ItemInput)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn lowers_exact_item_consumption_and_production_probabilities() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .circuit(7)
+                    .itemInputs(Materials.Iron.getDust(2))
+                    .inputChances(25 * 100, 75 * 100)
+                    .itemOutputs(Materials.Steel.getDust(3))
+                    .outputChances(12_50)
+                    .duration(20)
+                    .eut(2)
+                    .addTo(compressorRecipes);
+            }}
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let recovery = recover(&analysis);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let lowered = lower_recipe(recipe, &analysis.bindings)
+            .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
+
+        let ItemInputSpec::Stack(dust) = &lowered.item_inputs[0] else {
+            return Err(anyhow::anyhow!("dust input was not a stack"));
+        };
+        assert_eq!(
+            dust.consumption_probability,
+            Probability::new(1, 4).ok_or_else(|| anyhow::anyhow!("invalid probability"))?
+        );
+
+        let ItemInputSpec::Stack(circuit) = &lowered.item_inputs[1] else {
+            return Err(anyhow::anyhow!("circuit input was not a stack"));
+        };
+        assert_eq!(circuit.consumption_probability, Probability::ZERO);
+
+        let output = lowered
+            .item_outputs
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("output missing"))?;
+        assert_eq!(
+            output.production_probability,
+            Probability::new(1, 8).ok_or_else(|| anyhow::anyhow!("invalid probability"))?
+        );
+        assert_eq!(output.stack.amount, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn blocks_dynamic_probabilities_and_defaults_missing_trailing_entries() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            class Recipes {
+                void dynamic(int chance) {
+                    GTValues.RA.stdBuilder()
+                        .itemInputs(Materials.Iron.getDust(1))
+                        .itemOutputs(Materials.Steel.getDust(1))
+                        .outputChances(chance)
+                        .duration(20)
+                        .eut(2)
+                        .addTo(compressorRecipes);
+                }
+                void shortArray() {
+                    GTValues.RA.stdBuilder()
+                        .itemInputs(Materials.Iron.getDust(1))
+                        .itemOutputs(Materials.Steel.getDust(1), Materials.Copper.getDust(1))
+                        .outputChances(5000)
+                        .duration(20)
+                        .eut(2)
+                        .addTo(compressorRecipes);
+                }
+            }
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let recovery = recover(&analysis);
+        assert_eq!(recovery.recipes.len(), 2);
+
+        let Err(failure) = lower_recipe(&recovery.recipes[0], &analysis.bindings) else {
+            return Err(anyhow::anyhow!("dynamic probability unexpectedly lowered"));
+        };
+        assert!(
+            failure
+                .blockers
+                .iter()
+                .any(|blocker| blocker.kind == RecipeLoweringBlockerKind::Chances)
+        );
+
+        let lowered = lower_recipe(&recovery.recipes[1], &analysis.bindings)
+            .map_err(|failure| anyhow::anyhow!("short chance array failed: {failure:?}"))?;
+        assert_eq!(
+            lowered.item_outputs[0].production_probability,
+            Probability::new(1, 2).ok_or_else(|| anyhow::anyhow!("invalid probability"))?
+        );
+        assert_eq!(
+            lowered.item_outputs[1].production_probability,
+            Probability::ONE
         );
         Ok(())
     }
