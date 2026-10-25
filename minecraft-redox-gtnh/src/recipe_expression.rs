@@ -666,7 +666,13 @@ fn is_material_item_accessor(method: &str) -> bool {
 fn is_fluid_accessor(method: &str) -> bool {
     matches!(
         method,
-        "getFluid" | "getGas" | "getMolten" | "getPlasma" | "getFluidOrGas" | "getFluidStack"
+        "getFluid"
+            | "getGas"
+            | "getMolten"
+            | "getPlasma"
+            | "getFluidOrGas"
+            | "getFluidStack"
+            | "getSolid"
     )
 }
 
@@ -815,7 +821,7 @@ mod tests {
                     GTOreDictUnificator.get(OrePrefixes.dust, Materials.Netherrack, 4),
                     ItemList.Cell_Water.get(1),
                     new ItemStack(Blocks.dirt, 2, 3));
-                builder.fluidInputs(Materials.Water.getFluid(1_000));
+                builder.fluidInputs(Materials.Water.getFluid(1_000), Materials.Ice.getSolid(250));
             }}
         ";
         let analysis = analyze_source("R.java", "gt5", None, source)?;
@@ -845,9 +851,14 @@ mod tests {
             &fluids.argument_expressions,
             &analysis.bindings,
         );
+        assert_eq!(recovered.len(), 2);
         assert!(matches!(
             recovered[0].semantic,
             Some(FluidSemantic::FluidAccessor { .. })
+        ));
+        assert!(matches!(
+            recovered[1].semantic.as_ref(),
+            Some(FluidSemantic::FluidAccessor { accessor, .. }) if accessor == "getSolid"
         ));
         Ok(())
     }

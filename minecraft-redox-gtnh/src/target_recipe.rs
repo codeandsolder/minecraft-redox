@@ -137,8 +137,8 @@ fn lower_recipe_internal(
         }
     };
 
-    let item_inputs = lower_inputs(recipe, bindings, &mut blockers);
-    let item_outputs = lower_outputs(recipe, bindings, &mut blockers);
+    let item_inputs = lower_inputs(recipe, bindings, project, &mut blockers);
+    let item_outputs = lower_outputs(recipe, bindings, project, &mut blockers);
     let fluid_inputs = lower_fluids(
         &recipe.fluid_input_semantics,
         bindings,
@@ -218,6 +218,7 @@ fn structural_blockers(recipe: &RecipeDefinition) -> Vec<RecipeLoweringBlocker> 
 fn lower_inputs(
     recipe: &RecipeDefinition,
     bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
     blockers: &mut Vec<RecipeLoweringBlocker>,
 ) -> Vec<ItemInputSpec> {
     recipe
@@ -225,7 +226,7 @@ fn lower_inputs(
         .iter()
         .enumerate()
         .filter_map(|(index, recovered)| {
-            lower_recovered_stack(recovered, bindings)
+            lower_recovered_stack(recovered, bindings, project)
                 .map(ItemInputSpec::Stack)
                 .or_else(|| {
                     push_blocker(
@@ -242,6 +243,7 @@ fn lower_inputs(
 fn lower_outputs(
     recipe: &RecipeDefinition,
     bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
     blockers: &mut Vec<RecipeLoweringBlocker>,
 ) -> Vec<ItemStackSpec> {
     recipe
@@ -249,7 +251,7 @@ fn lower_outputs(
         .iter()
         .enumerate()
         .filter_map(|(index, recovered)| {
-            lower_recovered_stack(recovered, bindings).or_else(|| {
+            lower_recovered_stack(recovered, bindings, project).or_else(|| {
                 push_blocker(
                     blockers,
                     RecipeLoweringBlockerKind::ItemOutput,
@@ -264,11 +266,16 @@ fn lower_outputs(
 fn lower_recovered_stack(
     recovered: &RecoveredExpression<ItemSemantic>,
     bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
 ) -> Option<ItemStackSpec> {
-    lower_item_semantic(recovered.semantic.as_ref()?, bindings)
+    lower_item_semantic(recovered.semantic.as_ref()?, bindings, project)
 }
 
-fn lower_item_semantic(semantic: &ItemSemantic, bindings: &JavaBindings) -> Option<ItemStackSpec> {
+fn lower_item_semantic(
+    semantic: &ItemSemantic,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+) -> Option<ItemStackSpec> {
     match semantic {
         ItemSemantic::OreDict {
             prefix,
@@ -279,18 +286,25 @@ fn lower_item_semantic(semantic: &ItemSemantic, bindings: &JavaBindings) -> Opti
                 material: ContentId::new(resolved_reference_name(material, bindings)?),
                 form: ContentId::new(prefix.clone()),
             },
-            amount: amount_u64(amount)?,
+            amount: scalar_amount_u64(amount, bindings, project)?,
         }),
         ItemSemantic::OreDictQuery { key, amount } => Some(ItemStackSpec {
             selector: ItemSelector::OreKey {
                 key: ContentId::new(simple_string_literal(key)?),
             },
-            amount: amount_u64(amount)?,
+            amount: scalar_amount_u64(amount, bindings, project)?,
         }),
+        ItemSemantic::MaterialItem {
+            material,
+            accessor,
+            arguments,
+        } => lower_material_item(material, accessor, arguments, bindings, project),
         ItemSemantic::OreDictUnify {
             inner: Some(inner), ..
         }
-        | ItemSemantic::InlinedMethod { result: inner, .. } => lower_item_semantic(inner, bindings),
+        | ItemSemantic::InlinedMethod { result: inner, .. } => {
+            lower_item_semantic(inner, bindings, project)
+        }
         ItemSemantic::ItemList {
             item,
             accessor,
@@ -300,17 +314,21 @@ fn lower_item_semantic(semantic: &ItemSemantic, bindings: &JavaBindings) -> Opti
                 id: ContentId::new(item.clone()),
                 variant: None,
             },
-            amount: arguments.first().map_or(Some(1), amount_u64)?,
+            amount: arguments.first().map_or(Some(1), |amount| {
+                scalar_amount_u64(amount, bindings, project)
+            })?,
         }),
         ItemSemantic::ItemStack { item, amount, meta } => Some(ItemStackSpec {
             selector: ItemSelector::Named {
                 id: ContentId::new(resolved_reference_name(item, bindings)?),
                 variant: match meta.as_ref() {
                     None => None,
-                    Some(meta) => Some(literal_i64(meta)?),
+                    Some(meta) => Some(scalar_i64_optional(meta, bindings, project)?),
                 },
             },
-            amount: amount.as_ref().map_or(Some(1), amount_u64)?,
+            amount: amount.as_ref().map_or(Some(1), |amount| {
+                scalar_amount_u64(amount, bindings, project)
+            })?,
         }),
         ItemSemantic::CopyAmount {
             amount,
@@ -318,18 +336,111 @@ fn lower_item_semantic(semantic: &ItemSemantic, bindings: &JavaBindings) -> Opti
             inner: Some(inner),
             ..
         } => {
-            let mut stack = lower_item_semantic(inner, bindings)?;
-            stack.amount = amount_u64(amount)?;
+            let mut stack = lower_item_semantic(inner, bindings, project)?;
+            stack.amount = scalar_amount_u64(amount, bindings, project)?;
             Some(stack)
         }
         ItemSemantic::OreDictStack { arguments } => Some(ItemStackSpec {
             selector: ItemSelector::OreKey {
                 key: ContentId::new(simple_string_literal(arguments.first()?)?),
             },
-            amount: arguments.get(1).map_or(Some(1), amount_u64)?,
+            amount: arguments.get(1).map_or(Some(1), |amount| {
+                scalar_amount_u64(amount, bindings, project)
+            })?,
         }),
         _ => None,
     }
+}
+
+fn lower_material_item(
+    material: &str,
+    accessor: &str,
+    arguments: &[JavaExpression],
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+) -> Option<ItemStackSpec> {
+    let (form, amount) = if matches!(accessor, "get" | "getPart" | "getComponentByPrefix") {
+        let form = resolved_reference_name(arguments.first()?, bindings)?;
+        if !form.contains("OrePrefixes.") {
+            return None;
+        }
+        let amount = arguments.get(1).map_or(Some(1), |amount| {
+            scalar_amount_u64(amount, bindings, project)
+        })?;
+        (form, amount)
+    } else {
+        let form = material_accessor_form(accessor)?;
+        let amount = arguments.first().map_or(Some(1), |amount| {
+            scalar_amount_u64(amount, bindings, project)
+        })?;
+        (format!("gregtech.api.enums.OrePrefixes.{form}"), amount)
+    };
+    Some(ItemStackSpec {
+        selector: ItemSelector::MaterialForm {
+            material: ContentId::new(material.to_owned()),
+            form: ContentId::new(form),
+        },
+        amount,
+    })
+}
+
+fn material_accessor_form(accessor: &str) -> Option<&'static str> {
+    match accessor {
+        "getDust" => Some("dust"),
+        "getDustSmall" | "getSmallDust" => Some("dustSmall"),
+        "getDustTiny" | "getTinyDust" => Some("dustTiny"),
+        "getCell" | "getCells" => Some("cell"),
+        "getPlate" | "getPlates" => Some("plate"),
+        "getPlateDouble" => Some("plateDouble"),
+        "getPlateDense" => Some("plateDense"),
+        "getPlateSuperdense" => Some("plateSuperdense"),
+        "getScrew" => Some("screw"),
+        "getGear" => Some("gearGt"),
+        "getGearSmall" => Some("gearGtSmall"),
+        "getNanite" => Some("nanite"),
+        "getFrameBox" => Some("frameGt"),
+        "getBolt" => Some("bolt"),
+        "getRod" => Some("stick"),
+        "getLongRod" => Some("stickLong"),
+        "getBlock" | "getBlocks" => Some("block"),
+        "getGem" | "getGems" => Some("gem"),
+        "getFineWire" => Some("wireFine"),
+        "getRotor" => Some("rotor"),
+        "getRing" => Some("ring"),
+        "getIngot" | "getIngots" => Some("ingot"),
+        "getOre" => Some("ore"),
+        "getHotIngot" => Some("ingotHot"),
+        "getNugget" | "getNuggets" => Some("nugget"),
+        "getFoil" => Some("foil"),
+        "getWire01" => Some("wireGt01"),
+        "getWire02" => Some("wireGt02"),
+        "getWire04" => Some("wireGt04"),
+        "getWire08" => Some("wireGt08"),
+        "getWire12" => Some("wireGt12"),
+        "getWire16" => Some("wireGt16"),
+        "getCable01" => Some("cableGt01"),
+        "getCable02" => Some("cableGt02"),
+        "getCable04" => Some("cableGt04"),
+        "getCable08" => Some("cableGt08"),
+        "getCable12" => Some("cableGt12"),
+        "getCable16" => Some("cableGt16"),
+        "getCrushed" => Some("crushed"),
+        "getCrushedPurified" => Some("crushedPurified"),
+        "getCrushedCentrifuged" => Some("crushedCentrifuged"),
+        "getPlasmaCell" => Some("cellPlasma"),
+        _ => None,
+    }
+}
+
+fn scalar_i64_optional(
+    expression: &JavaExpression,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+) -> Option<i64> {
+    project.map_or_else(
+        || literal_i64(expression),
+        |project| scalar_i64(expression, bindings, project),
+    )
 }
 
 fn lower_fluids(
@@ -400,6 +511,7 @@ fn lower_fluid_semantic(
 fn fluid_form(accessor: &str) -> Option<&'static str> {
     match accessor {
         "getFluid" | "getFluidStack" => Some("fluid"),
+        "getSolid" => Some("solid"),
         "getMolten" => Some("molten"),
         "getGas" => Some("gas"),
         "getFluidOrGas" => Some("fluid_or_gas"),
@@ -418,10 +530,6 @@ fn scalar_amount_u64(
         |project| scalar_i64(expression, bindings, project),
     )?;
     u64::try_from(value).ok()
-}
-
-fn amount_u64(expression: &JavaExpression) -> Option<u64> {
-    u64::try_from(literal_i64(expression)?).ok()
 }
 
 fn simple_string_literal(expression: &JavaExpression) -> Option<String> {
@@ -508,6 +616,61 @@ mod tests {
     }
 
     #[test]
+    fn lowers_material_item_accessors_to_ore_forms() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            import gregtech.api.enums.OrePrefixes;
+            import bartworks.system.material.WerkstoffLoader;
+            import gtPlusPlus.core.material.MaterialsAlloy;
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .itemInputs(Materials.Iron.getDust(2))
+                    .itemOutputs(
+                        WerkstoffLoader.Example.get(OrePrefixes.plateDense, 3),
+                        MaterialsAlloy.INCONEL_792.getComponentByPrefix(OrePrefixes.wireGt04, 5))
+                    .duration(20)
+                    .eut(2)
+                    .addTo(compressorRecipes);
+            }}
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let recovery = recover(&analysis);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let lowered = lower_recipe(recipe, &analysis.bindings)
+            .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
+        let ItemInputSpec::Stack(input) = &lowered.item_inputs[0] else {
+            return Err(anyhow::anyhow!("material input was not a stack"));
+        };
+        assert_eq!(input.amount, 2);
+        assert!(matches!(
+            &input.selector,
+            ItemSelector::MaterialForm { material, form }
+                if material.as_str() == "gregtech.api.enums.Materials.Iron"
+                    && form.as_str() == "gregtech.api.enums.OrePrefixes.dust"
+        ));
+        assert_eq!(lowered.item_outputs[0].amount, 3);
+        assert!(matches!(
+            &lowered.item_outputs[0].selector,
+            ItemSelector::MaterialForm { material, form }
+                if material.as_str() == "bartworks.system.material.WerkstoffLoader.Example"
+                    && form.as_str() == "gregtech.api.enums.OrePrefixes.plateDense"
+        ));
+        assert_eq!(lowered.item_outputs[1].amount, 5);
+        assert!(matches!(
+            &lowered.item_outputs[1].selector,
+            ItemSelector::MaterialForm { material, form }
+                if material.as_str() == "gtPlusPlus.core.material.MaterialsAlloy.INCONEL_792"
+                    && form.as_str() == "gregtech.api.enums.OrePrefixes.wireGt04"
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn lowers_material_and_registry_fluids_with_project_amounts() -> anyhow::Result<()> {
         let constants = analyze_source(
             "GTRecipeBuilder.java",
@@ -527,7 +690,9 @@ mod tests {
             class Recipes { void run() {
                 GTValues.RA.stdBuilder()
                     .fluidInputs(Materials.Iron.getMolten(2 * INGOTS))
-                    .fluidOutputs(FluidRegistry.getFluidStack("steam", 1_000))
+                    .fluidOutputs(
+                        FluidRegistry.getFluidStack("steam", 1_000),
+                        Materials.Ice.getSolid(2 * INGOTS))
                     .duration(20)
                     .eut(2)
                     .addTo(compressorRecipes);
@@ -552,11 +717,18 @@ mod tests {
                 if material.as_str() == "gregtech.api.enums.Materials.Iron"
                     && form.as_str() == "molten"
         ));
-        assert_eq!(lowered.fluid_outputs.len(), 1);
+        assert_eq!(lowered.fluid_outputs.len(), 2);
         assert_eq!(lowered.fluid_outputs[0].amount, 1_000);
         assert!(matches!(
             &lowered.fluid_outputs[0].selector,
             FluidSelector::Named { id } if id.as_str() == "steam"
+        ));
+        assert_eq!(lowered.fluid_outputs[1].amount, 288);
+        assert!(matches!(
+            &lowered.fluid_outputs[1].selector,
+            FluidSelector::MaterialForm { material, form }
+                if material.as_str() == "gregtech.api.enums.Materials.Ice"
+                    && form.as_str() == "solid"
         ));
         Ok(())
     }

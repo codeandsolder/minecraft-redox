@@ -240,3 +240,20 @@ Full GT5 result:
 - debug full-corpus scan after the change: **16.03 s**, ~594% CPU, ~246 MiB RSS on Acer.
 
 The dominant remaining target-content blockers are now item inputs (2,992 recipes), modifiers (2,496), item outputs (2,379), and metadata (1,156). The largest directly understood item family not yet represented in target lowering is material-item access (`MaterialItem`), so item selector normalization is the next content milestone.
+
+### Material item target lowering
+
+Material-backed item accessors now lower to the same source-independent `ItemSelector::MaterialForm` representation used by ore-dictionary forms. Amounts and item metadata use the project scalar evaluator, so statically provable constants no longer block item lowering merely because they are not literals.
+
+The adapter maps only source-backed accessor families. In addition to direct `get(prefix, amount)`, `getPart(...)`, and `getComponentByPrefix(...)`, the GT/GT++ material helpers cover dusts, plates, gears, rods, rings, wires/cables, ores, cells, ingots, nuggets and the other concrete `OrePrefixes` wrappers present in the source. `Materials.getSolid(...)` was corrected to remain a fluid accessor; GT5 defines it as returning `FluidStack`, so treating every material `get*` call as an item accessor would have been unsound.
+
+Full GT5 result after this pass:
+
+- target recipes lowered: **1,268 / 5,791 (21.90%)**, up from 886;
+- item-input blockers: **1,945**, down from 2,992;
+- item-output blockers: **1,500**, down from 2,379;
+- fluid blockers: **457**, down from 460 after recognizing `getSolid`;
+- direct fluid semantics: **6,294 / 6,582**;
+- modifiers are now the largest blocker family at **2,496**, followed by item inputs (1,945), item outputs (1,500), metadata (1,156), fluids (457), chances (418), and non-constant EU/t (417).
+
+A source census shows the `modifiers` bucket is itself highly skewed: `circuit(...)` accounts for 2,312 call sites, while the remaining modifier methods are individually small. GT5's `GTRecipeBuilder.circuit(int)` materializes `GTUtility.getIntegratedCircuit(config)` into the item-input array, so it should be lowered as explicit recipe-input semantics rather than preserved as a generic opaque modifier. That is the next high-leverage target step.
