@@ -422,8 +422,9 @@ fn lower_metadata(
             if let Some(kelvin) = lower_coil_heat(call, value, bindings, project, blockers) {
                 minimum_heat_kelvin = Some(kelvin);
             }
-        } else if let Some(capability) = casing_capability(&key) {
-            if let Some(level) = lower_casing_requirement(call, value, bindings, project, blockers)
+        } else if let Some(capability) = minimum_capability_metadata(&key) {
+            if let Some(level) =
+                lower_capability_requirement(recipe, call, &key, value, bindings, project, blockers)
             {
                 minimum_capabilities.insert(capability, level);
             }
@@ -686,25 +687,48 @@ fn capture_assembly_line_research<'a>(
     }
 }
 
-fn lower_casing_requirement(
+fn lower_capability_requirement(
+    recipe: &RecipeDefinition,
     call: &crate::BuilderCall,
+    key: &str,
     value: &JavaExpression,
     bindings: &JavaBindings,
     project: Option<&JavaProjectIndex>,
     blockers: &mut Vec<RecipeLoweringBlocker>,
 ) -> Option<u64> {
-    let level = lower_nonnegative_scalar(value, bindings, project);
-    if level.is_none() {
+    let Some(level) = lower_nonnegative_scalar(value, bindings, project) else {
         push_blocker(
             blockers,
             RecipeLoweringBlockerKind::Metadata,
             format!(
-                "casing requirement is not a static non-negative capability level: {}",
+                "machine capability requirement is not a static non-negative level: {}",
                 call.arguments.join(", ")
             ),
         );
+        return None;
+    };
+    if key == "gregtech.api.util.GTRecipeConstants.COMPRESSION_TIER" {
+        if recipe.recipe_map != "gregtech.api.recipe.RecipeMaps.compressorRecipes" {
+            push_blocker(
+                blockers,
+                RecipeLoweringBlockerKind::Metadata,
+                format!(
+                    "COMPRESSION_TIER used on unsupported recipe map {}",
+                    recipe.recipe_map
+                ),
+            );
+            return None;
+        }
+        if !(1..=2).contains(&level) {
+            push_blocker(
+                blockers,
+                RecipeLoweringBlockerKind::Metadata,
+                format!("COMPRESSION_TIER must be 1 (HIP) or 2 (black hole), got {level}"),
+            );
+            return None;
+        }
     }
-    level
+    Some(level)
 }
 
 fn lower_fusion_startup_energy(
@@ -1187,7 +1211,7 @@ fn lower_metadata_item(
     lower_item_semantic(recovered.first()?.semantic.as_ref()?, bindings, project)
 }
 
-fn casing_capability(key: &str) -> Option<ContentId> {
+fn minimum_capability_metadata(key: &str) -> Option<ContentId> {
     let capability = match key {
         "gregtech.api.util.GTRecipeConstants.COAL_CASING_TIER" => {
             "machine_capability.component_assembly_line_casing"
@@ -1206,6 +1230,9 @@ fn casing_capability(key: &str) -> Option<ContentId> {
         }
         "gregtech.api.util.GTRecipeConstants.NFR_COIL_TIER" => {
             "machine_capability.naquadah_fuel_refine_coil"
+        }
+        "gregtech.api.util.GTRecipeConstants.COMPRESSION_TIER" => {
+            "machine_capability.advanced_compression"
         }
         _ => return None,
     };
@@ -3153,6 +3180,98 @@ mod tests {
                     capability: minecraft_redox_core::content::ContentId::new(capability),
                     level,
                 }]
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn lowers_compression_tier_as_minimum_advanced_compression() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+            import static gregtech.api.util.GTRecipeConstants.COMPRESSION_TIER;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            class Recipes {
+                void hip() {
+                    GTValues.RA.stdBuilder()
+                        .itemInputs(Materials.Iron.getPlates(64))
+                        .itemOutputs(Materials.Iron.getPlateSuperdense(1))
+                        .metadata(COMPRESSION_TIER, 1)
+                        .duration(20).eut(2).addTo(compressorRecipes);
+                }
+                void blackHole() {
+                    GTValues.RA.stdBuilder()
+                        .itemInputs(Materials.Steel.getPlates(64))
+                        .itemOutputs(Materials.Steel.getPlateSuperdense(1))
+                        .metadata(COMPRESSION_TIER, 2)
+                        .duration(20).eut(2).addTo(compressorRecipes);
+                }
+            }
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let recovery = recover(&analysis);
+        assert_eq!(recovery.recipes.len(), 2);
+        for (recipe, level) in recovery.recipes.iter().zip([1, 2]) {
+            let lowered = lower_recipe(recipe, &analysis.bindings)
+                .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
+            assert_eq!(
+                lowered.requirements,
+                [RecipeRequirement::MinimumCapability {
+                    capability: minecraft_redox_core::content::ContentId::new(
+                        "machine_capability.advanced_compression"
+                    ),
+                    level,
+                }]
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_compression_tier_stays_fail_closed() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+            import static gregtech.api.recipe.RecipeMaps.maceratorRecipes;
+            import static gregtech.api.util.GTRecipeConstants.COMPRESSION_TIER;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            class Recipes {
+                void invalidValue() {
+                    GTValues.RA.stdBuilder()
+                        .itemInputs(Materials.Iron.getDust(1))
+                        .itemOutputs(Materials.Steel.getDust(1))
+                        .metadata(COMPRESSION_TIER, 3)
+                        .duration(20).eut(2).addTo(compressorRecipes);
+                }
+                void wrongMap() {
+                    GTValues.RA.stdBuilder()
+                        .itemInputs(Materials.Iron.getDust(1))
+                        .itemOutputs(Materials.Steel.getDust(1))
+                        .metadata(COMPRESSION_TIER, 1)
+                        .duration(20).eut(2).addTo(maceratorRecipes);
+                }
+                void dynamic(int tier) {
+                    GTValues.RA.stdBuilder()
+                        .itemInputs(Materials.Iron.getDust(1))
+                        .itemOutputs(Materials.Steel.getDust(1))
+                        .metadata(COMPRESSION_TIER, tier)
+                        .duration(20).eut(2).addTo(compressorRecipes);
+                }
+            }
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let recovery = recover(&analysis);
+        assert_eq!(recovery.recipes.len(), 3);
+        for recipe in &recovery.recipes {
+            let failure = lower_recipe(recipe, &analysis.bindings)
+                .err()
+                .ok_or_else(|| anyhow::anyhow!("invalid compression requirement lowered"))?;
+            assert!(
+                failure
+                    .blockers
+                    .iter()
+                    .any(|blocker| blocker.kind == RecipeLoweringBlockerKind::Metadata)
             );
         }
         Ok(())

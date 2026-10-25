@@ -671,3 +671,26 @@ Full GT5 result after this pass:
 - chance blockers: **50**.
 
 This removes all 52 `RECYCLE` metadata blockers and adds 49 fully lowered recipes. The remaining three overlap independent unresolved semantics rather than synthetic arc-furnace behavior.
+
+### Advanced compression as a monotonic machine capability
+
+`GTRecipeConstants.COMPRESSION_TIER` now lowers to the generic target machine-capability requirement `machine_capability.advanced_compression`. Source inspection establishes the intended capability ladder: tier 1 is HIP compression and tier 2 is stabilized-black-hole compression. Ordinary/steam/industrial/neutronium compressors reject any advanced-compression recipe; the HIP compressor accepts tier 1 and rejects tier 2; the Black Hole Compressor accepts tier 2 and also distinguishes lower-tier recipes only for its own parallelism policy. That makes the recipe-side fact monotonic even though individual machines apply additional runtime behavior.
+
+The importer accepts this metadata only on `RecipeMaps.compressorRecipes` and only for source-defined levels 1 or 2. Tier 3, use on another recipe map, and dynamically unresolved values remain fail-closed. Existing casing/tier metadata lowering was refactored from casing-specific helpers into generic minimum-capability helpers so compression does not become an ad-hoc exception.
+
+The pinned corpus has 11 direct `COMPRESSION_TIER` annotations. Eight use static tier 1/2 values and lower now; three generator sites compute tier 1/2 from material properties through local variables and remain blocked until scalar provenance can recover those expressions generally.
+
+Full GT5 result after this pass:
+
+- target recipes lowered: **3,846 / 5,791 (66.41%)**, up from 3,840 / 5,791 (66.31%);
+- metadata blockers: **412**, down from 420;
+- modifier blockers: **6**;
+- item-input blockers: **1,218**;
+- item-output blockers: **961**;
+- fluid blockers: **457**;
+- non-constant EU/t blockers: **417**;
+- missing-duration blockers: **332**;
+- missing-EU/t blockers: **24**;
+- chance blockers: **50**.
+
+This adds six fully lowered recipes. The two other newly understood static annotations overlap independent blockers; the three material-derived cases are intentionally left for a general scalar-dataflow pass.
