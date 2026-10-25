@@ -2,7 +2,7 @@ use minecraft_redox_core::{
     SourceOrigin,
     content::{
         ContentId, ContentRecipe, FluidSelector, FluidStackSpec, ItemInputSpec, ItemInputStackSpec,
-        ItemOutputSpec, ItemSelector, ItemStackSpec, Probability,
+        ItemOutputSpec, ItemSelector, ItemStackSpec, Probability, RecipeRequirement,
     },
 };
 use minecraft_redox_java::{JavaBindings, JavaExpression, JavaProjectIndex};
@@ -90,6 +90,7 @@ fn lower_recipe_internal(
     project: Option<&JavaProjectIndex>,
 ) -> Result<ContentRecipe, Box<RecipeLoweringFailure>> {
     let mut blockers = structural_blockers(recipe);
+    let requirements = lower_metadata(recipe, bindings, project, &mut blockers);
 
     let duration_ticks = match recipe.duration_ticks {
         None => {
@@ -163,6 +164,7 @@ fn lower_recipe_internal(
             item_outputs,
             fluid_inputs,
             fluid_outputs,
+            requirements,
             duration_ticks,
             eut,
         });
@@ -204,13 +206,6 @@ fn lower_item_io(
 
 fn structural_blockers(recipe: &RecipeDefinition) -> Vec<RecipeLoweringBlocker> {
     let mut blockers = Vec::new();
-    if !recipe.metadata.is_empty() {
-        push_blocker(
-            &mut blockers,
-            RecipeLoweringBlockerKind::Metadata,
-            "recipe metadata is not in target recipe IR v1",
-        );
-    }
     if !recipe.modifiers.is_empty() {
         push_blocker(
             &mut blockers,
@@ -233,6 +228,86 @@ fn structural_blockers(recipe: &RecipeDefinition) -> Vec<RecipeLoweringBlocker> 
         );
     }
     blockers
+}
+
+fn lower_metadata(
+    recipe: &RecipeDefinition,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+    blockers: &mut Vec<RecipeLoweringBlocker>,
+) -> Vec<RecipeRequirement> {
+    let mut minimum_heat_kelvin = None;
+
+    for call in &recipe.metadata {
+        if call.name != "metadata" {
+            push_blocker(
+                blockers,
+                RecipeLoweringBlockerKind::Metadata,
+                format!("unsupported recipe metadata call: {}", call.name),
+            );
+            continue;
+        }
+
+        let [key, value] = call.argument_expressions.as_slice() else {
+            push_blocker(
+                blockers,
+                RecipeLoweringBlockerKind::Metadata,
+                format!(
+                    "metadata call does not have key/value arguments: {:?}",
+                    call.arguments
+                ),
+            );
+            continue;
+        };
+
+        let Some(key) = resolved_reference_name(key, bindings) else {
+            push_blocker(
+                blockers,
+                RecipeLoweringBlockerKind::Metadata,
+                format!(
+                    "metadata key is not statically identifiable: {}",
+                    call.arguments.join(", ")
+                ),
+            );
+            continue;
+        };
+
+        if key == "gregtech.api.util.GTRecipeConstants.COIL_HEAT" {
+            match lower_nonnegative_scalar(value, bindings, project) {
+                Some(kelvin) => minimum_heat_kelvin = Some(kelvin),
+                None => push_blocker(
+                    blockers,
+                    RecipeLoweringBlockerKind::Metadata,
+                    format!(
+                        "COIL_HEAT is not a static non-negative Kelvin value: {}",
+                        call.arguments.join(", ")
+                    ),
+                ),
+            }
+        } else {
+            push_blocker(
+                blockers,
+                RecipeLoweringBlockerKind::Metadata,
+                format!("unsupported recipe metadata key: {key}"),
+            );
+        }
+    }
+
+    minimum_heat_kelvin
+        .map(|kelvin| vec![RecipeRequirement::MinimumHeat { kelvin }])
+        .unwrap_or_default()
+}
+
+fn lower_nonnegative_scalar(
+    expression: &JavaExpression,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+) -> Option<u64> {
+    let value = project.map_or_else(
+        || literal_i64(expression),
+        |project| scalar_i64(expression, bindings, project),
+    )?;
+    u64::try_from(value).ok()
 }
 
 fn lower_chances(
@@ -803,11 +878,13 @@ fn push_blocker(
 
 #[cfg(test)]
 mod tests {
-    use minecraft_redox_core::content::{FluidSelector, ItemInputSpec, ItemSelector, Probability};
+    use minecraft_redox_core::content::{
+        FluidSelector, ItemInputSpec, ItemSelector, Probability, RecipeRequirement,
+    };
     use minecraft_redox_java::{JavaProjectIndex, analyze_source};
 
-    use super::{RecipeLoweringBlockerKind, lower_recipe};
-    use crate::recover;
+    use super::{RecipeLoweringBlockerKind, lower_recipe, lower_recipe_with_project};
+    use crate::{recover, recover_with_project};
 
     #[test]
     fn lowers_literal_compressor_recipe() -> anyhow::Result<()> {
@@ -1113,6 +1190,111 @@ mod tests {
                 .blockers
                 .iter()
                 .any(|blocker| blocker.kind == RecipeLoweringBlockerKind::ItemInput)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn lowers_coil_heat_as_minimum_process_heat_kelvin() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+            import static gregtech.api.util.GTRecipeConstants.COIL_HEAT;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            class Recipes {
+                static final int BASE_HEAT = 1800;
+                void run() {
+                    GTValues.RA.stdBuilder()
+                        .itemInputs(Materials.Iron.getDust(1))
+                        .itemOutputs(Materials.Steel.getDust(1))
+                        .metadata(COIL_HEAT, Recipes.BASE_HEAT + 100)
+                        .duration(20)
+                        .eut(2)
+                        .addTo(compressorRecipes);
+                }
+            }
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let mut project = JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let recovery = recover_with_project(&analysis, &project);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let lowered = lower_recipe_with_project(recipe, &analysis.bindings, &project)
+            .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
+        assert_eq!(
+            lowered.requirements,
+            [RecipeRequirement::MinimumHeat { kelvin: 1900 }]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn coil_heat_metadata_is_last_write_wins() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+            import static gregtech.api.util.GTRecipeConstants.COIL_HEAT;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .itemInputs(Materials.Iron.getDust(1))
+                    .itemOutputs(Materials.Steel.getDust(1))
+                    .metadata(COIL_HEAT, 1200)
+                    .metadata(COIL_HEAT, 2400)
+                    .duration(20)
+                    .eut(2)
+                    .addTo(compressorRecipes);
+            }}
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let recovery = recover(&analysis);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let lowered = lower_recipe(recipe, &analysis.bindings)
+            .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
+        assert_eq!(
+            lowered.requirements,
+            [RecipeRequirement::MinimumHeat { kelvin: 2400 }]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unsupported_metadata_remains_fail_closed() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+            import static gregtech.api.util.GTRecipeConstants.FUEL_VALUE;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .itemInputs(Materials.Iron.getDust(1))
+                    .itemOutputs(Materials.Steel.getDust(1))
+                    .metadata(FUEL_VALUE, 100)
+                    .duration(20)
+                    .eut(2)
+                    .addTo(compressorRecipes);
+            }}
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let recovery = recover(&analysis);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let Err(failure) = lower_recipe(recipe, &analysis.bindings) else {
+            return Err(anyhow::anyhow!("unsupported metadata unexpectedly lowered"));
+        };
+        assert!(
+            failure
+                .blockers
+                .iter()
+                .any(|blocker| blocker.kind == RecipeLoweringBlockerKind::Metadata)
         );
         Ok(())
     }

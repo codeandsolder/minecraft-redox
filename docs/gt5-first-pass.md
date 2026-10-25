@@ -323,3 +323,23 @@ Full GT5 result after this pass:
 - modifier blockers: **178**.
 
 The remaining chance tail is now too small to justify chance-specific overfitting. The next pass should return to the large semantic blocker families: concrete item helpers/selectors and typed machine metadata.
+
+
+### Typed minimum process heat requirement
+
+`GTRecipeConstants.COIL_HEAT` is now lowered as source-independent machine behavior rather than retained as opaque metadata or GT's legacy `mSpecialValue` alias. GT5 declares the key as the required heating-coil heat in Kelvin, and its Electric Blast Furnace, Plasma Forge, and Exothermic Hearth consumers use the same value both to reject recipes above machine heat capacity and as the recipe-heat input to heat overclock/discount calculations.
+
+Core recipe IR now carries typed `RecipeRequirement` values; the first variant is `MinimumHeat { kelvin }`. Builder-call recovery retains parsed argument expressions so metadata values can use the same project-backed scalar evaluator as amounts, EU/t and probabilities. Repeated `COIL_HEAT` entries preserve GT metadata storage's `Map.put` last-write-wins behavior. All unknown metadata keys and non-static/non-negative heat values remain fail-closed metadata blockers; no generic Java metadata bag is copied into the target runtime.
+
+Full GT5 result after this pass:
+
+- target recipes lowered: **3,157 / 5,791 (54.52%)**, up from 3,064 / 5,791 (52.91%);
+- metadata blockers: **979**, down from 1,156;
+- item-input blockers: **1,403**;
+- item-output blockers: **1,126**;
+- fluid blockers: **457**;
+- non-constant EU/t blockers: **417**;
+- modifier blockers: **178**;
+- chance blockers: **50**.
+
+The pass adds 93 fully lowered recipes and removes metadata as a blocker from 177 recipes while leaving every non-heat metadata family untouched. The next metadata families must be derived from their runtime consumers rather than generalized by name: fuel value/type, scanning/research, and machine casing tiers have distinct semantics.

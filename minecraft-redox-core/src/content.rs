@@ -140,6 +140,14 @@ pub enum ItemInputSpec {
     Alternatives { choices: Vec<ItemInputStackSpec> },
 }
 
+/// One source-independent requirement a machine must satisfy for a recipe.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RecipeRequirement {
+    /// Minimum process heat required by the recipe, in Kelvin.
+    MinimumHeat { kelvin: u64 },
+}
+
 /// Minimal target recipe IR.
 ///
 /// This deliberately starts smaller than GTNH's full recipe vocabulary. A source
@@ -153,6 +161,7 @@ pub struct ContentRecipe {
     pub item_outputs: Vec<ItemOutputSpec>,
     pub fluid_inputs: Vec<FluidStackSpec>,
     pub fluid_outputs: Vec<FluidStackSpec>,
+    pub requirements: Vec<RecipeRequirement>,
     pub duration_ticks: u64,
     pub eut: i64,
 }

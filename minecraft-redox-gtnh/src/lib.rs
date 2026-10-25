@@ -25,6 +25,7 @@ use std::collections::{BTreeMap, BTreeSet};
 pub struct BuilderCall {
     pub name: String,
     pub arguments: Vec<String>,
+    pub argument_expressions: Vec<JavaExpression>,
 }
 
 impl From<&JavaCall> for BuilderCall {
@@ -32,6 +33,7 @@ impl From<&JavaCall> for BuilderCall {
         Self {
             name: call.name.clone(),
             arguments: call.arguments.clone(),
+            argument_expressions: call.argument_expressions.clone(),
         }
     }
 }
