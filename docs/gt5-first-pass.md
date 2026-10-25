@@ -257,3 +257,40 @@ Full GT5 result after this pass:
 - modifiers are now the largest blocker family at **2,496**, followed by item inputs (1,945), item outputs (1,500), metadata (1,156), fluids (457), chances (418), and non-constant EU/t (417).
 
 A source census shows the `modifiers` bucket is itself highly skewed: `circuit(...)` accounts for 2,312 call sites, while the remaining modifier methods are individually small. GT5's `GTRecipeBuilder.circuit(int)` materializes `GTUtility.getIntegratedCircuit(config)` into the item-input array, so it should be lowered as explicit recipe-input semantics rather than preserved as a generic opaque modifier. That is the next high-leverage target step.
+
+### Required-versus-consumed inputs and linked item helpers
+
+GT5 encodes catalyst/configuration inputs by constructing an `ItemStack` with `stackSize == 0`. In particular, `GTRecipeBuilder.circuit(int)` calls `GTUtility.getIntegratedCircuit(config)`, which returns `ItemList.Circuit_Integrated.getWithDamage(0, config)`. Carrying that sentinel convention into the target engine would make a source-runtime accident part of the new recipe model, so target input IR now separates the amount required for matching from whether that amount is consumed:
+
+- `ItemInputStackSpec.amount` is the required count;
+- `ItemInputStackSpec.consumed` records whether successful execution removes it;
+- ordinary positive source stack sizes become `consumed: true`;
+- a GT source input with stack size zero becomes required amount 1 with `consumed: false`.
+
+This also makes `circuit(...)` ordinary target input semantics instead of an opaque recipe modifier. `itemInputsUnsafe(...)` is likewise no longer a modifier: the GT5 source differs only by allowing stack sizes greater than 64, while target quantities are already represented as `u64`.
+
+The same pass lowers statically identifiable `GTModHandler.getModItem(...)` and `getIC2Item(...)` calls to named target items, including amount and metadata. Overloads carrying a non-null replacement stack remain fail-closed because the fallback changes identity semantics; literal-null replacement overloads are equivalent to having no fallback and can lower safely.
+
+Project-linked item methods now retain the original receiver expression as well as its inferred type. This allows concrete wrapper identities such as `ItemRefer.Radiation_Protection_Plate.get(2)` to remain distinguishable, while calls on a merely typed local such as `Werkstoff w` remain unresolved. Source-backed linked adapters currently cover:
+
+- `goodgenerator.util.ItemRefer#get(int)` for concrete `ItemRefer.*` receivers;
+- `gregtech.api.enums.ItemList#get(long,Object...)` for concrete `ItemList.*` receivers;
+- `ComponentAssemblyLineLoader#get(OrePrefixes,Object,int)` when both prefix and material arguments resolve to qualified source identities.
+
+Direct GT++ material recognition also includes the `MaterialsElements`, `MaterialsOres`, and `MaterialsNuclides` families. A project-enrichment pass now revisits nested `copyAmount*`/ore-unification wrappers after linking so an outer direct wrapper cannot permanently hide an inner project-resolvable item. That enrichment is structurally useful but did not itself increase fully lowered recipe count on the current corpus, indicating that the remaining such wrappers predominantly contain genuinely dynamic values/helpers.
+
+Full GT5 result after this batch:
+
+- target recipes lowered: **2,911 / 5,791 (50.27%)**, up from 1,268 / 5,791 (21.90%);
+- item-input blockers: **1,403**, down from 1,945;
+- item-output blockers: **1,126**, down from 1,500;
+- metadata blockers: **1,156**;
+- fluid blockers: **457**;
+- chance blockers: **418**;
+- non-constant EU/t blockers: **417**;
+- modifier blockers: **178**, down from 2,496;
+- direct item semantics: **17,193 / 19,580** source item expressions.
+
+The largest single gain is circuit normalization: before `itemInputsUnsafe` cleanup and registry-item/helper lowering, the circuit pass alone raised fully lowered recipes from 1,268 to 2,492 and collapsed modifier blockers from 2,496 to 286. `itemInputsUnsafe` then reduced modifier blockers to 178 without changing complete-recipe count, showing those recipes had independent blockers. Registry item lowering raised complete recipes to 2,807; receiver-aware linked helpers then reached 2,911.
+
+The next priority should be selected by blocker semantics rather than the old modifier count. Item inputs/outputs remain large, but metadata is now comparable in scale and contains real machine behavior (`COIL_HEAT`, `SCANNING`, research/fuel/casing requirements). Generic metadata must not be discarded merely to improve coverage. Output/input chance arrays are smaller but structurally clean core recipe semantics and are a good candidate for a dedicated target-IR pass after the next item-helper census.

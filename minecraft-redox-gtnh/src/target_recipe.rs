@@ -1,8 +1,8 @@
 use minecraft_redox_core::{
     SourceOrigin,
     content::{
-        ContentId, ContentRecipe, FluidSelector, FluidStackSpec, ItemInputSpec, ItemSelector,
-        ItemStackSpec,
+        ContentId, ContentRecipe, FluidSelector, FluidStackSpec, ItemInputSpec, ItemInputStackSpec,
+        ItemSelector, ItemStackSpec,
     },
 };
 use minecraft_redox_java::{JavaBindings, JavaExpression, JavaProjectIndex};
@@ -227,6 +227,7 @@ fn lower_inputs(
         .enumerate()
         .filter_map(|(index, recovered)| {
             lower_recovered_stack(recovered, bindings, project)
+                .map(input_stack_spec)
                 .map(ItemInputSpec::Stack)
                 .or_else(|| {
                     push_blocker(
@@ -238,6 +239,22 @@ fn lower_inputs(
                 })
         })
         .collect()
+}
+
+fn input_stack_spec(stack: ItemStackSpec) -> ItemInputStackSpec {
+    if stack.amount == 0 {
+        ItemInputStackSpec {
+            selector: stack.selector,
+            amount: 1,
+            consumed: false,
+        }
+    } else {
+        ItemInputStackSpec {
+            selector: stack.selector,
+            amount: stack.amount,
+            consumed: true,
+        }
+    }
 }
 
 fn lower_outputs(
@@ -318,6 +335,27 @@ fn lower_item_semantic(
                 scalar_amount_u64(amount, bindings, project)
             })?,
         }),
+        ItemSemantic::ItemList {
+            item,
+            accessor,
+            arguments,
+        } if accessor == "getWithDamage" && arguments.len() == 2 => Some(ItemStackSpec {
+            selector: ItemSelector::Named {
+                id: ContentId::new(item.clone()),
+                variant: Some(scalar_i64_optional(arguments.get(1)?, bindings, project)?),
+            },
+            amount: scalar_amount_u64(arguments.first()?, bindings, project)?,
+        }),
+        ItemSemantic::ModItem {
+            provider,
+            arguments,
+        } => lower_mod_item(provider, arguments, bindings, project),
+        ItemSemantic::LinkedMethod {
+            method_id,
+            receiver,
+            arguments,
+            ..
+        } => lower_linked_item_method(method_id, receiver.as_ref(), arguments, bindings, project),
         ItemSemantic::ItemStack { item, amount, meta } => Some(ItemStackSpec {
             selector: ItemSelector::Named {
                 id: ContentId::new(resolved_reference_name(item, bindings)?),
@@ -430,6 +468,132 @@ fn material_accessor_form(accessor: &str) -> Option<&'static str> {
         "getPlasmaCell" => Some("cellPlasma"),
         _ => None,
     }
+}
+
+fn lower_linked_item_method(
+    method_id: &str,
+    receiver: Option<&JavaExpression>,
+    arguments: &[JavaExpression],
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+) -> Option<ItemStackSpec> {
+    if method_id
+        == "goodgenerator.loader.ComponentAssemblyLineLoader#get(gregtech.api.enums.OrePrefixes,Object,int)"
+        && arguments.len() == 3
+    {
+        let form = qualified_reference_name(arguments.first()?, bindings)?;
+        if !form.contains("OrePrefixes.") {
+            return None;
+        }
+        let material = qualified_reference_name(arguments.get(1)?, bindings)?;
+        return Some(ItemStackSpec {
+            selector: ItemSelector::MaterialForm {
+                material: ContentId::new(material),
+                form: ContentId::new(form),
+            },
+            amount: scalar_amount_u64(arguments.get(2)?, bindings, project)?,
+        });
+    }
+
+    if method_id == "goodgenerator.util.ItemRefer#get(int)" && arguments.len() == 1 {
+        let item = qualified_reference_name(receiver?, bindings)?;
+        if !item.contains("ItemRefer.") {
+            return None;
+        }
+        return Some(ItemStackSpec {
+            selector: ItemSelector::Named {
+                id: ContentId::new(item),
+                variant: None,
+            },
+            amount: scalar_amount_u64(arguments.first()?, bindings, project)?,
+        });
+    }
+
+    if method_id == "gregtech.api.enums.ItemList#get(long,Object...)" && !arguments.is_empty() {
+        let item = qualified_reference_name(receiver?, bindings)?;
+        if !item.contains("ItemList.") {
+            return None;
+        }
+        return Some(ItemStackSpec {
+            selector: ItemSelector::Named {
+                id: ContentId::new(item),
+                variant: None,
+            },
+            amount: scalar_amount_u64(arguments.first()?, bindings, project)?,
+        });
+    }
+
+    None
+}
+
+fn qualified_reference_name(
+    expression: &JavaExpression,
+    bindings: &JavaBindings,
+) -> Option<String> {
+    let name = resolved_reference_name(expression, bindings)?;
+    name.contains('.').then_some(name)
+}
+
+fn lower_mod_item(
+    provider: &str,
+    arguments: &[JavaExpression],
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+) -> Option<ItemStackSpec> {
+    if provider.ends_with("GTModHandler.getModItem") {
+        let mod_id = identity_component(arguments.first()?, bindings)?;
+        let item = identity_component(arguments.get(1)?, bindings)?;
+        let amount = arguments.get(2).map_or(Some(1), |amount| {
+            scalar_amount_u64(amount, bindings, project)
+        })?;
+        let variant = match arguments.len() {
+            2 | 3 => None,
+            4 if is_java_null(arguments.get(3)?) => None,
+            4 => Some(scalar_i64_optional(arguments.get(3)?, bindings, project)?),
+            5 if is_java_null(arguments.get(4)?) => {
+                Some(scalar_i64_optional(arguments.get(3)?, bindings, project)?)
+            }
+            _ => return None,
+        };
+        return Some(ItemStackSpec {
+            selector: ItemSelector::Named {
+                id: ContentId::new(format!("{mod_id}:{item}")),
+                variant,
+            },
+            amount,
+        });
+    }
+
+    if provider.ends_with("GTModHandler.getIC2Item") {
+        let item = identity_component(arguments.first()?, bindings)?;
+        let amount = scalar_amount_u64(arguments.get(1)?, bindings, project)?;
+        let variant = match arguments.len() {
+            2 => None,
+            3 if is_java_null(arguments.get(2)?) => None,
+            3 => Some(scalar_i64_optional(arguments.get(2)?, bindings, project)?),
+            4 if is_java_null(arguments.get(3)?) => {
+                Some(scalar_i64_optional(arguments.get(2)?, bindings, project)?)
+            }
+            _ => return None,
+        };
+        return Some(ItemStackSpec {
+            selector: ItemSelector::Named {
+                id: ContentId::new(format!("ic2:{item}")),
+                variant,
+            },
+            amount,
+        });
+    }
+
+    None
+}
+
+fn identity_component(expression: &JavaExpression, bindings: &JavaBindings) -> Option<String> {
+    simple_string_literal(expression).or_else(|| resolved_reference_name(expression, bindings))
+}
+
+fn is_java_null(expression: &JavaExpression) -> bool {
+    matches!(expression, JavaExpression::Literal(value) if value == "null")
 }
 
 fn scalar_i64_optional(
@@ -556,7 +720,7 @@ mod tests {
     use minecraft_redox_core::content::{FluidSelector, ItemInputSpec, ItemSelector};
     use minecraft_redox_java::{JavaProjectIndex, analyze_source};
 
-    use super::lower_recipe;
+    use super::{RecipeLoweringBlockerKind, lower_recipe};
     use crate::recover;
 
     #[test]
@@ -599,6 +763,7 @@ mod tests {
             return Err(anyhow::anyhow!("input was not a stack"));
         };
         assert_eq!(input.amount, 4);
+        assert!(input.consumed);
         assert!(matches!(
             &input.selector,
             ItemSelector::MaterialForm { material, form }
@@ -647,6 +812,7 @@ mod tests {
             return Err(anyhow::anyhow!("material input was not a stack"));
         };
         assert_eq!(input.amount, 2);
+        assert!(input.consumed);
         assert!(matches!(
             &input.selector,
             ItemSelector::MaterialForm { material, form }
@@ -667,6 +833,201 @@ mod tests {
                 if material.as_str() == "gtPlusPlus.core.material.MaterialsAlloy.INCONEL_792"
                     && form.as_str() == "gregtech.api.enums.OrePrefixes.wireGt04"
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn lowers_circuit_as_required_non_consumed_input() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .circuit(7)
+                    .itemInputsUnsafe(Materials.Iron.getDust(128))
+                    .duration(20)
+                    .eut(2)
+                    .addTo(compressorRecipes);
+            }}
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let recovery = recover(&analysis);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let lowered = lower_recipe(recipe, &analysis.bindings)
+            .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
+        assert_eq!(lowered.item_inputs.len(), 2);
+
+        let ItemInputSpec::Stack(material) = &lowered.item_inputs[0] else {
+            return Err(anyhow::anyhow!("material input was not a stack"));
+        };
+        assert_eq!(material.amount, 128);
+        assert!(material.consumed);
+
+        let ItemInputSpec::Stack(circuit) = &lowered.item_inputs[1] else {
+            return Err(anyhow::anyhow!("circuit input was not a stack"));
+        };
+        assert_eq!(circuit.amount, 1);
+        assert!(!circuit.consumed);
+        assert!(matches!(
+            &circuit.selector,
+            ItemSelector::Named {
+                id,
+                variant: Some(7),
+            } if id.as_str() == "gregtech.api.enums.ItemList.Circuit_Integrated"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn lowers_source_backed_linked_item_helpers() -> anyhow::Result<()> {
+        let source = r"
+            package goodgenerator.loader;
+            import static gregtech.api.enums.Materials.Iron;
+            import static gregtech.api.enums.OrePrefixes.plateDense;
+            import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+            import goodgenerator.util.ItemRefer;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.OrePrefixes;
+            import gregtech.api.util.GTUtility;
+            import net.minecraft.item.ItemStack;
+            class ComponentAssemblyLineLoader {
+                private static ItemStack get(OrePrefixes prefix, Object material, int amount) {
+                    return null;
+                }
+                void run() {
+                    GTValues.RA.stdBuilder()
+                        .itemInputs(get(plateDense, Iron, 48))
+                        .itemOutputs(GTUtility.copyAmount(3, ItemRefer.Radiation_Protection_Plate.get(2)))
+                        .duration(20)
+                        .eut(2)
+                        .addTo(compressorRecipes);
+                }
+            }
+        ";
+        let item_refer = r"
+            package goodgenerator.util;
+            import net.minecraft.item.ItemStack;
+            class ItemRefer {
+                static final ItemRefer Radiation_Protection_Plate = new ItemRefer();
+                ItemStack get(int amount) { return null; }
+            }
+        ";
+        let helper = analyze_source("ComponentAssemblyLineLoader.java", "gt5", None, source)?;
+        let item_refer = analyze_source("ItemRefer.java", "gt5", None, item_refer)?;
+        let mut project = JavaProjectIndex::default();
+        project.add_analysis(&helper);
+        project.add_analysis(&item_refer);
+        let recovery = crate::recover_with_project(&helper, &project);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let lowered = super::lower_recipe_with_project(recipe, &helper.bindings, &project)
+            .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
+
+        let ItemInputSpec::Stack(input) = &lowered.item_inputs[0] else {
+            return Err(anyhow::anyhow!("helper input was not a stack"));
+        };
+        assert_eq!(input.amount, 48);
+        assert!(matches!(
+            &input.selector,
+            ItemSelector::MaterialForm { material, form }
+                if material.as_str() == "gregtech.api.enums.Materials.Iron"
+                    && form.as_str() == "gregtech.api.enums.OrePrefixes.plateDense"
+        ));
+        assert_eq!(lowered.item_outputs[0].amount, 3);
+        assert!(matches!(
+            &lowered.item_outputs[0].selector,
+            ItemSelector::Named { id, variant: None }
+                if id.as_str() == "goodgenerator.util.ItemRefer.Radiation_Protection_Plate"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn lowers_mod_registry_items_without_hiding_fallback_semantics() -> anyhow::Result<()> {
+        let source = r#"
+            import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.util.GTModHandler;
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .itemInputs(GTModHandler.getModItem("dreamcraft", "MysteriousCrystalLens", 0, 7))
+                    .itemOutputs(GTModHandler.getIC2Item("reactorVentDiamond", 2, 1, null))
+                    .duration(20)
+                    .eut(2)
+                    .addTo(compressorRecipes);
+            }}
+        "#;
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let recovery = recover(&analysis);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let lowered = lower_recipe(recipe, &analysis.bindings)
+            .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
+
+        let ItemInputSpec::Stack(input) = &lowered.item_inputs[0] else {
+            return Err(anyhow::anyhow!("mod input was not a stack"));
+        };
+        assert_eq!(input.amount, 1);
+        assert!(!input.consumed);
+        assert!(matches!(
+            &input.selector,
+            ItemSelector::Named {
+                id,
+                variant: Some(7),
+            } if id.as_str() == "dreamcraft:MysteriousCrystalLens"
+        ));
+
+        assert_eq!(lowered.item_outputs[0].amount, 2);
+        assert!(matches!(
+            &lowered.item_outputs[0].selector,
+            ItemSelector::Named {
+                id,
+                variant: Some(1),
+            } if id.as_str() == "ic2:reactorVentDiamond"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn blocks_mod_item_with_non_null_fallback() -> anyhow::Result<()> {
+        let source = r#"
+            import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.util.GTModHandler;
+            import net.minecraft.init.Blocks;
+            import net.minecraft.item.ItemStack;
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .itemInputs(GTModHandler.getModItem(
+                        "example", "missing", 1, new ItemStack(Blocks.dirt, 1)))
+                    .duration(20)
+                    .eut(2)
+                    .addTo(compressorRecipes);
+            }}
+        "#;
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let recovery = recover(&analysis);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let failure = lower_recipe(recipe, &analysis.bindings)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("fallback recipe unexpectedly lowered"))?;
+        assert!(
+            failure
+                .blockers
+                .iter()
+                .any(|blocker| blocker.kind == RecipeLoweringBlockerKind::ItemInput)
+        );
         Ok(())
     }
 

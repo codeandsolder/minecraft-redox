@@ -348,13 +348,14 @@ fn recognize_recipe(
     };
 
     let mut after_add = false;
+    let mut integrated_circuit_inputs = Vec::new();
     for call in chain.calls.iter().skip(1) {
         if after_add {
             recipe.post_add_calls.push(call.into());
             continue;
         }
         match call.name.as_str() {
-            "itemInputs" => add_items(
+            "itemInputs" | "itemInputsUnsafe" => add_items(
                 &mut recipe.item_inputs,
                 &mut recipe.item_input_semantics,
                 call,
@@ -363,18 +364,6 @@ fn recognize_recipe(
                 &chain.origin.path,
                 true,
             ),
-            "itemInputsUnsafe" => {
-                add_items(
-                    &mut recipe.item_inputs,
-                    &mut recipe.item_input_semantics,
-                    call,
-                    bindings,
-                    project,
-                    &chain.origin.path,
-                    true,
-                );
-                recipe.modifiers.push(call.into());
-            }
             "itemOutputs" => add_items(
                 &mut recipe.item_outputs,
                 &mut recipe.item_output_semantics,
@@ -407,14 +396,47 @@ fn recognize_recipe(
             "specialValue" => recipe.special_value = one_argument(call),
             "special" => recipe.special = one_argument(call),
             "metadata" | "recipeCategory" => recipe.metadata.push(call.into()),
+            "circuit" => {
+                if let Some(input) = integrated_circuit_input(call) {
+                    integrated_circuit_inputs.push(input);
+                } else {
+                    recipe.modifiers.push(call.into());
+                }
+            }
             "noOptimize" | "ignoreCollision" | "fake" | "enabled" | "disabled" | "hidden"
             | "requiresCleanRoom" | "requiresLowGravity" | "requireMods" | "nbtSensitive"
-            | "noBuffer" | "setNEIDesc" | "circuit" => recipe.modifiers.push(call.into()),
+            | "noBuffer" | "setNEIDesc" => recipe.modifiers.push(call.into()),
             "addTo" => after_add = true,
             _ => recipe.unhandled_calls.push(call.into()),
         }
     }
+    for input in integrated_circuit_inputs {
+        recipe.item_inputs.push(input.source.clone());
+        recipe.item_input_semantics.push(input);
+    }
     Some(recipe)
+}
+
+fn integrated_circuit_input(call: &JavaCall) -> Option<RecoveredExpression<ItemSemantic>> {
+    let source_config = call.arguments.first()?;
+    let config = call.argument_expressions.first()?.clone();
+    let item = String::from("gregtech.api.enums.ItemList.Circuit_Integrated");
+    let accessor = String::from("getWithDamage");
+    let arguments = vec![JavaExpression::Literal(String::from("0")), config];
+
+    Some(RecoveredExpression {
+        source: format!("GTUtility.getIntegratedCircuit({source_config})"),
+        expression: JavaExpression::Call {
+            receiver: Some(Box::new(JavaExpression::Reference(item.clone()))),
+            method: accessor.clone(),
+            arguments: arguments.clone(),
+        },
+        semantic: Some(ItemSemantic::ItemList {
+            item,
+            accessor,
+            arguments,
+        }),
+    })
 }
 
 fn set_duration(recipe: &mut RecipeDefinition, call: &JavaCall, bindings: &JavaBindings) {
@@ -618,8 +640,8 @@ fn is_known_material_property(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{GtnhSummary, recover};
-    use minecraft_redox_java::analyze_source;
+    use super::{GtnhSummary, ItemSemantic, recover};
+    use minecraft_redox_java::{JavaExpression, analyze_source};
 
     #[test]
     fn recognizes_gt_recipe_builder() -> anyhow::Result<()> {
@@ -627,6 +649,7 @@ mod tests {
             import static gregtech.api.util.GTRecipeBuilder.SECONDS;
             class Recipes { void run() {
                 GTValues.RA.stdBuilder()
+                    .circuit(7)
                     .itemInputs(ItemList.Cell_Water.get(1))
                     .itemOutputs(new ItemStack(Blocks.snow, 1))
                     .duration(15 * SECONDS)
@@ -641,8 +664,22 @@ mod tests {
         assert_eq!(recipe.recipe_map, "compressorRecipes");
         assert_eq!(recipe.duration.as_deref(), Some("15 * SECONDS"));
         assert_eq!(recipe.duration_ticks, Some(300));
-        assert_eq!(recipe.item_input_semantics.len(), 1);
+        assert_eq!(recipe.item_input_semantics.len(), 2);
         assert!(recipe.item_input_semantics[0].semantic.is_some());
+        assert!(matches!(
+            recipe.item_input_semantics[1].semantic.as_ref(),
+            Some(ItemSemantic::ItemList {
+                item,
+                accessor,
+                arguments,
+            }) if item == "gregtech.api.enums.ItemList.Circuit_Integrated"
+                && accessor == "getWithDamage"
+                && matches!(arguments.as_slice(), [
+                    JavaExpression::Literal(amount),
+                    JavaExpression::Literal(config),
+                ] if amount == "0" && config == "7")
+        ));
+        assert_eq!(recipe.modifiers.as_slice(), []);
         assert_eq!(recipe.eut.as_deref(), Some("2"));
         assert_eq!(recipe.unhandled_calls.len(), 0);
         let mut summary = GtnhSummary::default();

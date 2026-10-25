@@ -67,12 +67,24 @@ pub struct ItemStackSpec {
     pub amount: u64,
 }
 
+/// One concrete item requirement in a recipe input slot.
+///
+/// `amount` is how many matching items must be present. `consumed` is separate
+/// because some recipe systems use catalysts/configuration items that are
+/// required for matching but survive a successful recipe execution.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ItemInputStackSpec {
+    pub selector: ItemSelector,
+    pub amount: u64,
+    pub consumed: bool,
+}
+
 /// One recipe input slot. Alternatives occupy one slot, not several inputs.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ItemInputSpec {
-    Stack(ItemStackSpec),
-    Alternatives { choices: Vec<ItemStackSpec> },
+    Stack(ItemInputStackSpec),
+    Alternatives { choices: Vec<ItemInputStackSpec> },
 }
 
 /// Minimal target recipe IR.

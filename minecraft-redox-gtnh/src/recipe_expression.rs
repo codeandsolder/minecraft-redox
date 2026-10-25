@@ -62,6 +62,7 @@ pub enum ItemSemantic {
     LinkedMethod {
         method_id: String,
         return_type: String,
+        receiver: Option<JavaExpression>,
         receiver_type: Option<String>,
         arguments: Vec<JavaExpression>,
     },
@@ -99,6 +100,7 @@ pub enum FluidSemantic {
     LinkedMethod {
         method_id: String,
         return_type: String,
+        receiver: Option<JavaExpression>,
         receiver_type: Option<String>,
         arguments: Vec<JavaExpression>,
     },
@@ -158,6 +160,15 @@ pub fn recover_item_inputs_with_project(
                     nested_array_is_slot,
                 )
             })
+            .map(|semantic| {
+                enrich_item_semantic_with_project(
+                    semantic,
+                    bindings,
+                    project,
+                    source_path,
+                    byte_position,
+                )
+            })
     })
 }
 
@@ -171,9 +182,19 @@ pub fn recover_items_with_project(
     byte_position: usize,
 ) -> Vec<RecoveredExpression<ItemSemantic>> {
     recover_values(sources, expressions, |expression| {
-        item_semantic(expression, bindings).or_else(|| {
-            project_item_semantic(expression, bindings, project, source_path, byte_position)
-        })
+        item_semantic(expression, bindings)
+            .or_else(|| {
+                project_item_semantic(expression, bindings, project, source_path, byte_position)
+            })
+            .map(|semantic| {
+                enrich_item_semantic_with_project(
+                    semantic,
+                    bindings,
+                    project,
+                    source_path,
+                    byte_position,
+                )
+            })
     })
 }
 
@@ -287,7 +308,11 @@ fn project_input_item_semantic(
     nested_array_is_slot: bool,
 ) -> Option<ItemSemantic> {
     if nested_array_is_slot
-        && let JavaExpression::Call { arguments, .. } = expression
+        && let JavaExpression::Call {
+            receiver,
+            arguments,
+            ..
+        } = expression
         && let Some((resolved, receiver_type)) =
             project.resolve_call_at(source_path, byte_position, expression, bindings)
         && is_recipe_input_container_type(&resolved.return_type)
@@ -310,6 +335,7 @@ fn project_input_item_semantic(
         return Some(ItemSemantic::LinkedMethod {
             method_id,
             return_type: resolved.return_type.clone(),
+            receiver: receiver.as_deref().cloned(),
             receiver_type,
             arguments: arguments.clone(),
         });
@@ -342,11 +368,20 @@ fn project_item_semantic(
                 declared_type: value.type_name,
             })
         }
-        JavaExpression::Call { arguments, .. } => {
+        JavaExpression::Call {
+            receiver,
+            arguments,
+            ..
+        } => {
             if let Some((resolved, receiver_type)) =
                 project.resolve_call_at(source_path, byte_position, expression, bindings)
-                && let Some(semantic) =
-                    linked_method_semantic(resolved, arguments, bindings, receiver_type)
+                && let Some(semantic) = linked_method_semantic(
+                    resolved,
+                    receiver.as_deref(),
+                    arguments,
+                    bindings,
+                    receiver_type,
+                )
             {
                 return Some(semantic);
             }
@@ -356,6 +391,76 @@ fn project_item_semantic(
             project_item_semantic(inner, bindings, project, source_path, byte_position)
         }
         _ => typed_item_expression(expression, bindings, project, source_path, byte_position),
+    }
+}
+
+fn enrich_item_semantic_with_project(
+    semantic: ItemSemantic,
+    bindings: &JavaBindings,
+    project: &JavaProjectIndex,
+    source_path: &str,
+    byte_position: usize,
+) -> ItemSemantic {
+    match semantic {
+        ItemSemantic::CopyAmount {
+            amount,
+            meta,
+            item,
+            inner,
+            unsafe_copy,
+        } => {
+            let inner = inner.or_else(|| {
+                item_semantic(&item, bindings)
+                    .or_else(|| {
+                        project_item_semantic(&item, bindings, project, source_path, byte_position)
+                    })
+                    .map(|semantic| {
+                        Box::new(enrich_item_semantic_with_project(
+                            semantic,
+                            bindings,
+                            project,
+                            source_path,
+                            byte_position,
+                        ))
+                    })
+            });
+            ItemSemantic::CopyAmount {
+                amount,
+                meta,
+                item,
+                inner,
+                unsafe_copy,
+            }
+        }
+        ItemSemantic::OreDictUnify { item, inner } => {
+            let inner = inner.or_else(|| {
+                item_semantic(&item, bindings)
+                    .or_else(|| {
+                        project_item_semantic(&item, bindings, project, source_path, byte_position)
+                    })
+                    .map(|semantic| {
+                        Box::new(enrich_item_semantic_with_project(
+                            semantic,
+                            bindings,
+                            project,
+                            source_path,
+                            byte_position,
+                        ))
+                    })
+            });
+            ItemSemantic::OreDictUnify { item, inner }
+        }
+        ItemSemantic::InlinedMethod { method_id, result } => ItemSemantic::InlinedMethod {
+            method_id,
+            result: Box::new(enrich_item_semantic_with_project(
+                *result,
+                bindings,
+                project,
+                source_path,
+                byte_position,
+            )),
+        },
+        semantic => semantic,
     }
 }
 
@@ -381,6 +486,7 @@ fn is_item_value_type(type_name: &str) -> bool {
 
 fn linked_method_semantic(
     resolved: &minecraft_redox_java::JavaMethod,
+    receiver: Option<&JavaExpression>,
     arguments: &[JavaExpression],
     bindings: &JavaBindings,
     receiver_type: Option<String>,
@@ -404,6 +510,7 @@ fn linked_method_semantic(
     Some(ItemSemantic::LinkedMethod {
         method_id,
         return_type: resolved.return_type.clone(),
+        receiver: receiver.cloned(),
         receiver_type,
         arguments: arguments.to_vec(),
     })
@@ -416,7 +523,12 @@ fn project_fluid_semantic(
     source_path: &str,
     byte_position: usize,
 ) -> Option<FluidSemantic> {
-    let JavaExpression::Call { arguments, .. } = expression else {
+    let JavaExpression::Call {
+        receiver,
+        arguments,
+        ..
+    } = expression
+    else {
         return None;
     };
     let (resolved, receiver_type) =
@@ -427,6 +539,7 @@ fn project_fluid_semantic(
     Some(FluidSemantic::LinkedMethod {
         method_id: resolved.stable_id(),
         return_type: resolved.return_type.clone(),
+        receiver: receiver.as_deref().cloned(),
         receiver_type,
         arguments: arguments.clone(),
     })
@@ -635,6 +748,9 @@ fn looks_like_item_list_member(reference: &str) -> bool {
 fn looks_like_material_member(reference: &str) -> bool {
     reference.contains("Materials.")
         || reference.contains("MaterialsAlloy.")
+        || reference.contains("MaterialsElements.")
+        || reference.contains("MaterialsOres.")
+        || reference.contains("MaterialsNuclides.")
         || reference.contains("MaterialMisc.")
         || reference.contains("WerkstoffLoader.")
         || reference.contains("GGMaterial.")
