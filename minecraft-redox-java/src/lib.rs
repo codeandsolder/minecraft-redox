@@ -141,6 +141,8 @@ pub struct JavaLocalVariable {
     pub scope_end_byte: usize,
     pub initializer: Option<JavaExpression>,
     pub initializer_source: Option<String>,
+    /// Iterable expression for an enhanced-for variable; `None` for ordinary locals.
+    pub iteration_source: Option<JavaExpression>,
     pub write_bytes: Vec<usize>,
 }
 
@@ -785,6 +787,42 @@ impl JavaProjectIndex {
         local.initializer.clone()
     }
 
+    /// Return the finite values iterated by an enhanced-for local when the iterable is a
+    /// stable array initializer and the loop variable has not been modified before use.
+    #[must_use]
+    pub fn stable_enhanced_for_elements_at(
+        &self,
+        path: &str,
+        byte_position: usize,
+        reference_name: &str,
+    ) -> Option<Vec<JavaExpression>> {
+        let method = self.enclosing_method(path, byte_position)?;
+        let local = method
+            .local_variables
+            .iter()
+            .filter(|local| {
+                local.name == reference_name
+                    && local.declaration_byte <= byte_position
+                    && byte_position < local.scope_end_byte
+            })
+            .max_by_key(|local| local.declaration_byte)?;
+        if local
+            .write_bytes
+            .iter()
+            .any(|write_byte| *write_byte < byte_position)
+        {
+            return None;
+        }
+        let iterable = local.iteration_source.as_ref()?;
+        let iterable = match iterable {
+            JavaExpression::Reference(reference) => {
+                self.stable_local_initializer_at(path, byte_position, reference)?
+            }
+            expression => expression.clone(),
+        };
+        enhanced_for_array_elements(&iterable)
+    }
+
     #[must_use]
     pub fn reference_type_at(
         &self,
@@ -1361,6 +1399,9 @@ fn collect_local_variables(
                 scope_end_byte: body.end_byte(),
                 initializer: None,
                 initializer_source: None,
+                iteration_source: node
+                    .child_by_field_name("value")
+                    .map(|value| expression(value, source)),
                 write_bytes: Vec::new(),
             });
             collect_local_variables(body, source, bindings, variables);
@@ -1395,6 +1436,7 @@ fn collect_local_variables(
                         scope_end_byte,
                         initializer: value.map(|value| expression(value, source)),
                         initializer_source: value.map(|value| node_source(value, source)),
+                        iteration_source: None,
                         write_bytes: Vec::new(),
                     });
                 }
@@ -1492,6 +1534,14 @@ fn record_local_write(name: &str, byte_position: usize, variables: &mut [JavaLoc
         .max_by_key(|local| local.declaration_byte)
     {
         local.write_bytes.push(byte_position);
+    }
+}
+
+fn enhanced_for_array_elements(expression: &JavaExpression) -> Option<Vec<JavaExpression>> {
+    match expression {
+        JavaExpression::Array { elements, .. } => Some(elements.clone()),
+        JavaExpression::Parenthesized(inner) => enhanced_for_array_elements(inner),
+        _ => None,
     }
 }
 
@@ -2413,6 +2463,39 @@ mod tests {
                 .stable_local_initializer_at("Recipe.java", calls[3].byte_start, "methodMutated")
                 .is_none()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn exposes_finite_enhanced_for_array_values() -> anyhow::Result<()> {
+        let source = r"
+            package demo;
+            class ItemStack { ItemStack(int id) {} }
+            class Recipe {
+                void run(ItemStack[] dynamic) {
+                    ItemStack[] stable = new ItemStack[] { new ItemStack(1), new ItemStack(2) };
+                    for (ItemStack item : stable) { sink(item); }
+                    for (ItemStack item : dynamic) { sink(item); }
+                }
+            }
+        ";
+        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
+        let mut index = super::JavaProjectIndex::default();
+        index.add_analysis(&analysis);
+        let calls: Vec<_> = analysis
+            .call_chains
+            .iter()
+            .flat_map(|chain| &chain.calls)
+            .filter(|call| call.name == "sink")
+            .collect();
+        assert_eq!(calls.len(), 2);
+        let values = index
+            .stable_enhanced_for_elements_at("Recipe.java", calls[0].byte_start, "item")
+            .ok_or_else(|| anyhow::anyhow!("stable enhanced-for values missing"))?;
+        assert_eq!(values.len(), 2);
+        assert!(index
+            .stable_enhanced_for_elements_at("Recipe.java", calls[1].byte_start, "item")
+            .is_none());
         Ok(())
     }
 

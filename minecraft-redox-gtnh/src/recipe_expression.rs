@@ -289,7 +289,7 @@ fn recipe_input_semantic(
     }
 }
 
-fn item_semantic(expression: &JavaExpression, bindings: &JavaBindings) -> Option<ItemSemantic> {
+pub(crate) fn item_semantic(expression: &JavaExpression, bindings: &JavaBindings) -> Option<ItemSemantic> {
     match expression {
         JavaExpression::Call {
             receiver: Some(receiver),
@@ -371,6 +371,11 @@ fn project_item_semantic(
                 project.resolve_value_at(source_path, byte_position, reference, bindings)?;
             if !is_item_value_type(&value.type_name) {
                 return None;
+            }
+            if let Some(alternatives) =
+                project.stable_enhanced_for_elements_at(source_path, byte_position, reference)
+            {
+                return Some(ItemSemantic::ExplicitAlternatives { alternatives });
             }
             if let Some(initializer) =
                 project.stable_local_initializer_at(source_path, byte_position, reference)
@@ -1098,6 +1103,38 @@ mod tests {
         assert!(matches!(
             recipe.fluid_input_semantics[0].semantic,
             Some(FluidSemantic::InlinedValue { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn recovers_finite_enhanced_for_item_alternatives() -> anyhow::Result<()> {
+        let source = r"
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            import gregtech.api.enums.OrePrefixes;
+            import gregtech.api.util.GTOreDictUnificator;
+            import net.minecraft.item.ItemStack;
+            class Recipes { void run() {
+                ItemStack[] items = new ItemStack[] {
+                    GTOreDictUnificator.get(OrePrefixes.dust, Materials.Talc, 1L),
+                    GTOreDictUnificator.get(OrePrefixes.dust, Materials.Soapstone, 1L),
+                    GTOreDictUnificator.get(OrePrefixes.dust, Materials.Redstone, 1L)
+                };
+                for (ItemStack item : items) {
+                    GTValues.RA.stdBuilder().itemInputs(item).itemOutputs(Materials.Iron.getDust(1))
+                        .duration(20).eut(4).addTo(gregtech.api.recipe.RecipeMaps.brewingRecipes);
+                }
+            }}
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let mut project = JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let recovery = crate::recover_with_project(&analysis, &project);
+        let recipe = recovery.recipes.first().ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        assert!(matches!(
+            &recipe.item_input_semantics[0].semantic,
+            Some(ItemSemantic::ExplicitAlternatives { alternatives }) if alternatives.len() == 3
         ));
         Ok(())
     }

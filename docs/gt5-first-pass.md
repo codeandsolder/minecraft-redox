@@ -1110,3 +1110,26 @@ Full pinned-corpus result after the conservative escape/mutation check:
 - missing-EU/t blockers: **24**;
 - post-add blockers: **7**;
 - modifier blockers: **6**.
+
+### Finite item alternatives and enhanced-for provenance
+
+The Java project index now retains the iterable expression for enhanced-for locals and can expose the finite values of a loop variable when the iterable is a stable array initializer. Dynamic collections, parameter arrays, modified loop variables, and non-array iterables remain unresolved.
+
+GT item recovery maps such finite loop values to the existing `ItemSemantic::ExplicitAlternatives`. The target lowerer now consumes `ExplicitAlternatives` for recipe inputs, recursively lowering every choice with the same slot consumption probability into one `ItemInputSpec::Alternatives` slot. This also fixes direct `ItemStack[]` alternative inputs that recovery already recognized but target lowering previously rejected.
+
+A representative source case is `BreweryRecipes`: six builders run inside `for (ItemStack item : brewingItems)`, where `brewingItems` is the fixed Talc/Soapstone/Redstone dust array. Three source-emitted recipes with identical process semantics are therefore normalized to one recipe whose first input slot accepts any of those three concrete material forms.
+
+Full pinned-corpus result:
+
+- target recipes lowered: **4,071 / 5,791 (70.30%)**, up from 4,056 / 5,791 (70.04%);
+- item-input blockers: **1,179**, down from 1,194;
+- item-output blockers: **945**;
+- fluid blockers: **306**;
+- metadata blockers: **331**;
+- non-constant EU/t blockers: **417**;
+- missing-duration blockers: **332**;
+- chance blockers: **50**;
+- special blockers: **31**;
+- missing-EU/t blockers: **24**;
+- post-add blockers: **7**;
+- modifier blockers: **6**.

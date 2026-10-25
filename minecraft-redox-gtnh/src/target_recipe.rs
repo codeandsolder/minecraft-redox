@@ -2279,19 +2279,57 @@ fn lower_inputs(
         .zip(probabilities)
         .enumerate()
         .filter_map(|(index, (recovered, probability))| {
-            lower_recovered_stack(recovered, bindings, project)
-                .map(|stack| input_stack_spec(stack, *probability))
-                .map(ItemInputSpec::Stack)
-                .or_else(|| {
-                    push_blocker(
-                        blockers,
-                        RecipeLoweringBlockerKind::ItemInput,
-                        format!("input {index}: {}", recovered.source),
-                    );
-                    None
-                })
+            lower_item_input(recovered, *probability, bindings, project).or_else(|| {
+                push_blocker(
+                    blockers,
+                    RecipeLoweringBlockerKind::ItemInput,
+                    format!("input {index}: {}", recovered.source),
+                );
+                None
+            })
         })
         .collect()
+}
+
+fn lower_item_input(
+    recovered: &RecoveredExpression<ItemSemantic>,
+    consumption_probability: Probability,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+) -> Option<ItemInputSpec> {
+    lower_item_input_semantic(
+        recovered.semantic.as_ref()?,
+        consumption_probability,
+        bindings,
+        project,
+    )
+}
+
+fn lower_item_input_semantic(
+    semantic: &ItemSemantic,
+    consumption_probability: Probability,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+) -> Option<ItemInputSpec> {
+    match semantic {
+        ItemSemantic::ExplicitAlternatives { alternatives } => {
+            let choices = alternatives
+                .iter()
+                .map(|alternative| {
+                    crate::recipe_expression::item_semantic(alternative, bindings)
+                        .and_then(|semantic| lower_item_semantic(&semantic, bindings, project))
+                        .map(|stack| input_stack_spec(stack, consumption_probability))
+                })
+                .collect::<Option<Vec<_>>>()?;
+            (!choices.is_empty()).then_some(ItemInputSpec::Alternatives { choices })
+        }
+        ItemSemantic::InlinedMethod { result, .. } | ItemSemantic::InlinedValue { result, .. } => {
+            lower_item_input_semantic(result, consumption_probability, bindings, project)
+        }
+        _ => lower_item_semantic(semantic, bindings, project)
+            .map(|stack| input_stack_spec(stack, consumption_probability))
+            .map(ItemInputSpec::Stack),
+    }
 }
 
 fn input_stack_spec(
@@ -6080,6 +6118,43 @@ mod tests {
                 .iter()
                 .any(|blocker| blocker.kind == RecipeLoweringBlockerKind::Metadata)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn lowers_finite_enhanced_for_items_as_input_alternatives() -> anyhow::Result<()> {
+        let source = r"
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            import gregtech.api.enums.OrePrefixes;
+            import gregtech.api.util.GTOreDictUnificator;
+            import net.minecraft.item.ItemStack;
+            class Recipes { void run() {
+                ItemStack[] brewingItems = new ItemStack[] {
+                    GTOreDictUnificator.get(OrePrefixes.dust, Materials.Talc, 1L),
+                    GTOreDictUnificator.get(OrePrefixes.dust, Materials.Soapstone, 1L),
+                    GTOreDictUnificator.get(OrePrefixes.dust, Materials.Redstone, 1L)
+                };
+                for (ItemStack item : brewingItems) {
+                    GTValues.RA.stdBuilder().itemInputs(item).itemOutputs(Materials.Iron.getDust(1))
+                        .duration(20).eut(4).addTo(gregtech.api.recipe.RecipeMaps.brewingRecipes);
+                }
+            }}
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let mut project = JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let recovery = crate::recover_with_project(&analysis, &project);
+        let lowered = super::lower_recipe_with_project(
+            recovery.recipes.first().ok_or_else(|| anyhow::anyhow!("recipe missing"))?,
+            &analysis.bindings,
+            &project,
+        ).map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
+        let ItemInputSpec::Alternatives { choices } = &lowered.item_inputs[0] else {
+            return Err(anyhow::anyhow!("enhanced-for input did not become alternatives"));
+        };
+        assert_eq!(choices.len(), 3);
+        assert!(choices.iter().all(|choice| choice.amount == 1));
         Ok(())
     }
 
