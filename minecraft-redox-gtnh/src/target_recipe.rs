@@ -2,9 +2,9 @@ use minecraft_redox_core::{
     SourceOrigin,
     content::{
         ContentId, ContentRecipe, FluidInputSpec, FluidSelector, FluidStackSpec, ItemInputSpec,
-        ItemSelector, ItemStackIntegerPair, ItemStackSpec, RecipeBehavior, RecipeCondition,
-        RecipeMetadataSpec, RecipeMetadataValue, RecipePolicySpec, RecipeSlotChance,
-        RecipeSpecialSpec,
+        ItemSelector, ItemStackIntegerPair, ItemStackSpec, ParticleGroupSelection, RecipeBehavior,
+        RecipeCondition, RecipeMetadataSpec, RecipeMetadataValue, RecipePolicySpec,
+        RecipeSlotChance, RecipeSpecialSpec,
     },
 };
 use minecraft_redox_java::{
@@ -317,6 +317,8 @@ fn lower_metadata_entry(
         lower_beam_crafter_metadata(&metadata.value_expression, bindings, project)?
     } else if is_java_type(expected, "SourceChamberMetadata") {
         lower_source_chamber_metadata(&metadata.value_expression, bindings, project)?
+    } else if is_java_type(expected, "LargeHadronColliderMetadata") {
+        lower_large_hadron_collider_metadata(&metadata.value_expression, bindings, project)?
     } else if project.is_some_and(|project| {
         let owner = bindings.resolve_reference(expected);
         project.type_kind(&owner) == Some(JavaTypeKind::Enum)
@@ -655,6 +657,70 @@ fn lower_source_chamber_metadata(
         max_energy: max_energy?,
         focus: focus?,
         energy_ratio: energy_ratio?,
+    })
+}
+
+fn lower_large_hadron_collider_metadata(
+    expression: &JavaExpression,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+) -> Option<RecipeMetadataValue> {
+    let mut calls = Vec::new();
+    let root = flatten_expression_call_chain(expression, &mut calls)?;
+    let root_name = resolved_reference_name(root, bindings)?;
+    if !root_name.ends_with("LargeHadronColliderMetadata")
+        || calls.first()?.0 != "builder"
+        || calls.last()?.0 != "build"
+    {
+        return None;
+    }
+    let mut particles = None;
+    let mut progress_bar_texture_index = None;
+    let middle_len = calls.len().saturating_sub(2);
+    for (method, arguments) in calls.iter().skip(1).take(middle_len) {
+        match (*method, *arguments) {
+            ("particleList", [argument]) => {
+                particles = Some(lower_particle_group_selection(argument, bindings, project)?);
+            }
+            ("progressBarTextureIndex", [argument]) => {
+                progress_bar_texture_index = Some(metadata_i64(argument, bindings, project)?);
+            }
+            _ => return None,
+        }
+    }
+    Some(RecipeMetadataValue::LargeHadronCollider {
+        particles: particles?,
+        progress_bar_texture_index: progress_bar_texture_index?,
+    })
+}
+
+fn lower_particle_group_selection(
+    expression: &JavaExpression,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+) -> Option<ParticleGroupSelection> {
+    let (base, start, end) = if let JavaExpression::Call {
+        receiver: Some(receiver),
+        method,
+        arguments,
+    } = expression
+        && method == "subList"
+        && let [start, end] = arguments.as_slice()
+    {
+        (
+            receiver.as_ref(),
+            Some(u32::try_from(metadata_i64(start, bindings, project)?).ok()?),
+            Some(u32::try_from(metadata_i64(end, bindings, project)?).ok()?),
+        )
+    } else {
+        (expression, None, None)
+    };
+    let reference = resolved_reference_name(base, bindings)?;
+    let group = reference.strip_suffix(".acceptedParticles")?;
+    Some(ParticleGroupSelection {
+        group: ContentId::new(group),
+        start,
+        end,
     })
 }
 
@@ -1702,6 +1768,61 @@ mod tests {
                 focus: minecraft_redox_core::content::FixedDecimal { coefficient: 98, decimal_places: 0 },
                 energy_ratio: minecraft_redox_core::content::FixedDecimal { coefficient: 1, decimal_places: 1 },
             } if particle.as_str() == "Particle.ELECTRON"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn lowers_large_hadron_collider_particle_groups() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+            import gregtech.api.enums.GTValues;
+            class RecipeMetadataKey<T> {}
+            class ParticleList { ParticleList subList(int start, int end) { return null; } }
+            enum LHCModule {
+                EM, Weak;
+                final ParticleList acceptedParticles = new ParticleList();
+            }
+            class LargeHadronColliderMetadata {
+                static Builder builder() { return null; }
+                static class Builder {
+                    Builder particleList(ParticleList list) { return this; }
+                    Builder progressBarTextureIndex(int v) { return this; }
+                    LargeHadronColliderMetadata build() { return null; }
+                }
+            }
+            class Keys { static RecipeMetadataKey<LargeHadronColliderMetadata> LHC; }
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .metadata(Keys.LHC, LargeHadronColliderMetadata.builder()
+                        .particleList(LHCModule.Weak.acceptedParticles.subList(8, 16))
+                        .progressBarTextureIndex(1)
+                        .build())
+                    .duration(20)
+                    .eut(2)
+                    .addTo(compressorRecipes);
+            }}
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let mut project = JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let recovery = crate::recover_with_project(&analysis, &project);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let lowered = super::lower_recipe_with_project(recipe, &analysis.bindings, &project)
+            .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
+        assert!(matches!(
+            &lowered.metadata[0].value,
+            RecipeMetadataValue::LargeHadronCollider {
+                particles: minecraft_redox_core::content::ParticleGroupSelection {
+                    group,
+                    start: Some(8),
+                    end: Some(16),
+                },
+                progress_bar_texture_index: 1,
+            } if group.as_str() == "LHCModule.Weak"
         ));
         Ok(())
     }

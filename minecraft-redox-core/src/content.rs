@@ -128,6 +128,13 @@ pub struct ItemStackIntegerPair {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ParticleGroupSelection {
+    pub group: ContentId,
+    pub start: Option<u32>,
+    pub end: Option<u32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RecipeMetadataValue {
     Integer {
@@ -179,6 +186,10 @@ pub enum RecipeMetadataValue {
         max_energy: FixedDecimal,
         focus: FixedDecimal,
         energy_ratio: FixedDecimal,
+    },
+    LargeHadronCollider {
+        particles: ParticleGroupSelection,
+        progress_bar_texture_index: i64,
     },
 }
 
