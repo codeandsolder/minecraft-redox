@@ -402,6 +402,7 @@ fn lower_metadata(
 ) -> LoweredMetadata {
     let mut minimum_heat_kelvin = None;
     let mut minimum_capabilities = BTreeMap::new();
+    let mut exact_capabilities = BTreeMap::new();
     let mut startup_energy_eu = 0;
     let mut fuel_value = None;
     let mut fuel_type = None;
@@ -428,6 +429,13 @@ fn lower_metadata(
                 lower_capability_requirement(recipe, call, &key, value, bindings, project, blockers)
             {
                 minimum_capabilities.insert(capability, level);
+            }
+        } else if key == "gregtech.api.util.GTRecipeConstants.ALGAE_POND_TIER" {
+            if let Some(level) =
+                lower_exact_algae_tier(recipe, call, value, bindings, project, blockers)
+            {
+                exact_capabilities
+                    .insert(ContentId::new("machine_capability.algae_pond_tier"), level);
             }
         } else if key == "gregtech.api.util.GTRecipeConstants.FUSION_THRESHOLD" {
             if let Some(value) =
@@ -473,6 +481,7 @@ fn lower_metadata(
     let requirements = lower_recipe_requirements(
         minimum_heat_kelvin,
         minimum_capabilities,
+        exact_capabilities,
         required_environments,
     );
     let unlock =
@@ -758,6 +767,39 @@ fn capture_assembly_line_research<'a>(
     } else {
         *scanning = Some(value);
     }
+}
+
+fn lower_exact_algae_tier(
+    recipe: &RecipeDefinition,
+    call: &crate::BuilderCall,
+    value: &JavaExpression,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+    blockers: &mut Vec<RecipeLoweringBlocker>,
+) -> Option<u64> {
+    if recipe.recipe_map != "gregtech.api.recipe.RecipeMaps.algaePondRecipes" {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            format!(
+                "ALGAE_POND_TIER used on unsupported recipe map {}",
+                recipe.recipe_map
+            ),
+        );
+        return None;
+    }
+    let level = lower_nonnegative_scalar(value, bindings, project);
+    if level.is_none() {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            format!(
+                "ALGAE_POND_TIER is not a static non-negative exact tier: {}",
+                call.arguments.join(", ")
+            ),
+        );
+    }
+    level
 }
 
 fn lower_capability_requirement(
@@ -1151,6 +1193,7 @@ fn special_value_alias_overrides_environment(
 fn lower_recipe_requirements(
     minimum_heat_kelvin: Option<u64>,
     minimum_capabilities: BTreeMap<ContentId, u64>,
+    exact_capabilities: BTreeMap<ContentId, u64>,
     required_environments: BTreeSet<ContentId>,
 ) -> Vec<RecipeRequirement> {
     let mut requirements = Vec::new();
@@ -1161,6 +1204,11 @@ fn lower_recipe_requirements(
         minimum_capabilities
             .into_iter()
             .map(|(capability, level)| RecipeRequirement::MinimumCapability { capability, level }),
+    );
+    requirements.extend(
+        exact_capabilities
+            .into_iter()
+            .map(|(capability, level)| RecipeRequirement::ExactCapability { capability, level }),
     );
     requirements.extend(
         required_environments
@@ -3416,18 +3464,17 @@ mod tests {
     }
 
     #[test]
-    fn algae_pond_tier_is_not_a_minimum_machine_capability() -> anyhow::Result<()> {
+    fn lowers_algae_pond_tier_as_exact_machine_capability() -> anyhow::Result<()> {
         let source = r"
-            import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+            import static gregtech.api.recipe.RecipeMaps.algaePondRecipes;
             import static gregtech.api.util.GTRecipeConstants.ALGAE_POND_TIER;
             import gregtech.api.enums.GTValues;
             import gregtech.api.enums.Materials;
             class Recipes { void run() {
                 GTValues.RA.stdBuilder()
-                    .itemInputs(Materials.Iron.getDust(1))
                     .itemOutputs(Materials.Steel.getDust(1))
                     .metadata(ALGAE_POND_TIER, 4)
-                    .duration(20).eut(2).addTo(compressorRecipes);
+                    .duration(20).eut(0).addTo(algaePondRecipes);
             }}
         ";
         let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
@@ -3436,17 +3483,57 @@ mod tests {
             .recipes
             .first()
             .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
-        let Err(failure) = lower_recipe(recipe, &analysis.bindings) else {
-            return Err(anyhow::anyhow!(
-                "algae selector unexpectedly lowered as a requirement"
-            ));
-        };
-        assert!(
-            failure
-                .blockers
-                .iter()
-                .any(|blocker| blocker.kind == RecipeLoweringBlockerKind::Metadata)
+        let lowered = lower_recipe(recipe, &analysis.bindings)
+            .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
+        assert_eq!(
+            lowered.requirements,
+            [RecipeRequirement::ExactCapability {
+                capability: minecraft_redox_core::content::ContentId::new(
+                    "machine_capability.algae_pond_tier"
+                ),
+                level: 4,
+            }]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_algae_pond_selector_stays_fail_closed() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.recipe.RecipeMaps.algaePondRecipes;
+            import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+            import static gregtech.api.util.GTRecipeConstants.ALGAE_POND_TIER;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            class Recipes {
+                void wrongMap() {
+                    GTValues.RA.stdBuilder()
+                        .itemOutputs(Materials.Steel.getDust(1))
+                        .metadata(ALGAE_POND_TIER, 4)
+                        .duration(20).eut(0).addTo(compressorRecipes);
+                }
+                void dynamic(int tier) {
+                    GTValues.RA.stdBuilder()
+                        .itemOutputs(Materials.Steel.getDust(1))
+                        .metadata(ALGAE_POND_TIER, tier)
+                        .duration(20).eut(0).addTo(algaePondRecipes);
+                }
+            }
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let recovery = recover(&analysis);
+        assert_eq!(recovery.recipes.len(), 2);
+        for recipe in &recovery.recipes {
+            let failure = lower_recipe(recipe, &analysis.bindings)
+                .err()
+                .ok_or_else(|| anyhow::anyhow!("invalid algae selector unexpectedly lowered"))?;
+            assert!(
+                failure
+                    .blockers
+                    .iter()
+                    .any(|blocker| blocker.kind == RecipeLoweringBlockerKind::Metadata)
+            );
+        }
         Ok(())
     }
 

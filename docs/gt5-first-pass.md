@@ -717,3 +717,26 @@ Full GT5 result after this pass:
 - chance blockers: **50**.
 
 The remaining PCB blockers are real machine semantics: tier-2/3 recipes require a particular nanite material whose stored count controls parallelism, and BIO recipes require an active bio-chamber upgrade. Those should become explicit resource/capability semantics rather than being folded into the tier field.
+
+### Exact machine capabilities for algae-pond recipe selection
+
+Some recipe metadata is an equality selector rather than a minimum machine threshold. `RecipeRequirement` therefore now has `ExactCapability { capability, level }`, allowing the target content model to distinguish “machine capability must equal this recipe variant” from the existing monotonic `MinimumCapability` contract.
+
+`GTRecipeConstants.ALGAE_POND_TIER` is the first source-backed use. Both current and legacy algae-pond machines iterate `RecipeMaps.algaePondRecipes` and select the unique recipe whose legacy special value is exactly equal to the machine's selected tier. If compost is supplied, the machine itself increments that selected tier and substitutes the runtime compost input before execution. The target recipe therefore stores only `ExactCapability { capability: machine_capability.algae_pond_tier, level }`; compost remains machine-side selection/input behavior rather than being invented as static recipe content.
+
+The importer accepts `ALGAE_POND_TIER` only on `RecipeMaps.algaePondRecipes` and only when the tier is a static non-negative scalar. Wrong-map and dynamic-tier uses remain fail-closed.
+
+Full GT5 result after this pass:
+
+- target recipes lowered: **3,862 / 5,791 (66.69%)**, up from 3,846 / 5,791 (66.41%);
+- metadata blockers: **391**, down from 407;
+- modifier blockers: **6**;
+- item-input blockers: **1,218**;
+- item-output blockers: **961**;
+- fluid blockers: **457**;
+- non-constant EU/t blockers: **417**;
+- missing-duration blockers: **332**;
+- missing-EU/t blockers: **24**;
+- chance blockers: **50**.
+
+All 16 algae-pond recipes in the pinned corpus become fully lowerable.

@@ -152,6 +152,8 @@ pub enum RecipeRequirement {
     MinimumHeat { kelvin: u64 },
     /// Minimum named machine capability required to process the recipe.
     MinimumCapability { capability: ContentId, level: u64 },
+    /// Exact named machine capability value required to select this recipe.
+    ExactCapability { capability: ContentId, level: u64 },
     /// Named runtime environment in which the process must execute.
     ///
     /// Environment quality and machine-specific effects of that quality are runtime concerns,
