@@ -188,7 +188,7 @@ pub enum MaterialFormGroup {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MaterialColorSpec {
-    Argb(u32),
+    Argb { value: u32 },
     Named { id: ContentId },
 }
 

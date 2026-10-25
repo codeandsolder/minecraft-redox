@@ -1016,7 +1016,7 @@ fn optional_color(
     let value = expression
         .and_then(|value| scalar_value(value, bindings, project))
         .and_then(|value| u32::try_from(value).ok())
-        .map(MaterialColorSpec::Argb)
+        .map(|value| MaterialColorSpec::Argb { value })
         .or_else(|| {
             expression
                 .and_then(|value| content_id(value, bindings))
