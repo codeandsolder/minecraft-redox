@@ -874,11 +874,65 @@ fn lower_fluid_semantic(
                 amount: scalar_amount_u64(arguments.get(1)?, bindings, project)?,
             })
         }
+        FluidSemantic::LinkedMethod {
+            method_id,
+            arguments,
+            ..
+        } => lower_gt_mod_handler_fluid(method_id, arguments, bindings, project),
         FluidSemantic::RegistryFluid { .. }
-        | FluidSemantic::LinkedMethod { .. }
         | FluidSemantic::LinkedValue { .. }
         | FluidSemantic::TypedExpression { .. } => None,
     }
+}
+
+fn lower_gt_mod_handler_fluid(
+    method_id: &str,
+    arguments: &[JavaExpression],
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+) -> Option<FluidStackSpec> {
+    let amount = scalar_amount_u64(arguments.first()?, bindings, project)?;
+    let selector = match method_id {
+        "gregtech.api.util.GTModHandler#getWater(long)" => FluidSelector::MaterialForm {
+            material: ContentId::new("gregtech.api.enums.Materials.Water"),
+            form: ContentId::new("fluid"),
+        },
+        "gregtech.api.util.GTModHandler#getLava(long)" => FluidSelector::MaterialForm {
+            material: ContentId::new("gregtech.api.enums.Materials.Lava"),
+            form: ContentId::new("fluid"),
+        },
+        "gregtech.api.util.GTModHandler#getSteam(long)" => FluidSelector::MaterialForm {
+            material: ContentId::new("gregtech.api.enums.Materials.Steam"),
+            form: ContentId::new("gas"),
+        },
+        "gregtech.api.util.GTModHandler#getMilk(long)" => FluidSelector::MaterialForm {
+            material: ContentId::new("gregtech.api.enums.Materials.Milk"),
+            form: ContentId::new("fluid"),
+        },
+        "gregtech.api.util.GTModHandler#getDistilledWater(long)" => FluidSelector::Named {
+            id: ContentId::new("ic2distilledwater"),
+        },
+        "gregtech.api.util.GTModHandler#getIC2Coolant(long)" => FluidSelector::Named {
+            id: ContentId::new("ic2coolant"),
+        },
+        "gregtech.api.util.GTModHandler#getLiquidDNA(long)" => FluidSelector::Named {
+            id: ContentId::new("liquiddna"),
+        },
+        "gregtech.api.util.GTModHandler#getHotWater(int)" => FluidSelector::Named {
+            id: ContentId::new("ic2hotwater"),
+        },
+        "gregtech.api.util.GTModHandler#getPahoehoeLava(int)" => FluidSelector::Named {
+            id: ContentId::new("ic2pahoehoelava"),
+        },
+        "gregtech.api.util.GTModHandler#getSuperHeatedSteam(int)" => FluidSelector::Named {
+            id: ContentId::new("ic2superheatedsteam"),
+        },
+        "gregtech.api.util.GTModHandler#getHotCoolant(int)" => FluidSelector::Named {
+            id: ContentId::new("ic2hotcoolant"),
+        },
+        _ => return None,
+    };
+    Some(FluidStackSpec { selector, amount })
 }
 
 fn fluid_form(accessor: &str) -> Option<&'static str> {
@@ -1614,6 +1668,61 @@ mod tests {
         assert!(matches!(
             &lowered.fluid_outputs[0].selector,
             FluidSelector::Named { id } if id.as_str() == "steam"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn lowers_gt_mod_handler_fixed_fluids() -> anyhow::Result<()> {
+        let mod_handler = analyze_source(
+            "GTModHandler.java",
+            "gt5",
+            None,
+            r"
+                package gregtech.api.util;
+                class FluidStack {}
+                class GTModHandler {
+                    static FluidStack getDistilledWater(long amount) { return null; }
+                    static FluidStack getHotWater(int amount) { return null; }
+                }
+            ",
+        )?;
+        let source = r"
+            import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.util.GTModHandler;
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .fluidInputs(GTModHandler.getDistilledWater(1_000))
+                    .fluidOutputs(GTModHandler.getHotWater(250))
+                    .duration(20)
+                    .eut(2)
+                    .addTo(compressorRecipes);
+            }}
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let mut project = JavaProjectIndex::default();
+        project.add_analysis(&mod_handler);
+        project.add_analysis(&analysis);
+        let recovery = crate::recover_with_project(&analysis, &project);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let lowered = super::lower_recipe_with_project(recipe, &analysis.bindings, &project)
+            .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
+        let FluidInputSpec::Stack(input) = &lowered.fluid_inputs[0] else {
+            return Err(anyhow::anyhow!("fluid input was not a stack"));
+        };
+        assert_eq!(input.amount, 1_000);
+        assert!(matches!(
+            &input.selector,
+            FluidSelector::Named { id } if id.as_str() == "ic2distilledwater"
+        ));
+        assert_eq!(lowered.fluid_outputs[0].amount, 250);
+        assert!(matches!(
+            &lowered.fluid_outputs[0].selector,
+            FluidSelector::Named { id } if id.as_str() == "ic2hotwater"
         ));
         Ok(())
     }
