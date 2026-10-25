@@ -173,6 +173,13 @@ pub enum RecipeMetadataValue {
         amount_a: i64,
         amount_b: i64,
     },
+    SourceChamber {
+        particle: ContentId,
+        rate: i64,
+        max_energy: FixedDecimal,
+        focus: FixedDecimal,
+        energy_ratio: FixedDecimal,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

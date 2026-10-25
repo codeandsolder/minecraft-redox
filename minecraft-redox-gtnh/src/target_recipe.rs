@@ -315,6 +315,8 @@ fn lower_metadata_entry(
         lower_sievert_metadata(&metadata.value_expression, bindings, project)?
     } else if is_java_type(expected, "BeamCrafterMetadata") {
         lower_beam_crafter_metadata(&metadata.value_expression, bindings, project)?
+    } else if is_java_type(expected, "SourceChamberMetadata") {
+        lower_source_chamber_metadata(&metadata.value_expression, bindings, project)?
     } else if project.is_some_and(|project| {
         let owner = bindings.resolve_reference(expected);
         project.type_kind(&owner) == Some(JavaTypeKind::Enum)
@@ -608,6 +610,54 @@ fn lower_beam_crafter_metadata(
     })
 }
 
+fn lower_source_chamber_metadata(
+    expression: &JavaExpression,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+) -> Option<RecipeMetadataValue> {
+    let mut calls = Vec::new();
+    let root = flatten_expression_call_chain(expression, &mut calls)?;
+    let root_name = resolved_reference_name(root, bindings)?;
+    if !root_name.ends_with("SourceChamberMetadata")
+        || calls.first()?.0 != "builder"
+        || calls.last()?.0 != "build"
+    {
+        return None;
+    }
+
+    let mut particle = None;
+    let mut rate = None;
+    let mut max_energy = None;
+    let mut focus = None;
+    let mut energy_ratio = None;
+    let middle_len = calls.len().saturating_sub(2);
+    for (method, arguments) in calls.iter().skip(1).take(middle_len) {
+        match (*method, *arguments) {
+            ("particleID", [argument]) => {
+                particle = Some(lower_particle_id_expression(argument, bindings, project)?);
+            }
+            ("rate", [argument]) => {
+                rate = Some(metadata_i64(argument, bindings, project)?);
+            }
+            ("energy", [max, ratio]) => {
+                max_energy = Some(fixed_decimal_value(max)?);
+                energy_ratio = Some(fixed_decimal_value(ratio)?);
+            }
+            ("focus", [argument]) => {
+                focus = Some(fixed_decimal_value(argument)?);
+            }
+            _ => return None,
+        }
+    }
+    Some(RecipeMetadataValue::SourceChamber {
+        particle: particle?,
+        rate: rate?,
+        max_energy: max_energy?,
+        focus: focus?,
+        energy_ratio: energy_ratio?,
+    })
+}
+
 fn flatten_expression_call_chain<'a>(
     expression: &'a JavaExpression,
     calls: &mut Vec<(&'a str, &'a [JavaExpression])>,
@@ -638,7 +688,7 @@ fn lower_particle_id_expression(
     else {
         return None;
     };
-    if method != "getId" || !arguments.is_empty() {
+    if !matches!(method.as_str(), "getId" | "ordinal") || !arguments.is_empty() {
         return None;
     }
     let reference = resolved_reference_name(receiver, bindings)?;
@@ -1598,6 +1648,60 @@ mod tests {
                 amount_b: 120,
             } if particle_a.as_str() == "Particle.PROTON"
                 && particle_b.as_str() == "Particle.ELECTRON"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn lowers_source_chamber_metadata_builder() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+            import gregtech.api.enums.GTValues;
+            class RecipeMetadataKey<T> {}
+            enum Particle { ELECTRON, NEUTRON; }
+            class SourceChamberMetadata {
+                static Builder builder() { return null; }
+                static class Builder {
+                    Builder particleID(int v) { return this; }
+                    Builder rate(int v) { return this; }
+                    Builder energy(float max, float ratio) { return this; }
+                    Builder focus(float v) { return this; }
+                    SourceChamberMetadata build() { return null; }
+                }
+            }
+            class Keys { static RecipeMetadataKey<SourceChamberMetadata> SOURCE; }
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .metadata(Keys.SOURCE, SourceChamberMetadata.builder()
+                        .particleID(Particle.ELECTRON.ordinal())
+                        .rate(20)
+                        .energy(1000, 0.1f)
+                        .focus(98)
+                        .build())
+                    .duration(20)
+                    .eut(2)
+                    .addTo(compressorRecipes);
+            }}
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let mut project = JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let recovery = crate::recover_with_project(&analysis, &project);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let lowered = super::lower_recipe_with_project(recipe, &analysis.bindings, &project)
+            .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
+        assert!(matches!(
+            &lowered.metadata[0].value,
+            RecipeMetadataValue::SourceChamber {
+                particle,
+                rate: 20,
+                max_energy: minecraft_redox_core::content::FixedDecimal { coefficient: 1000, decimal_places: 0 },
+                focus: minecraft_redox_core::content::FixedDecimal { coefficient: 98, decimal_places: 0 },
+                energy_ratio: minecraft_redox_core::content::FixedDecimal { coefficient: 1, decimal_places: 1 },
+            } if particle.as_str() == "Particle.ELECTRON"
         ));
         Ok(())
     }
