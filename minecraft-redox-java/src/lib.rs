@@ -431,7 +431,10 @@ impl JavaProjectIndex {
             if raw.ends_with(supertype_suffix)
                 && let Some(argument) = generic_type_argument(supertype, target_index)
             {
-                return Some(argument.to_owned());
+                return Some(self.normalize_type_name(
+                    argument,
+                    owner.rsplit_once('.').map(|(package, _)| package),
+                ));
             }
             let normalized =
                 self.normalize_owner_name(&raw, owner.rsplit_once('.').map(|(package, _)| package));
@@ -3998,6 +4001,24 @@ mod tests {
         assert_eq!(
             index.generic_supertype_argument("demo.ResearchKey", "RecipeMetadataKey", 0),
             Some(String::from("net.minecraft.item.ItemStack"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn canonicalizes_same_package_inherited_generic_argument() -> anyhow::Result<()> {
+        let source = r"
+            package demo;
+            class RecipeMetadataKey<T> {}
+            enum Upgrade { NONE, BIO }
+            class UpgradeKey extends RecipeMetadataKey<Upgrade> {}
+        ";
+        let analysis = analyze_source("UpgradeKey.java", "demo", None, source)?;
+        let mut index = super::JavaProjectIndex::default();
+        index.add_analysis(&analysis);
+        assert_eq!(
+            index.generic_supertype_argument("demo.UpgradeKey", "RecipeMetadataKey", 0),
+            Some(String::from("demo.Upgrade"))
         );
         Ok(())
     }
