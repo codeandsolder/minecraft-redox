@@ -374,6 +374,35 @@ fn empty_recipe_definition(
     }
 }
 
+fn resolve_recipe_map(
+    chain: &JavaCallChain,
+    add_to: &minecraft_redox_java::JavaCall,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+) -> Option<String> {
+    let raw = add_to.arguments.first()?.trim();
+    let direct = bindings.resolve_reference(raw);
+    let Some(project) = project else {
+        return Some(direct);
+    };
+    if direct != raw || raw.contains('.') {
+        return Some(direct);
+    }
+    let Some(JavaExpression::Reference(reference)) = add_to.argument_expressions.first() else {
+        return Some(direct);
+    };
+    let Some(owner) = project
+        .enclosing_method(&chain.origin.path, add_to.byte_start)
+        .map(|method| method.owner.as_str())
+    else {
+        return Some(direct);
+    };
+    let Some(field) = project.resolve_field(owner, reference, Some(true)) else {
+        return Some(direct);
+    };
+    Some(format!("{}.{}", field.owner, field.name))
+}
+
 fn recognize_recipe(
     chain: &JavaCallChain,
     bindings: &JavaBindings,
@@ -383,7 +412,7 @@ fn recognize_recipe(
         return None;
     }
     let add_to = chain.calls.iter().rfind(|call| call.name == "addTo")?;
-    let recipe_map = bindings.resolve_reference(add_to.arguments.first()?);
+    let recipe_map = resolve_recipe_map(chain, add_to, bindings, project)?;
     let mut recipe = empty_recipe_definition(chain, bindings, recipe_map);
 
     let mut after_add = false;
@@ -705,8 +734,8 @@ fn is_known_material_property(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{GtnhSummary, ItemSemantic, recover};
-    use minecraft_redox_java::{JavaExpression, analyze_source};
+    use super::{GtnhSummary, ItemSemantic, recover, recover_with_project};
+    use minecraft_redox_java::{JavaExpression, JavaProjectIndex, analyze_source};
 
     #[test]
     fn recognizes_gt_recipe_builder() -> anyhow::Result<()> {
@@ -762,6 +791,32 @@ mod tests {
         summary.absorb(&analysis, &recovery);
         assert_eq!(summary.recipes_lowered, 1);
         assert!(summary.recipe_lowering_blockers.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_same_class_static_recipe_map_identity() -> anyhow::Result<()> {
+        let source = r"
+            package kubatech.loaders;
+            class DEFCRecipes {
+                static final Object fusionCraftingRecipes = null;
+                void run() {
+                    GTValues.RA.stdBuilder()
+                        .duration(20)
+                        .eut(2)
+                        .addTo(fusionCraftingRecipes);
+                }
+            }
+        ";
+        let analysis = analyze_source("DEFCRecipes.java", "gt5", None, source)?;
+        let mut project = JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let recovery = recover_with_project(&analysis, &project);
+        assert_eq!(recovery.recipes.len(), 1);
+        assert_eq!(
+            recovery.recipes[0].recipe_map,
+            "kubatech.loaders.DEFCRecipes.fusionCraftingRecipes"
+        );
         Ok(())
     }
 

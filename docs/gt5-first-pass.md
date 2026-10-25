@@ -763,3 +763,26 @@ Full GT5 result after this pass:
 - chance blockers: **50**.
 
 The remaining PCB-specific blocker is intentionally not flattened into a boolean requirement: tier-2/3 recipes name a required nanite material, and the count of matching nanites controls maximum parallelism. That belongs in an explicit machine-resource/capability primitive or runtime policy, not in the BIO flag.
+
+### Recipe-map-bound machine capability metadata
+
+Minimum machine-capability metadata is now bound to the recipe maps whose machines actually consume it. The previous generic capability pass correctly recovered the values but its characterization test placed every key on `compressorRecipes`, which proved the value mapping while accidentally permitting those metadata keys globally. The importer now stores a source-backed recipe-map set alongside each capability mapping and fails closed when a known key appears on another map.
+
+This applies to component-assembly-line casing tier, chemical-plant solid-casing tier, precise-assembler casing tier, DE Fusion Crafter casing tier, Nano Forge tier, Naquadah Fuel Refinery coil tier, advanced compression tier, and PCB Factory tier. Surplus machine capability can still affect source-machine speed, parallelism, or overclock policy; those remain machine-side runtime behavior while the recipe keeps only its minimum capability requirement.
+
+The audit exposed one resolver issue rather than a semantic exception: `kubatech.loaders.DEFCRecipes` adds recipes to a same-class static field named `fusionCraftingRecipes`, which previously recovered as the ambiguous bare field name. Project-aware recipe-map recovery now qualifies same-class static fields with their owner, producing `kubatech.loaders.DEFCRecipes.fusionCraftingRecipes` generally instead of whitelisting a bare identifier.
+
+Full GT5 result after this hardening pass is intentionally unchanged:
+
+- target recipes lowered: **3,862 / 5,791 (66.69%)**;
+- metadata blockers: **389**;
+- modifier blockers: **6**;
+- item-input blockers: **1,218**;
+- item-output blockers: **961**;
+- fluid blockers: **457**;
+- non-constant EU/t blockers: **417**;
+- missing-duration blockers: **332**;
+- missing-EU/t blockers: **24**;
+- chance blockers: **50**.
+
+A wrong-map regression now verifies that a syntactically valid static capability level cannot silently acquire semantics on an unrelated recipe map.

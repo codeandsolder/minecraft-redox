@@ -484,11 +484,13 @@ fn collect_metadata_entry<'a>(
         if let Some(kelvin) = lower_coil_heat(call, value, bindings, project, blockers) {
             state.minimum_heat_kelvin = Some(kelvin);
         }
-    } else if let Some(capability) = minimum_capability_metadata(key) {
+    } else if let Some(spec) = minimum_capability_metadata(key) {
         if let Some(level) =
-            lower_capability_requirement(recipe, call, key, value, bindings, project, blockers)
+            lower_capability_requirement(recipe, key, spec, value, bindings, project, blockers)
         {
-            state.minimum_capabilities.insert(capability, level);
+            state
+                .minimum_capabilities
+                .insert(ContentId::new(spec.capability), level);
         }
     } else if key == "gregtech.api.util.GTRecipeConstants.ALGAE_POND_TIER" {
         if let Some(level) =
@@ -897,57 +899,39 @@ fn lower_exact_algae_tier(
 
 fn lower_capability_requirement(
     recipe: &RecipeDefinition,
-    call: &crate::BuilderCall,
     key: &str,
+    spec: MinimumCapabilityMetadata,
     value: &JavaExpression,
     bindings: &JavaBindings,
     project: Option<&JavaProjectIndex>,
     blockers: &mut Vec<RecipeLoweringBlocker>,
 ) -> Option<u64> {
-    let Some(level) = lower_nonnegative_scalar(value, bindings, project) else {
+    if !spec.recipe_maps.contains(&recipe.recipe_map.as_str()) {
         push_blocker(
             blockers,
             RecipeLoweringBlockerKind::Metadata,
             format!(
-                "machine capability requirement is not a static non-negative level: {}",
-                call.arguments.join(", ")
-            ),
-        );
-        return None;
-    };
-    if key == "gregtech.api.recipe.metadata.PCBFactoryTierKey.INSTANCE"
-        && recipe.recipe_map != "gregtech.api.recipe.RecipeMaps.pcbFactoryRecipes"
-    {
-        push_blocker(
-            blockers,
-            RecipeLoweringBlockerKind::Metadata,
-            format!(
-                "PCB factory tier used on unsupported recipe map {}",
+                "machine capability metadata {key} used on unsupported recipe map {}",
                 recipe.recipe_map
             ),
         );
         return None;
     }
-    if is_compression_tier_key(key) {
-        if recipe.recipe_map != "gregtech.api.recipe.RecipeMaps.compressorRecipes" {
-            push_blocker(
-                blockers,
-                RecipeLoweringBlockerKind::Metadata,
-                format!(
-                    "COMPRESSION_TIER used on unsupported recipe map {}",
-                    recipe.recipe_map
-                ),
-            );
-            return None;
-        }
-        if !(1..=2).contains(&level) {
-            push_blocker(
-                blockers,
-                RecipeLoweringBlockerKind::Metadata,
-                format!("COMPRESSION_TIER must be 1 (HIP) or 2 (black hole), got {level}"),
-            );
-            return None;
-        }
+    let Some(level) = lower_nonnegative_scalar(value, bindings, project) else {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            format!("machine capability requirement {key} is not a static non-negative level"),
+        );
+        return None;
+    };
+    if is_compression_tier_key(key) && !(1..=2).contains(&level) {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            format!("COMPRESSION_TIER must be 1 (HIP) or 2 (black hole), got {level}"),
+        );
+        return None;
     }
     Some(level)
 }
@@ -1446,36 +1430,53 @@ fn is_compression_tier_key(key: &str) -> bool {
     )
 }
 
-fn minimum_capability_metadata(key: &str) -> Option<ContentId> {
-    let capability = match key {
-        "gregtech.api.util.GTRecipeConstants.COAL_CASING_TIER" => {
-            "machine_capability.component_assembly_line_casing"
-        }
-        "gregtech.api.util.GTRecipeConstants.CHEMPLANT_CASING_TIER" => {
-            "machine_capability.chemical_plant_solid_casing"
-        }
-        "gregtech.api.util.GTRecipeConstants.PRECISE_ASSEMBLER_CASING_TIER" => {
-            "machine_capability.precise_assembler_casing"
-        }
-        "gregtech.api.util.GTRecipeConstants.DEFC_CASING_TIER" => {
-            "machine_capability.draconic_evolution_fusion_casing"
-        }
-        "gregtech.api.util.GTRecipeConstants.NANO_FORGE_TIER" => {
-            "machine_capability.nano_forge_structure"
-        }
-        "gregtech.api.util.GTRecipeConstants.NFR_COIL_TIER" => {
-            "machine_capability.naquadah_fuel_refine_coil"
-        }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MinimumCapabilityMetadata {
+    capability: &'static str,
+    recipe_maps: &'static [&'static str],
+}
+
+fn minimum_capability_metadata(key: &str) -> Option<MinimumCapabilityMetadata> {
+    let (capability, recipe_maps): (&str, &[&str]) = match key {
+        "gregtech.api.util.GTRecipeConstants.COAL_CASING_TIER" => (
+            "machine_capability.component_assembly_line_casing",
+            &["goodgenerator.api.recipe.GoodGeneratorRecipeMaps.componentAssemblyLineRecipes"],
+        ),
+        "gregtech.api.util.GTRecipeConstants.CHEMPLANT_CASING_TIER" => (
+            "machine_capability.chemical_plant_solid_casing",
+            &["gregtech.api.recipe.RecipeMaps.chemicalPlantRecipes"],
+        ),
+        "gregtech.api.util.GTRecipeConstants.PRECISE_ASSEMBLER_CASING_TIER" => (
+            "machine_capability.precise_assembler_casing",
+            &["goodgenerator.api.recipe.GoodGeneratorRecipeMaps.preciseAssemblerRecipes"],
+        ),
+        "gregtech.api.util.GTRecipeConstants.DEFC_CASING_TIER" => (
+            "machine_capability.draconic_evolution_fusion_casing",
+            &["kubatech.loaders.DEFCRecipes.fusionCraftingRecipes"],
+        ),
+        "gregtech.api.util.GTRecipeConstants.NANO_FORGE_TIER" => (
+            "machine_capability.nano_forge_structure",
+            &["gregtech.api.recipe.RecipeMaps.nanoForgeRecipes"],
+        ),
+        "gregtech.api.util.GTRecipeConstants.NFR_COIL_TIER" => (
+            "machine_capability.naquadah_fuel_refine_coil",
+            &["goodgenerator.api.recipe.GoodGeneratorRecipeMaps.naquadahFuelRefineFactoryRecipes"],
+        ),
         "gregtech.api.util.GTRecipeConstants.COMPRESSION_TIER"
-        | "gregtech.api.recipe.metadata.CompressionTierKey.INSTANCE" => {
-            "machine_capability.advanced_compression"
-        }
-        "gregtech.api.recipe.metadata.PCBFactoryTierKey.INSTANCE" => {
-            "machine_capability.pcb_factory_tier"
-        }
+        | "gregtech.api.recipe.metadata.CompressionTierKey.INSTANCE" => (
+            "machine_capability.advanced_compression",
+            &["gregtech.api.recipe.RecipeMaps.compressorRecipes"],
+        ),
+        "gregtech.api.recipe.metadata.PCBFactoryTierKey.INSTANCE" => (
+            "machine_capability.pcb_factory_tier",
+            &["gregtech.api.recipe.RecipeMaps.pcbFactoryRecipes"],
+        ),
         _ => return None,
     };
-    Some(ContentId::new(capability))
+    Some(MinimumCapabilityMetadata {
+        capability,
+        recipe_maps,
+    })
 }
 
 fn lower_nonnegative_scalar(
@@ -3345,13 +3346,18 @@ mod tests {
     #[test]
     fn lowers_casing_metadata_to_named_machine_capabilities() -> anyhow::Result<()> {
         let source = r"
-            import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+            import static goodgenerator.api.recipe.GoodGeneratorRecipeMaps.componentAssemblyLineRecipes;
+            import static goodgenerator.api.recipe.GoodGeneratorRecipeMaps.naquadahFuelRefineFactoryRecipes;
+            import static goodgenerator.api.recipe.GoodGeneratorRecipeMaps.preciseAssemblerRecipes;
+            import static gregtech.api.recipe.RecipeMaps.chemicalPlantRecipes;
+            import static gregtech.api.recipe.RecipeMaps.nanoForgeRecipes;
             import static gregtech.api.util.GTRecipeConstants.CHEMPLANT_CASING_TIER;
             import static gregtech.api.util.GTRecipeConstants.COAL_CASING_TIER;
             import static gregtech.api.util.GTRecipeConstants.DEFC_CASING_TIER;
             import static gregtech.api.util.GTRecipeConstants.NANO_FORGE_TIER;
             import static gregtech.api.util.GTRecipeConstants.NFR_COIL_TIER;
             import static gregtech.api.util.GTRecipeConstants.PRECISE_ASSEMBLER_CASING_TIER;
+            import static kubatech.loaders.DEFCRecipes.fusionCraftingRecipes;
             import gregtech.api.enums.GTValues;
             import gregtech.api.enums.Materials;
             class Recipes {
@@ -3360,42 +3366,42 @@ mod tests {
                         .itemInputs(Materials.Iron.getDust(1))
                         .itemOutputs(Materials.Steel.getDust(1))
                         .metadata(COAL_CASING_TIER, 6)
-                        .duration(20).eut(2).addTo(compressorRecipes);
+                        .duration(20).eut(2).addTo(componentAssemblyLineRecipes);
                 }
                 void chemical() {
                     GTValues.RA.stdBuilder()
                         .itemInputs(Materials.Iron.getDust(1))
                         .itemOutputs(Materials.Steel.getDust(1))
                         .metadata(CHEMPLANT_CASING_TIER, 3)
-                        .duration(20).eut(2).addTo(compressorRecipes);
+                        .duration(20).eut(2).addTo(chemicalPlantRecipes);
                 }
                 void precise() {
                     GTValues.RA.stdBuilder()
                         .itemInputs(Materials.Iron.getDust(1))
                         .itemOutputs(Materials.Steel.getDust(1))
                         .metadata(PRECISE_ASSEMBLER_CASING_TIER, 2)
-                        .duration(20).eut(2).addTo(compressorRecipes);
+                        .duration(20).eut(2).addTo(preciseAssemblerRecipes);
                 }
                 void defc() {
                     GTValues.RA.stdBuilder()
                         .itemInputs(Materials.Iron.getDust(1))
                         .itemOutputs(Materials.Steel.getDust(1))
                         .metadata(DEFC_CASING_TIER, 4)
-                        .duration(20).eut(2).addTo(compressorRecipes);
+                        .duration(20).eut(2).addTo(fusionCraftingRecipes);
                 }
                 void nanoForge() {
                     GTValues.RA.stdBuilder()
                         .itemInputs(Materials.Iron.getDust(1))
                         .itemOutputs(Materials.Steel.getDust(1))
                         .metadata(NANO_FORGE_TIER, 3)
-                        .duration(20).eut(2).addTo(compressorRecipes);
+                        .duration(20).eut(2).addTo(nanoForgeRecipes);
                 }
                 void fuelRefine() {
                     GTValues.RA.stdBuilder()
                         .itemInputs(Materials.Iron.getDust(1))
                         .itemOutputs(Materials.Steel.getDust(1))
                         .metadata(NFR_COIL_TIER, 4)
-                        .duration(20).eut(2).addTo(compressorRecipes);
+                        .duration(20).eut(2).addTo(naquadahFuelRefineFactoryRecipes);
                 }
             }
         ";
@@ -3421,6 +3427,37 @@ mod tests {
                 }]
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn machine_capability_metadata_on_wrong_map_stays_blocked() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+            import static gregtech.api.util.GTRecipeConstants.NANO_FORGE_TIER;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .itemInputs(Materials.Iron.getDust(1))
+                    .itemOutputs(Materials.Steel.getDust(1))
+                    .metadata(NANO_FORGE_TIER, 3)
+                    .duration(20).eut(2).addTo(compressorRecipes);
+            }}
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let recovery = recover(&analysis);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let failure = lower_recipe(recipe, &analysis.bindings)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("wrong-map capability unexpectedly lowered"))?;
+        assert!(failure.blockers.iter().any(|blocker| {
+            blocker.kind == RecipeLoweringBlockerKind::Metadata
+                && blocker.detail.contains("used on unsupported recipe map")
+        }));
         Ok(())
     }
 
