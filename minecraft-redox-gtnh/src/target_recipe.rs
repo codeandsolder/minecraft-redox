@@ -4,7 +4,7 @@ use minecraft_redox_core::{
     SourceOrigin,
     content::{
         ContentId, ContentRecipe, FluidSelector, FluidStackSpec, ItemInputSpec, ItemInputStackSpec,
-        ItemOutputSpec, ItemSelector, ItemStackSpec, Probability, RecipeRequirement,
+        ItemOutputSpec, ItemSelector, ItemStackSpec, Probability, RecipeRequirement, RecipeUnlock,
     },
 };
 use minecraft_redox_java::{JavaBindings, JavaExpression, JavaProjectIndex};
@@ -12,7 +12,9 @@ use serde::Serialize;
 
 use crate::{
     FluidSemantic, ItemSemantic, RecipeDefinition, RecoveredExpression,
-    recipe_expression::{literal_i64, resolved_reference_name},
+    recipe_expression::{
+        literal_i64, recover_items, recover_items_with_project, resolved_reference_name,
+    },
     scalar_expression::scalar_i64,
 };
 
@@ -92,7 +94,7 @@ fn lower_recipe_internal(
     project: Option<&JavaProjectIndex>,
 ) -> Result<ContentRecipe, Box<RecipeLoweringFailure>> {
     let mut blockers = structural_blockers(recipe);
-    let requirements = lower_metadata(recipe, bindings, project, &mut blockers);
+    let lowered_metadata = lower_metadata(recipe, bindings, project, &mut blockers);
 
     let duration_ticks = match recipe.duration_ticks {
         None => {
@@ -166,7 +168,8 @@ fn lower_recipe_internal(
             item_outputs,
             fluid_inputs,
             fluid_outputs,
-            requirements,
+            requirements: lowered_metadata.requirements,
+            unlock: lowered_metadata.unlock,
             duration_ticks,
             eut,
         });
@@ -232,14 +235,21 @@ fn structural_blockers(recipe: &RecipeDefinition) -> Vec<RecipeLoweringBlocker> 
     blockers
 }
 
+struct LoweredMetadata {
+    requirements: Vec<RecipeRequirement>,
+    unlock: Option<RecipeUnlock>,
+}
+
 fn lower_metadata(
     recipe: &RecipeDefinition,
     bindings: &JavaBindings,
     project: Option<&JavaProjectIndex>,
     blockers: &mut Vec<RecipeLoweringBlocker>,
-) -> Vec<RecipeRequirement> {
+) -> LoweredMetadata {
     let mut minimum_heat_kelvin = None;
     let mut minimum_capabilities = BTreeMap::new();
+    let mut research_item = None;
+    let mut scanning = None;
 
     for call in &recipe.metadata {
         if call.name != "metadata" {
@@ -301,6 +311,27 @@ fn lower_metadata(
                     ),
                 ),
             }
+        } else if matches!(
+            key.as_str(),
+            "gregtech.api.util.GTRecipeConstants.RESEARCH_ITEM"
+                | "gregtech.api.util.GTRecipeConstants.SCANNING"
+        ) {
+            if recipe.recipe_map != "gregtech.api.util.GTRecipeConstants.AssemblyLine" {
+                push_blocker(
+                    blockers,
+                    RecipeLoweringBlockerKind::Metadata,
+                    format!(
+                        "assembly-line research metadata used on recipe map {}",
+                        recipe.recipe_map
+                    ),
+                );
+                continue;
+            }
+            if key.ends_with(".RESEARCH_ITEM") {
+                research_item = Some((call, value));
+            } else {
+                scanning = Some(value);
+            }
         } else {
             push_blocker(
                 blockers,
@@ -310,6 +341,19 @@ fn lower_metadata(
         }
     }
 
+    let requirements = lower_recipe_requirements(minimum_heat_kelvin, minimum_capabilities);
+    let unlock =
+        lower_assembly_line_unlock(recipe, research_item, scanning, bindings, project, blockers);
+    LoweredMetadata {
+        requirements,
+        unlock,
+    }
+}
+
+fn lower_recipe_requirements(
+    minimum_heat_kelvin: Option<u64>,
+    minimum_capabilities: BTreeMap<ContentId, u64>,
+) -> Vec<RecipeRequirement> {
     let mut requirements = Vec::new();
     if let Some(kelvin) = minimum_heat_kelvin {
         requirements.push(RecipeRequirement::MinimumHeat { kelvin });
@@ -320,6 +364,133 @@ fn lower_metadata(
             .map(|(capability, level)| RecipeRequirement::MinimumCapability { capability, level }),
     );
     requirements
+}
+
+fn lower_assembly_line_unlock(
+    recipe: &RecipeDefinition,
+    research_item: Option<(&crate::BuilderCall, &JavaExpression)>,
+    scanning: Option<&JavaExpression>,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+    blockers: &mut Vec<RecipeLoweringBlocker>,
+) -> Option<RecipeUnlock> {
+    if research_item.is_none() && scanning.is_none() {
+        return None;
+    }
+
+    let Some((research_call, research_expression)) = research_item else {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            "AssemblyLine SCANNING has no RESEARCH_ITEM; the source recipe map drops this recipe",
+        );
+        return None;
+    };
+    let Some(scanning) = scanning else {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            "AssemblyLine RESEARCH_ITEM has no SCANNING data and cannot produce a usable scan",
+        );
+        return None;
+    };
+
+    let Some(sample) = lower_metadata_item(
+        recipe,
+        research_call,
+        research_expression,
+        bindings,
+        project,
+    ) else {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            format!(
+                "AssemblyLine RESEARCH_ITEM did not lower to a concrete item: {}",
+                research_call.arguments.join(", ")
+            ),
+        );
+        return None;
+    };
+
+    let JavaExpression::New {
+        type_name,
+        arguments,
+    } = scanning
+    else {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            "AssemblyLine SCANNING is not a Scanning(time, voltage) constructor",
+        );
+        return None;
+    };
+    if !bindings.resolve_reference(type_name).ends_with(".Scanning") || arguments.len() != 2 {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            "AssemblyLine SCANNING is not the expected Scanning(time, voltage) value",
+        );
+        return None;
+    }
+
+    let Some(duration_ticks) = lower_nonnegative_scalar(&arguments[0], bindings, project)
+        .filter(|duration| *duration > 0 && i32::try_from(*duration).is_ok())
+    else {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            "AssemblyLine scan duration is not a positive source-int tick count",
+        );
+        return None;
+    };
+    let Some(eut) = scalar_i64_optional(&arguments[1], bindings, project)
+        .filter(|eut| *eut > 0 && i32::try_from(*eut).is_ok())
+    else {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            "Assembly Line scan EU/t is not a positive source-int value",
+        );
+        return None;
+    };
+
+    let sample = ItemInputStackSpec {
+        selector: sample.selector,
+        amount: sample.amount,
+        consumption_probability: Probability::ONE,
+    };
+    Some(RecipeUnlock::Scan {
+        sample,
+        duration_ticks,
+        eut,
+    })
+}
+
+fn lower_metadata_item(
+    recipe: &RecipeDefinition,
+    call: &crate::BuilderCall,
+    expression: &JavaExpression,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+) -> Option<ItemStackSpec> {
+    let source = call.arguments.get(1)?.clone();
+    let sources = [source];
+    let expressions = [expression.clone()];
+    let recovered = project.map_or_else(
+        || recover_items(&sources, &expressions, bindings),
+        |project| {
+            recover_items_with_project(
+                &sources,
+                &expressions,
+                bindings,
+                project,
+                &recipe.origin.path,
+                call.byte_start,
+            )
+        },
+    );
+    lower_item_semantic(recovered.first()?.semantic.as_ref()?, bindings, project)
 }
 
 fn casing_capability(key: &str) -> Option<ContentId> {
@@ -1141,7 +1312,7 @@ fn push_blocker(
 #[cfg(test)]
 mod tests {
     use minecraft_redox_core::content::{
-        FluidSelector, ItemInputSpec, ItemSelector, Probability, RecipeRequirement,
+        FluidSelector, ItemInputSpec, ItemSelector, Probability, RecipeRequirement, RecipeUnlock,
     };
     use minecraft_redox_java::{JavaExpression, JavaProjectIndex, analyze_source};
 
@@ -1770,6 +1941,123 @@ mod tests {
                 .iter()
                 .any(|blocker| blocker.kind == RecipeLoweringBlockerKind::ItemInput)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn lowers_assembly_line_research_to_consumed_scan_unlock() -> anyhow::Result<()> {
+        let item_refer = analyze_source(
+            "ItemRefer.java",
+            "gt5",
+            None,
+            r"
+                package goodgenerator.util;
+                import net.minecraft.item.ItemStack;
+                class ItemRefer {
+                    static final ItemRefer Radiation_Protection_Plate = new ItemRefer();
+                    ItemStack get(int amount) { return null; }
+                }
+            ",
+        )?;
+        let recipe = analyze_source(
+            "Recipes.java",
+            "gt5",
+            None,
+            r"
+                package demo;
+                import static gregtech.api.util.GTRecipeConstants.AssemblyLine;
+                import static gregtech.api.util.GTRecipeConstants.RESEARCH_ITEM;
+                import static gregtech.api.util.GTRecipeConstants.SCANNING;
+                import goodgenerator.util.ItemRefer;
+                import gregtech.api.enums.GTValues;
+                import gregtech.api.enums.Materials;
+                import gregtech.api.util.recipe.Scanning;
+                class Recipes { void run() {
+                    GTValues.RA.stdBuilder()
+                        .itemInputs(
+                            Materials.Iron.getDust(1),
+                            Materials.Copper.getDust(1),
+                            Materials.Tin.getDust(1),
+                            Materials.Gold.getDust(1))
+                        .fluidInputs(Materials.Water.getFluid(1000))
+                        .itemOutputs(Materials.Steel.getDust(1))
+                        .metadata(RESEARCH_ITEM, ItemRefer.Radiation_Protection_Plate.get(2))
+                        .metadata(SCANNING, new Scanning(1200, 2048))
+                        .duration(20)
+                        .eut(2)
+                        .addTo(AssemblyLine);
+                }}
+            ",
+        )?;
+        let mut project = JavaProjectIndex::default();
+        project.add_analysis(&item_refer);
+        project.add_analysis(&recipe);
+        let recovery = recover_with_project(&recipe, &project);
+        let recovered = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let lowered = lower_recipe_with_project(recovered, &recipe.bindings, &project)
+            .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
+
+        let Some(RecipeUnlock::Scan {
+            sample,
+            duration_ticks,
+            eut,
+        }) = &lowered.unlock
+        else {
+            return Err(anyhow::anyhow!("assembly-line scan unlock missing"));
+        };
+        assert_eq!(*duration_ticks, 1200);
+        assert_eq!(*eut, 2048);
+        assert_eq!(sample.amount, 2);
+        assert_eq!(sample.consumption_probability, Probability::ONE);
+        assert!(matches!(
+            &sample.selector,
+            ItemSelector::Named { id, variant: None }
+                if id.as_str() == "goodgenerator.util.ItemRefer.Radiation_Protection_Plate"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn assembly_line_scanning_without_research_item_stays_blocked() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.util.GTRecipeConstants.AssemblyLine;
+            import static gregtech.api.util.GTRecipeConstants.SCANNING;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            import gregtech.api.util.recipe.Scanning;
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .itemInputs(
+                        Materials.Iron.getDust(1),
+                        Materials.Copper.getDust(1),
+                        Materials.Tin.getDust(1),
+                        Materials.Gold.getDust(1))
+                    .fluidInputs(Materials.Water.getFluid(1000))
+                    .itemOutputs(Materials.Steel.getDust(1))
+                    .metadata(SCANNING, new Scanning(1200, 2048))
+                    .duration(20)
+                    .eut(2)
+                    .addTo(AssemblyLine);
+            }}
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let recovery = recover(&analysis);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let failure = lower_recipe(recipe, &analysis.bindings)
+            .err()
+            .ok_or_else(|| {
+                anyhow::anyhow!("source-dropped AssemblyLine recipe unexpectedly lowered")
+            })?;
+        assert!(failure.blockers.iter().any(|blocker| {
+            blocker.kind == RecipeLoweringBlockerKind::Metadata
+                && blocker.detail.contains("has no RESEARCH_ITEM")
+        }));
         Ok(())
     }
 

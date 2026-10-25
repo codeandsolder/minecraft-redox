@@ -459,3 +459,26 @@ Full GT5 result after this pass:
 - chance blockers: **50**.
 
 The corpus is five fully lowered recipes short of 60%. No additional family was generalized merely to cross that threshold: the nearest remaining helpers either depend on dynamic material provenance or require structured item/NBT state.
+
+### Assembly Line research as target recipe unlocks
+
+GregTech Assembly Line `RESEARCH_ITEM` plus `SCANNING` metadata is now lowered as a source-independent `RecipeUnlock::Scan` rather than preserved as metadata or expanded into source fake recipes. The target unlock carries the research sample, scan duration in ticks, and EU/t. The sample is represented as a required input with deterministic consumption, matching `ScannerHandlerLoader`/`MTEScanner`, where `mResearchItem.stackSize` is removed when research begins.
+
+The source data-stick output, persistent recipe hash, `specialValue(-201)`, scanner fake recipe, and assembly-line visual recipe are intentionally not part of the target semantic model. They are GregTech UI/transport machinery around the fact that completing the scan grants access to the Assembly Line recipe.
+
+Metadata item values reuse the normal project-aware item recovery/lowering path. `BuilderCall` therefore retains source byte positions, allowing research samples such as linked `ItemRefer.*.get(...)` helpers to resolve with the same provenance rules as ordinary recipe items rather than creating a weaker metadata-specific parser.
+
+Corpus characterization found 142 Assembly Line recipes carrying `SCANNING`: 134 also have `RESEARCH_ITEM`, while eight have scanning data alone. GregTech's `AssemblyLine` recipe-map transformer returns no recipe when `RESEARCH_ITEM` is absent, so those eight remain fail-closed instead of being invented as usable target recipes. Missing or non-positive scan time/EU/t is likewise not accepted as a usable target unlock.
+
+Full GT5 result after this pass:
+
+- target recipes lowered: **3,502 / 5,791 (60.47%)**, up from 3,470 / 5,791 (59.92%);
+- metadata blockers: **746**, down from 872;
+- item-input blockers: **1,218**;
+- item-output blockers: **961**;
+- fluid blockers: **457**;
+- non-constant EU/t blockers: **417**;
+- modifier blockers: **178**;
+- chance blockers: **50**.
+
+This removes metadata as a blocker from 126 recipes and adds 32 fully lowered recipes. The remaining valid research-sample failures are content-identity problems, not research semantics: seven `Loaders.NeutronAccelerators[index]` stacks are populated procedurally from a registration loop, and `LanthItemList.TARGET_CHAMBER` is a mutable static `ItemStack` assigned during registration. Those should be solved by a general procedural content-identity pass rather than special-cased in Assembly Line research lowering.

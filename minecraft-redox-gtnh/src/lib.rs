@@ -26,6 +26,8 @@ pub struct BuilderCall {
     pub name: String,
     pub arguments: Vec<String>,
     pub argument_expressions: Vec<JavaExpression>,
+    pub byte_start: usize,
+    pub byte_end: usize,
 }
 
 impl From<&JavaCall> for BuilderCall {
@@ -34,6 +36,8 @@ impl From<&JavaCall> for BuilderCall {
             name: call.name.clone(),
             arguments: call.arguments.clone(),
             argument_expressions: call.argument_expressions.clone(),
+            byte_start: call.byte_start,
+            byte_end: call.byte_end,
         }
     }
 }

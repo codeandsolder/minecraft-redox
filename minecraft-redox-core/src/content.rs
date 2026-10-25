@@ -154,6 +154,21 @@ pub enum RecipeRequirement {
     MinimumCapability { capability: ContentId, level: u64 },
 }
 
+/// A source-independent process that grants access to a recipe.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RecipeUnlock {
+    /// Consume a matching sample while scanning it for the configured time and power.
+    ///
+    /// Source-specific knowledge carriers (for example data sticks) are intentionally
+    /// not represented here; they are transport/UI details around the resulting unlock.
+    Scan {
+        sample: ItemInputStackSpec,
+        duration_ticks: u64,
+        eut: i64,
+    },
+}
+
 /// Minimal target recipe IR.
 ///
 /// This deliberately starts smaller than GTNH's full recipe vocabulary. A source
@@ -168,6 +183,7 @@ pub struct ContentRecipe {
     pub fluid_inputs: Vec<FluidStackSpec>,
     pub fluid_outputs: Vec<FluidStackSpec>,
     pub requirements: Vec<RecipeRequirement>,
+    pub unlock: Option<RecipeUnlock>,
     pub duration_ticks: u64,
     pub eut: i64,
 }
