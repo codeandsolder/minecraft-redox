@@ -1133,3 +1133,32 @@ Full pinned-corpus result:
 - missing-EU/t blockers: **24**;
 - post-add blockers: **7**;
 - modifier blockers: **6**.
+
+
+### Ore-dictionary object input slots
+
+`GTRecipeBuilder.itemInputs(Object...)` treats a two-element `Object[]` as one ore-dictionary input slot: element 0 is converted to an ore key and element 1 is the required stack amount. The builder then accepts any registered stack under that ore key; it does not treat the Java array itself as recipe data.
+
+The target lowerer now consumes the already-recovered `ItemSemantic::OreDictAlternativeInput` directly:
+
+- literal string keys become `ItemSelector::OreKey`;
+- `OrePrefixes.<form>.get(Materials.<material>)` becomes the source-independent `ItemSelector::MaterialForm { material, form }`, avoiding GT's incidental `ItemData.toString()` encoding;
+- the second array element is lowered through the normal static scalar evaluator;
+- dynamic keys, non-GT prefix/material expressions, or dynamic amounts remain fail-closed.
+
+This particularly removes the Assembly Line families expressed as e.g. `new Object[] { OrePrefixes.circuit.get(Materials.UV), 4 }`, without enumerating the runtime ore registry.
+
+Full pinned-corpus result:
+
+- target recipes lowered: **4,138 / 5,791 (71.46%)**, up from 4,071 / 5,791 (70.30%);
+- item-input blockers: **1,086**, down from 1,179;
+- item-output blockers: **945**;
+- fluid blockers: **306**;
+- metadata blockers: **331**;
+- non-constant EU/t blockers: **417**;
+- missing-duration blockers: **332**;
+- chance blockers: **50**;
+- special blockers: **31**;
+- missing-EU/t blockers: **24**;
+- post-add blockers: **7**;
+- modifier blockers: **6**.

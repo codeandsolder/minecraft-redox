@@ -2312,6 +2312,11 @@ fn lower_item_input_semantic(
     project: Option<&JavaProjectIndex>,
 ) -> Option<ItemInputSpec> {
     match semantic {
+        ItemSemantic::OreDictAlternativeInput { key, amount } => {
+            lower_ore_dict_alternative_input(key, amount, bindings, project)
+                .map(|stack| input_stack_spec(stack, consumption_probability))
+                .map(ItemInputSpec::Stack)
+        }
         ItemSemantic::ExplicitAlternatives { alternatives } => {
             let choices = alternatives
                 .iter()
@@ -2330,6 +2335,44 @@ fn lower_item_input_semantic(
             .map(|stack| input_stack_spec(stack, consumption_probability))
             .map(ItemInputSpec::Stack),
     }
+}
+
+fn lower_ore_dict_alternative_input(
+    key: &JavaExpression,
+    amount: &JavaExpression,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+) -> Option<ItemStackSpec> {
+    let amount = scalar_amount_u64(amount, bindings, project)?;
+    let selector = if let Some(key) = simple_string_literal(key) {
+        ItemSelector::OreKey {
+            key: ContentId::new(key),
+        }
+    } else {
+        let JavaExpression::Call {
+            receiver: Some(receiver),
+            method,
+            arguments,
+        } = key
+        else {
+            return None;
+        };
+        if method != "get" || arguments.len() != 1 {
+            return None;
+        }
+        let form = resolved_reference_name(receiver, bindings)?;
+        let material = resolved_reference_name(arguments.first()?, bindings)?;
+        if !form.starts_with("gregtech.api.enums.OrePrefixes.")
+            || !material.starts_with("gregtech.api.enums.Materials.")
+        {
+            return None;
+        }
+        ItemSelector::MaterialForm {
+            material: ContentId::new(material),
+            form: ContentId::new(form),
+        }
+    };
+    Some(ItemStackSpec { selector, amount })
 }
 
 fn input_stack_spec(
@@ -6118,6 +6161,77 @@ mod tests {
                 .iter()
                 .any(|blocker| blocker.kind == RecipeLoweringBlockerKind::Metadata)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn lowers_ore_dict_object_inputs_without_enumerating_registry() -> anyhow::Result<()> {
+        let source = r#"
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            import gregtech.api.enums.OrePrefixes;
+            class Recipes {
+                void staticInputs() {
+                    GTValues.RA.stdBuilder()
+                        .itemInputs(
+                            new Object[] { OrePrefixes.circuit.get(Materials.UV), 4 },
+                            new Object[] { "circuitSpecial", 2 })
+                        .itemOutputs(Materials.Iron.getDust(1))
+                        .duration(20).eut(4)
+                        .addTo(gregtech.api.recipe.RecipeMaps.assemblerRecipes);
+                }
+                void dynamicAmount(int amount) {
+                    GTValues.RA.stdBuilder()
+                        .itemInputs(new Object[] { OrePrefixes.circuit.get(Materials.UV), amount })
+                        .itemOutputs(Materials.Iron.getDust(1))
+                        .duration(20).eut(4)
+                        .addTo(gregtech.api.recipe.RecipeMaps.assemblerRecipes);
+                }
+            }
+        "#;
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let mut project = JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let recovery = crate::recover_with_project(&analysis, &project);
+        assert_eq!(recovery.recipes.len(), 2);
+
+        let lowered = super::lower_recipe_with_project(
+            &recovery.recipes[0],
+            &analysis.bindings,
+            &project,
+        )
+        .map_err(|failure| anyhow::anyhow!("ore-dict object lowering failed: {failure:?}"))?;
+        assert_eq!(lowered.item_inputs.len(), 2);
+        let ItemInputSpec::Stack(material_form) = &lowered.item_inputs[0] else {
+            return Err(anyhow::anyhow!("material-form ore input became alternatives"));
+        };
+        assert_eq!(material_form.amount, 4);
+        assert!(matches!(
+            &material_form.selector,
+            ItemSelector::MaterialForm { material, form }
+                if material.as_str() == "gregtech.api.enums.Materials.UV"
+                    && form.as_str() == "gregtech.api.enums.OrePrefixes.circuit"
+        ));
+        let ItemInputSpec::Stack(ore_key) = &lowered.item_inputs[1] else {
+            return Err(anyhow::anyhow!("literal ore-key input became alternatives"));
+        };
+        assert_eq!(ore_key.amount, 2);
+        assert!(matches!(
+            &ore_key.selector,
+            ItemSelector::OreKey { key } if key.as_str() == "circuitSpecial"
+        ));
+
+        let failure = super::lower_recipe_with_project(
+            &recovery.recipes[1],
+            &analysis.bindings,
+            &project,
+        )
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("dynamic ore-dict amount unexpectedly lowered"))?;
+        assert!(failure
+            .blockers
+            .iter()
+            .any(|blocker| blocker.kind == RecipeLoweringBlockerKind::ItemInput));
         Ok(())
     }
 
