@@ -868,3 +868,30 @@ Full pinned-corpus result:
 The CLI now has `gtnh --blockers <file-or-dir>` for project-aware lowering diagnostics. It groups exact blocker details, counts both total affected recipes and recipes for which that detail is the sole remaining blocker, retains a few source examples, and sorts by sole-blocker value first. This makes lowering work prioritize semantic wins rather than raw source frequency.
 
 After the soldering pass there are **1,875** failed recipes, exactly 5,791 - 3,916. The leading sole blockers are Beam Crafter metadata (22), `ADDITIVE_AMOUNT` (18), `GTUtility.copyAmount(1, aStack)` item provenance (13), dynamic iron-ingot output amount (12), `NKE_RANGE` (12), `logWood16` item provenance (11), distilled-water helpers (10+5 for the two largest exact forms), and dissolution-tank ratio (9).
+
+
+### Transparent GTModHandler registry-fluid helpers
+
+Project-linked GTModHandler fluid methods are now lowered only when their source body is a direct fixed fluid constructor. The supported set is:
+
+- `getHotWater(int)` -> named fluid `ic2hotwater`;
+- `getPahoehoeLava(int)` -> `ic2pahoehoelava`;
+- `getSuperHeatedSteam(int)` -> `ic2superheatedsteam`;
+- `getHotCoolant(int)` -> `ic2hotcoolant`.
+
+Each retains its statically evaluated amount and lowers as an ordinary concrete fluid input. `getDistilledWater`, `getIC2Coolant`, and `getLiquidDNA` deliberately remain unresolved because their source implementations contain runtime fallbacks to another fluid; treating them as fixed identities or ordinary interchangeable alternatives would change semantics.
+
+Full pinned-corpus result:
+
+- target recipes lowered: **3,929 / 5,791 (67.85%)**, up from 3,916 / 5,791 (67.62%);
+- fluid blockers: **388**, down from 401;
+- metadata blockers: **379**;
+- item-input blockers: **1,218**;
+- item-output blockers: **961**;
+- non-constant EU/t blockers: **417**;
+- missing-duration blockers: **332**;
+- chance blockers: **50**;
+- special blockers: **31**;
+- missing-EU/t blockers: **24**;
+- post-add blockers: **7**;
+- modifier blockers: **6**.

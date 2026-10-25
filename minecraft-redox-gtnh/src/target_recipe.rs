@@ -2336,10 +2336,34 @@ fn lower_fluid_semantic(
                 amount: scalar_amount_u64(arguments.get(1)?, bindings, project)?,
             })
         }
-        FluidSemantic::RegistryFluid { .. }
-        | FluidSemantic::SolderingSubstitute { .. }
-        | FluidSemantic::LinkedMethod { .. } => None,
+        FluidSemantic::LinkedMethod {
+            method_id,
+            arguments,
+            ..
+        } => lower_transparent_linked_fluid_helper(method_id, arguments, bindings, project),
+        FluidSemantic::RegistryFluid { .. } | FluidSemantic::SolderingSubstitute { .. } => None,
     }
+}
+
+fn lower_transparent_linked_fluid_helper(
+    method_id: &str,
+    arguments: &[JavaExpression],
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+) -> Option<FluidStackSpec> {
+    let fluid_id = match method_id {
+        "gregtech.api.util.GTModHandler#getHotWater(int)" => "ic2hotwater",
+        "gregtech.api.util.GTModHandler#getPahoehoeLava(int)" => "ic2pahoehoelava",
+        "gregtech.api.util.GTModHandler#getSuperHeatedSteam(int)" => "ic2superheatedsteam",
+        "gregtech.api.util.GTModHandler#getHotCoolant(int)" => "ic2hotcoolant",
+        _ => return None,
+    };
+    Some(FluidStackSpec {
+        selector: FluidSelector::Named {
+            id: ContentId::new(fluid_id),
+        },
+        amount: scalar_amount_u64(arguments.first()?, bindings, project)?,
+    })
 }
 
 fn fluid_form(accessor: &str) -> Option<&'static str> {
@@ -4543,6 +4567,123 @@ mod tests {
         assert_eq!(
             lowered.item_outputs[1].production_probability,
             Probability::ONE
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn lowers_transparent_gtmodhandler_registry_fluids() -> anyhow::Result<()> {
+        let helper = analyze_source(
+            "GTModHandler.java",
+            "gt5",
+            None,
+            r"
+                package gregtech.api.util;
+                import net.minecraftforge.fluids.FluidStack;
+                class GTModHandler {
+                    static FluidStack getHotWater(int amount) { return null; }
+                    static FluidStack getPahoehoeLava(int amount) { return null; }
+                    static FluidStack getSuperHeatedSteam(int amount) { return null; }
+                    static FluidStack getHotCoolant(int amount) { return null; }
+                    static FluidStack getDistilledWater(long amount) { return null; }
+                }
+            ",
+        )?;
+        let source = r"
+            import static gregtech.api.recipe.RecipeMaps.chemicalReactorRecipes;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            import gregtech.api.util.GTModHandler;
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .itemInputs(Materials.Iron.getDust(1))
+                    .itemOutputs(Materials.Steel.getDust(1))
+                    .fluidInputs(
+                        GTModHandler.getHotWater(1000),
+                        GTModHandler.getPahoehoeLava(2000),
+                        GTModHandler.getSuperHeatedSteam(3000),
+                        GTModHandler.getHotCoolant(4000))
+                    .duration(20).eut(2).addTo(chemicalReactorRecipes);
+            }}
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let mut project = JavaProjectIndex::default();
+        project.add_analysis(&helper);
+        project.add_analysis(&analysis);
+        let recovery = crate::recover_with_project(&analysis, &project);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let lowered = super::lower_recipe_with_project(recipe, &analysis.bindings, &project)
+            .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
+        let expected = [
+            ("ic2hotwater", 1000),
+            ("ic2pahoehoelava", 2000),
+            ("ic2superheatedsteam", 3000),
+            ("ic2hotcoolant", 4000),
+        ];
+        assert_eq!(lowered.fluid_inputs.len(), expected.len());
+        for (input, (fluid_id, amount)) in lowered.fluid_inputs.iter().zip(expected) {
+            let FluidInputSpec::Stack(stack) = input else {
+                return Err(anyhow::anyhow!("fixed registry fluid became alternatives"));
+            };
+            assert_eq!(stack.amount, amount);
+            assert!(matches!(
+                &stack.selector,
+                FluidSelector::Named { id } if id.as_str() == fluid_id
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn fallback_gtmodhandler_fluids_stay_unresolved() -> anyhow::Result<()> {
+        let helper = analyze_source(
+            "GTModHandler.java",
+            "gt5",
+            None,
+            r"
+                package gregtech.api.util;
+                import net.minecraftforge.fluids.FluidStack;
+                class GTModHandler {
+                    static FluidStack getDistilledWater(long amount) { return null; }
+                }
+            ",
+        )?;
+        let source = r"
+            import static gregtech.api.recipe.RecipeMaps.chemicalReactorRecipes;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            import gregtech.api.util.GTModHandler;
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .itemInputs(Materials.Iron.getDust(1))
+                    .itemOutputs(Materials.Steel.getDust(1))
+                    .fluidInputs(GTModHandler.getDistilledWater(1000))
+                    .duration(20).eut(2).addTo(chemicalReactorRecipes);
+            }}
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let mut project = JavaProjectIndex::default();
+        project.add_analysis(&helper);
+        project.add_analysis(&analysis);
+        let recovery = crate::recover_with_project(&analysis, &project);
+        let failure = super::lower_recipe_with_project(
+            recovery
+                .recipes
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("recipe missing"))?,
+            &analysis.bindings,
+            &project,
+        )
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("fallback fluid unexpectedly lowered"))?;
+        assert!(
+            failure
+                .blockers
+                .iter()
+                .any(|blocker| blocker.kind == RecipeLoweringBlockerKind::Fluids)
         );
         Ok(())
     }
