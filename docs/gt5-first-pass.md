@@ -1051,3 +1051,33 @@ Full pinned-corpus result:
 - missing-EU/t blockers: **24**;
 - post-add blockers: **7**;
 - modifier blockers: **6**.
+
+
+### Large Hadron Collider descriptors are reference-only
+
+The five `largeHadronColliderRecipes` entries are now explicitly `ReferenceOnly`. Source inspection shows `MTELargeHadronCollider.checkProcessing()` completely overrides normal recipe execution and never looks up these entries; actual accelerator/collider behavior is driven by beam state and installed `LHCModule`s. `LARGE_HADRON_COLLIDER_METADATA` is consumed only by the recipe-browser frontend to display accepted particles and choose progress art.
+
+Because the target discards that redundant presentation payload, the adapter is intentionally narrow: it accepts only the five canonical source descriptor shapes and verifies that each metadata descriptor matches its source casing and progress-art index:
+
+- CMS casing / electromagnetic module;
+- ATLAS casing / lower Weak particle-list half;
+- ATLAS casing / upper Weak particle-list half;
+- ALICE casing / Strong module;
+- LHCb casing / Gravity module.
+
+The metadata builder must be the exact same-package `LargeHadronColliderMetadata.builder()` chain. Unknown setters, changed list slices, mismatched casing/module pairs, dynamic indices, or use on another recipe map remain fail-closed.
+
+Full pinned-corpus result:
+
+- target recipes lowered: **4,022 / 5,791 (69.45%)**, up from 4,017 / 5,791 (69.37%);
+- metadata blockers: **331**, down from 336;
+- fluid blockers: **323**;
+- item-input blockers: **1,218**;
+- item-output blockers: **961**;
+- non-constant EU/t blockers: **417**;
+- missing-duration blockers: **332**;
+- chance blockers: **50**;
+- special blockers: **31**;
+- missing-EU/t blockers: **24**;
+- post-add blockers: **7**;
+- modifier blockers: **6**.

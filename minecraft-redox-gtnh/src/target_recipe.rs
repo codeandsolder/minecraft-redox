@@ -247,10 +247,11 @@ fn lower_availability_requirements(
 }
 
 fn lower_execution_mode(recipe: &RecipeDefinition) -> RecipeExecutionMode {
-    if recipe
-        .execution_policy_calls
-        .iter()
-        .any(|call| call.name == "fake")
+    if recipe.recipe_map == "gregtech.api.recipe.RecipeMaps.largeHadronColliderRecipes"
+        || recipe
+            .execution_policy_calls
+            .iter()
+            .any(|call| call.name == "fake")
     {
         RecipeExecutionMode::ReferenceOnly
     } else {
@@ -535,6 +536,8 @@ fn collect_metadata_entry<'a>(
         {
             state.progress_override = Some(progress);
         }
+    } else if key == "gregtech.api.recipe.RecipeMaps.LARGE_HADRON_COLLIDER_METADATA" {
+        lower_lhc_reference_metadata(recipe, call, value, bindings, project, blockers);
     } else if key == "gregtech.api.util.GTRecipeConstants.FOUNDRY_MODULE" {
         lower_foundry_reference_metadata(recipe, call, value, bindings, blockers);
     } else if key == "gregtech.api.util.GTRecipeConstants.DISSOLUTION_TANK_RATIO" {
@@ -713,6 +716,199 @@ fn lower_foundry_reference_metadata(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LhcReferenceDescriptor {
+    Electromagnetic,
+    WeakLower,
+    WeakUpper,
+    Strong,
+    Gravity,
+}
+
+fn lower_lhc_reference_metadata(
+    recipe: &RecipeDefinition,
+    call: &crate::BuilderCall,
+    value: &JavaExpression,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+    blockers: &mut Vec<RecipeLoweringBlocker>,
+) {
+    const LHC_MAP: &str = "gregtech.api.recipe.RecipeMaps.largeHadronColliderRecipes";
+    if recipe.recipe_map != LHC_MAP {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            format!(
+                "LARGE_HADRON_COLLIDER_METADATA used on unsupported recipe map {}",
+                recipe.recipe_map
+            ),
+        );
+        return;
+    }
+    let Some((descriptor, progress_index)) =
+        parse_lhc_reference_metadata(call, value, bindings, project, blockers)
+    else {
+        return;
+    };
+    let (expected_item, expected_progress) = match descriptor {
+        LhcReferenceDescriptor::Electromagnetic => ("gregtech.api.enums.ItemList.CMSCasing", 0),
+        LhcReferenceDescriptor::WeakLower | LhcReferenceDescriptor::WeakUpper => {
+            ("gregtech.api.enums.ItemList.ATLASCasing", 1)
+        }
+        LhcReferenceDescriptor::Strong => ("gregtech.api.enums.ItemList.ALICECasing", 2),
+        LhcReferenceDescriptor::Gravity => ("gregtech.api.enums.ItemList.LHCbCasing", 3),
+    };
+    if progress_index != expected_progress
+        || !lhc_reference_input_matches(recipe, expected_item, bindings, project)
+    {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            "Large Hadron Collider reference metadata does not match its canonical casing/module descriptor",
+        );
+    }
+}
+
+fn parse_lhc_reference_metadata(
+    call: &crate::BuilderCall,
+    value: &JavaExpression,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+    blockers: &mut Vec<RecipeLoweringBlocker>,
+) -> Option<(LhcReferenceDescriptor, i64)> {
+    let Some((setters, root)) = metadata_builder_chain(value) else {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            format!(
+                "unsupported Large Hadron Collider metadata shape: {}",
+                call.arguments.join(", ")
+            ),
+        );
+        return None;
+    };
+    let resolved_root = bindings.resolve_reference(&root);
+    let resolved_root = if resolved_root == "LargeHadronColliderMetadata"
+        && bindings.package.as_deref() == Some("gregtech.loaders.postload.recipes.beamcrafter")
+    {
+        String::from("gregtech.loaders.postload.recipes.beamcrafter.LargeHadronColliderMetadata")
+    } else {
+        resolved_root
+    };
+    if resolved_root != "gregtech.loaders.postload.recipes.beamcrafter.LargeHadronColliderMetadata"
+    {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            format!("unexpected Large Hadron Collider metadata builder: {root}"),
+        );
+        return None;
+    }
+
+    let mut particle_list = None;
+    let mut progress_index = None;
+    for (method, arguments) in setters {
+        let [argument] = arguments else {
+            push_blocker(
+                blockers,
+                RecipeLoweringBlockerKind::Metadata,
+                format!("malformed Large Hadron Collider metadata setter: {method}"),
+            );
+            return None;
+        };
+        match method {
+            "particleList" if particle_list.is_none() => particle_list = Some(argument),
+            "progressBarTextureIndex" if progress_index.is_none() => {
+                progress_index = scalar_i64_optional(argument, bindings, project);
+            }
+            _ => {
+                push_blocker(
+                    blockers,
+                    RecipeLoweringBlockerKind::Metadata,
+                    format!("unsupported Large Hadron Collider metadata setter: {method}"),
+                );
+                return None;
+            }
+        }
+    }
+    let Some(descriptor) =
+        particle_list.and_then(|value| lhc_reference_descriptor(value, bindings))
+    else {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            "Large Hadron Collider particle-list descriptor is not one of the canonical source forms",
+        );
+        return None;
+    };
+    let Some(progress_index) = progress_index else {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            "Large Hadron Collider progress texture index is not static",
+        );
+        return None;
+    };
+    Some((descriptor, progress_index))
+}
+
+fn lhc_reference_descriptor(
+    expression: &JavaExpression,
+    bindings: &JavaBindings,
+) -> Option<LhcReferenceDescriptor> {
+    const PREFIX: &str = "gregtech.common.tileentities.machines.multi.beamcrafting.LHCModule.";
+    if let Some(reference) = resolved_reference_name(expression, bindings) {
+        return match reference.strip_prefix(PREFIX)? {
+            "EM.acceptedParticles" => Some(LhcReferenceDescriptor::Electromagnetic),
+            "Strong.acceptedParticles" => Some(LhcReferenceDescriptor::Strong),
+            "Grav.acceptedParticles" => Some(LhcReferenceDescriptor::Gravity),
+            _ => None,
+        };
+    }
+    let JavaExpression::Call {
+        receiver: Some(receiver),
+        method,
+        arguments,
+    } = expression
+    else {
+        return None;
+    };
+    if method != "subList" || arguments.len() != 2 {
+        return None;
+    }
+    let receiver = resolved_reference_name(receiver, bindings)?;
+    if receiver != format!("{PREFIX}Weak.acceptedParticles") {
+        return None;
+    }
+    match (
+        literal_i64(arguments.first()?),
+        literal_i64(arguments.get(1)?),
+    ) {
+        (Some(0), Some(8)) => Some(LhcReferenceDescriptor::WeakLower),
+        (Some(8), Some(16)) => Some(LhcReferenceDescriptor::WeakUpper),
+        _ => None,
+    }
+}
+
+fn lhc_reference_input_matches(
+    recipe: &RecipeDefinition,
+    expected_item: &str,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+) -> bool {
+    let [input] = recipe.item_input_semantics.as_slice() else {
+        return false;
+    };
+    let Some(stack) = lower_recovered_stack(input, bindings, project) else {
+        return false;
+    };
+    stack.amount == 1
+        && matches!(
+            stack.selector,
+            ItemSelector::Named { id, variant: None } if id.as_str() == expected_item
+        )
+}
+
 fn lower_beamcrafter_progress(
     recipe: &RecipeDefinition,
     call: &crate::BuilderCall,
@@ -733,7 +929,7 @@ fn lower_beamcrafter_progress(
         );
         return None;
     }
-    let Some((setters, root)) = beamcrafter_builder_chain(value) else {
+    let Some((setters, root)) = metadata_builder_chain(value) else {
         push_blocker(
             blockers,
             RecipeLoweringBlockerKind::Metadata,
@@ -821,11 +1017,11 @@ fn lower_beamcrafter_progress(
     })
 }
 
-type BeamCrafterSetter<'a> = (&'a str, &'a [JavaExpression]);
+type MetadataSetter<'a> = (&'a str, &'a [JavaExpression]);
 
-fn beamcrafter_builder_chain(
+fn metadata_builder_chain(
     expression: &JavaExpression,
-) -> Option<(Vec<BeamCrafterSetter<'_>>, String)> {
+) -> Option<(Vec<MetadataSetter<'_>>, String)> {
     let JavaExpression::Call {
         receiver: Some(receiver),
         method,
@@ -5667,6 +5863,104 @@ mod tests {
                 .blockers
                 .iter()
                 .any(|blocker| blocker.kind == RecipeLoweringBlockerKind::Fluids)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn lowers_lhc_module_descriptors_as_reference_only() -> anyhow::Result<()> {
+        let source = r"
+            package gregtech.loaders.postload.recipes.beamcrafter;
+            import static gregtech.api.recipe.RecipeMaps.LARGE_HADRON_COLLIDER_METADATA;
+            import static gregtech.api.recipe.RecipeMaps.largeHadronColliderRecipes;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.ItemList;
+            import gregtech.common.tileentities.machines.multi.beamcrafting.LHCModule;
+            class LargeHadronColliderMetadata {
+                static Builder builder() { return null; }
+                static class Builder {
+                    Builder particleList(Object value) { return this; }
+                    Builder progressBarTextureIndex(int value) { return this; }
+                    LargeHadronColliderMetadata build() { return null; }
+                }
+            }
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .itemInputs(ItemList.ATLASCasing.get(1))
+                    .metadata(
+                        LARGE_HADRON_COLLIDER_METADATA,
+                        LargeHadronColliderMetadata.builder()
+                            .particleList(LHCModule.Weak.acceptedParticles.subList(8, 16))
+                            .progressBarTextureIndex(1)
+                            .build())
+                    .duration(20).eut(32).ignoreCollision().addTo(largeHadronColliderRecipes);
+            }}
+        ";
+        let analysis = analyze_source("LargeHadronColliderRecipes.java", "gt5", None, source)?;
+        let mut project = JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let recovery = crate::recover_with_project(&analysis, &project);
+        let lowered = super::lower_recipe_with_project(
+            recovery
+                .recipes
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("recipe missing"))?,
+            &analysis.bindings,
+            &project,
+        )
+        .map_err(|failure| anyhow::anyhow!("LHC reference lowering failed: {failure:?}"))?;
+        assert_eq!(lowered.execution_mode, RecipeExecutionMode::ReferenceOnly);
+        Ok(())
+    }
+
+    #[test]
+    fn lhc_reference_metadata_mismatch_stays_blocked() -> anyhow::Result<()> {
+        let source = r"
+            package gregtech.loaders.postload.recipes.beamcrafter;
+            import static gregtech.api.recipe.RecipeMaps.LARGE_HADRON_COLLIDER_METADATA;
+            import static gregtech.api.recipe.RecipeMaps.largeHadronColliderRecipes;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.ItemList;
+            import gregtech.common.tileentities.machines.multi.beamcrafting.LHCModule;
+            class LargeHadronColliderMetadata {
+                static Builder builder() { return null; }
+                static class Builder {
+                    Builder particleList(Object value) { return this; }
+                    Builder progressBarTextureIndex(int value) { return this; }
+                    LargeHadronColliderMetadata build() { return null; }
+                }
+            }
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .itemInputs(ItemList.CMSCasing.get(1))
+                    .metadata(
+                        LARGE_HADRON_COLLIDER_METADATA,
+                        LargeHadronColliderMetadata.builder()
+                            .particleList(LHCModule.Strong.acceptedParticles)
+                            .progressBarTextureIndex(2)
+                            .build())
+                    .duration(20).eut(32).ignoreCollision().addTo(largeHadronColliderRecipes);
+            }}
+        ";
+        let analysis = analyze_source("LargeHadronColliderRecipes.java", "gt5", None, source)?;
+        let mut project = JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let recovery = crate::recover_with_project(&analysis, &project);
+        let failure = super::lower_recipe_with_project(
+            recovery
+                .recipes
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("recipe missing"))?,
+            &analysis.bindings,
+            &project,
+        )
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("mismatched LHC descriptor unexpectedly lowered"))?;
+        assert!(
+            failure
+                .blockers
+                .iter()
+                .any(|blocker| blocker.kind == RecipeLoweringBlockerKind::Metadata)
         );
         Ok(())
     }
