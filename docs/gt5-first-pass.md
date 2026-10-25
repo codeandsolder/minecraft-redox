@@ -807,3 +807,25 @@ Full GT5 result after this pass:
 - missing-duration blockers: **332**;
 - missing-EU/t blockers: **24**;
 - chance blockers: **50**.
+
+
+### Bacterial-vat glass tier as a minimum capability
+
+`GTRecipeConstants.GLASS` on BartWorks bacterial-vat recipes is now lowered to `RecipeRequirement::MinimumCapability { capability: machine_capability.bacterial_vat_glass, level }`. Source inspection of `MTEBioVat` shows a direct monotonic gate: the recipe is rejected when the machine's `glassTier` is below the metadata value.
+
+The capability is bound only to `bartworks.API.recipe.BartWorksRecipeMaps.bacterialVatRecipes` through the same map-aware capability table used by the other machine-tier metadata. The pinned corpus contains four directly recovered GLASS annotations, all level 3 on that map.
+
+This pass does not increase the fully lowered recipe count because those BioVat recipes still carry unresolved special BioCulture payloads, but it removes GLASS as an independent blocker:
+
+- target recipes lowered: **3,868 / 5,791 (66.79%)**;
+- metadata blockers: **379**, down from 383;
+- modifier blockers: **6**;
+- item-input blockers: **1,218**;
+- item-output blockers: **961**;
+- fluid blockers: **457**;
+- non-constant EU/t blockers: **417**;
+- missing-duration blockers: **332**;
+- missing-EU/t blockers: **24**;
+- chance blockers: **50**.
+
+The separate `SIEVERT` path is intentionally not folded into this capability: BioVat supports both minimum and exact radiation matching, and the only explicit SIEVERT metadata use in this pinned corpus is on a fake radio-hatch display recipe.

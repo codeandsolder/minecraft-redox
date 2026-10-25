@@ -1489,6 +1489,10 @@ fn minimum_capability_metadata(key: &str) -> Option<MinimumCapabilityMetadata> {
             "machine_capability.precise_assembler_casing",
             &["goodgenerator.api.recipe.GoodGeneratorRecipeMaps.preciseAssemblerRecipes"],
         ),
+        "gregtech.api.util.GTRecipeConstants.GLASS" => (
+            "machine_capability.bacterial_vat_glass",
+            &["bartworks.API.recipe.BartWorksRecipeMaps.bacterialVatRecipes"],
+        ),
         "gregtech.api.util.GTRecipeConstants.DEFC_CASING_TIER" => (
             "machine_capability.draconic_evolution_fusion_casing",
             &["kubatech.loaders.DEFCRecipes.fusionCraftingRecipes"],
@@ -3497,6 +3501,41 @@ mod tests {
             blocker.kind == RecipeLoweringBlockerKind::Metadata
                 && blocker.detail.contains("used on unsupported recipe map")
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn lowers_bacterial_vat_glass_as_minimum_capability() -> anyhow::Result<()> {
+        let source = r"
+            import static bartworks.API.recipe.BartWorksRecipeMaps.bacterialVatRecipes;
+            import static gregtech.api.util.GTRecipeConstants.GLASS;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .itemInputs(Materials.Sugar.getDust(1))
+                    .itemOutputs(Materials.Biomass.getDust(1))
+                    .metadata(GLASS, 3)
+                    .duration(20).eut(2).addTo(bacterialVatRecipes);
+            }}
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let recovery = recover(&analysis);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let lowered = lower_recipe(recipe, &analysis.bindings)
+            .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
+        assert_eq!(
+            lowered.requirements,
+            [RecipeRequirement::MinimumCapability {
+                capability: minecraft_redox_core::content::ContentId::new(
+                    "machine_capability.bacterial_vat_glass"
+                ),
+                level: 3,
+            }]
+        );
         Ok(())
     }
 
