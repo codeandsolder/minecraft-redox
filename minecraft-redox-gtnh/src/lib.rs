@@ -69,6 +69,12 @@ pub struct RecipeDefinition {
     pub metadata: Vec<BuilderCall>,
     /// Explicit source presentation category, retained for archaeology/UI migration only.
     pub recipe_category: Option<BuilderCall>,
+    /// Source UI-only decoration that does not change recipe execution.
+    pub presentation_calls: Vec<BuilderCall>,
+    /// Source registry policy that does not change the recipe once registered.
+    pub registration_calls: Vec<BuilderCall>,
+    /// Source runtime optimization hints with no process-semantic effect.
+    pub execution_hints: Vec<BuilderCall>,
     pub modifiers: Vec<BuilderCall>,
     pub post_add_calls: Vec<BuilderCall>,
     pub unhandled_calls: Vec<BuilderCall>,
@@ -350,6 +356,9 @@ fn empty_recipe_definition(
         special: None,
         metadata: Vec::new(),
         recipe_category: None,
+        presentation_calls: Vec::new(),
+        registration_calls: Vec::new(),
+        execution_hints: Vec::new(),
         modifiers: Vec::new(),
         post_add_calls: Vec::new(),
         unhandled_calls: Vec::new(),
@@ -435,9 +444,13 @@ fn recognize_recipe(
                     recipe.modifiers.push(call.into());
                 }
             }
-            "noOptimize" | "ignoreCollision" | "fake" | "enabled" | "disabled" | "hidden"
-            | "requiresCleanRoom" | "requiresLowGravity" | "requireMods" | "nbtSensitive"
-            | "noBuffer" | "setNEIDesc" => recipe.modifiers.push(call.into()),
+            "hidden" | "setNEIDesc" => recipe.presentation_calls.push(call.into()),
+            "ignoreCollision" => recipe.registration_calls.push(call.into()),
+            "noBuffer" => recipe.execution_hints.push(call.into()),
+            "noOptimize" | "fake" | "enabled" | "disabled" | "requiresCleanRoom"
+            | "requiresLowGravity" | "requireMods" | "nbtSensitive" => {
+                recipe.modifiers.push(call.into());
+            }
             "addTo" => after_add = true,
             _ => recipe.unhandled_calls.push(call.into()),
         }

@@ -854,6 +854,15 @@ fn casing_capability(key: &str) -> Option<ContentId> {
         "gregtech.api.util.GTRecipeConstants.PRECISE_ASSEMBLER_CASING_TIER" => {
             "machine_capability.precise_assembler_casing"
         }
+        "gregtech.api.util.GTRecipeConstants.DEFC_CASING_TIER" => {
+            "machine_capability.draconic_evolution_fusion_casing"
+        }
+        "gregtech.api.util.GTRecipeConstants.NANO_FORGE_TIER" => {
+            "machine_capability.nano_forge_structure"
+        }
+        "gregtech.api.util.GTRecipeConstants.NFR_COIL_TIER" => {
+            "machine_capability.naquadah_fuel_refine_coil"
+        }
         _ => return None,
     };
     Some(ContentId::new(capability))
@@ -2602,6 +2611,9 @@ mod tests {
             import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
             import static gregtech.api.util.GTRecipeConstants.CHEMPLANT_CASING_TIER;
             import static gregtech.api.util.GTRecipeConstants.COAL_CASING_TIER;
+            import static gregtech.api.util.GTRecipeConstants.DEFC_CASING_TIER;
+            import static gregtech.api.util.GTRecipeConstants.NANO_FORGE_TIER;
+            import static gregtech.api.util.GTRecipeConstants.NFR_COIL_TIER;
             import static gregtech.api.util.GTRecipeConstants.PRECISE_ASSEMBLER_CASING_TIER;
             import gregtech.api.enums.GTValues;
             import gregtech.api.enums.Materials;
@@ -2627,6 +2639,27 @@ mod tests {
                         .metadata(PRECISE_ASSEMBLER_CASING_TIER, 2)
                         .duration(20).eut(2).addTo(compressorRecipes);
                 }
+                void defc() {
+                    GTValues.RA.stdBuilder()
+                        .itemInputs(Materials.Iron.getDust(1))
+                        .itemOutputs(Materials.Steel.getDust(1))
+                        .metadata(DEFC_CASING_TIER, 4)
+                        .duration(20).eut(2).addTo(compressorRecipes);
+                }
+                void nanoForge() {
+                    GTValues.RA.stdBuilder()
+                        .itemInputs(Materials.Iron.getDust(1))
+                        .itemOutputs(Materials.Steel.getDust(1))
+                        .metadata(NANO_FORGE_TIER, 3)
+                        .duration(20).eut(2).addTo(compressorRecipes);
+                }
+                void fuelRefine() {
+                    GTValues.RA.stdBuilder()
+                        .itemInputs(Materials.Iron.getDust(1))
+                        .itemOutputs(Materials.Steel.getDust(1))
+                        .metadata(NFR_COIL_TIER, 4)
+                        .duration(20).eut(2).addTo(compressorRecipes);
+                }
             }
         ";
         let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
@@ -2635,6 +2668,9 @@ mod tests {
             ("machine_capability.component_assembly_line_casing", 6),
             ("machine_capability.chemical_plant_solid_casing", 3),
             ("machine_capability.precise_assembler_casing", 2),
+            ("machine_capability.draconic_evolution_fusion_casing", 4),
+            ("machine_capability.nano_forge_structure", 3),
+            ("machine_capability.naquadah_fuel_refine_coil", 4),
         ];
         assert_eq!(recovery.recipes.len(), expected.len());
         for (recipe, (capability, level)) in recovery.recipes.iter().zip(expected) {
@@ -2879,6 +2915,96 @@ mod tests {
             blocker.kind == RecipeLoweringBlockerKind::Metadata
                 && blocker.detail.contains("source dispatcher's")
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn non_process_builder_policy_does_not_block_process_lowering() -> anyhow::Result<()> {
+        let source = r#"
+            import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .itemInputs(Materials.Iron.getDust(1))
+                    .itemOutputs(Materials.Steel.getDust(1))
+                    .hidden()
+                    .setNEIDesc("source-only presentation")
+                    .ignoreCollision()
+                    .noBuffer()
+                    .duration(20)
+                    .eut(2)
+                    .addTo(compressorRecipes);
+            }}
+        "#;
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let recovery = recover(&analysis);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        assert_eq!(
+            recipe
+                .presentation_calls
+                .iter()
+                .map(|call| call.name.as_str())
+                .collect::<Vec<_>>(),
+            ["hidden", "setNEIDesc"]
+        );
+        assert_eq!(
+            recipe
+                .registration_calls
+                .iter()
+                .map(|call| call.name.as_str())
+                .collect::<Vec<_>>(),
+            ["ignoreCollision"]
+        );
+        assert_eq!(
+            recipe
+                .execution_hints
+                .iter()
+                .map(|call| call.name.as_str())
+                .collect::<Vec<_>>(),
+            ["noBuffer"]
+        );
+        assert_eq!(recipe.modifiers.as_slice(), []);
+
+        lower_recipe(recipe, &analysis.bindings)
+            .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn fake_recipe_remains_a_process_blocker() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .itemInputs(Materials.Iron.getDust(1))
+                    .itemOutputs(Materials.Steel.getDust(1))
+                    .fake()
+                    .duration(20)
+                    .eut(2)
+                    .addTo(compressorRecipes);
+            }}
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let recovery = recover(&analysis);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let failure = lower_recipe(recipe, &analysis.bindings)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("fake recipe unexpectedly lowered as executable"))?;
+        assert!(
+            failure
+                .blockers
+                .iter()
+                .any(|blocker| blocker.kind == RecipeLoweringBlockerKind::Modifiers)
+        );
         Ok(())
     }
 

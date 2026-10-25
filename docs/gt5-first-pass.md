@@ -545,3 +545,32 @@ Full GT5 result after this pass:
 - chance blockers: **50**.
 
 This adds 94 fully lowered recipes and removes metadata as a blocker from 119 recipes without weakening source validity checks. The distinction is useful beyond GT5: presentation/grouping provenance can be retained for migration or UI work without being mistaken for runtime recipe semantics.
+
+### Machine capability metadata and non-process builder policy
+
+Three additional source-inspected tier annotations now lower through the existing source-independent `RecipeRequirement::MinimumCapability` model:
+
+- `DEFC_CASING_TIER` -> `machine_capability.draconic_evolution_fusion_casing`;
+- `NANO_FORGE_TIER` -> `machine_capability.nano_forge_structure`;
+- `NFR_COIL_TIER` -> `machine_capability.naquadah_fuel_refine_coil`.
+
+Each source machine rejects a recipe whose annotated tier exceeds the machine tier. Higher machine tiers also influence overclocking, speed, or parallelism, but those are machine-side policies rather than additional recipe facts; the target recipe therefore stores only the minimum capability requirement. `QFT_FOCUS_TIER` is deliberately excluded because it controls optional focusing/output behavior rather than basic recipe admissibility.
+
+Builder calls that do not change the process itself are now retained as source provenance without blocking executable target lowering. `hidden()` and `setNEIDesc(...)` are presentation-only, `ignoreCollision()` controls source registration collision checks, and `noBuffer()` disables GregTech's cached-recipe fast path. They are kept in separate presentation, registration, and execution-hint buckets rather than silently discarded.
+
+Real execution semantics remain fail-closed. In particular, `fake()` makes a recipe non-executable in GregTech lookup, `nbtSensitive()` changes input matching, `requireMods(...)` conditionally suppresses registration, and cleanroom/low-gravity requirements constrain the runtime environment. Cleanroom also has quality-dependent item-output loss in basic machines, so it cannot be represented faithfully as a simple boolean machine capability.
+
+Full GT5 result after this pass:
+
+- target recipes lowered: **3,706 / 5,791 (64.00%)**, up from 3,695 / 5,791 (63.81%);
+- metadata blockers: **472**, down from 504;
+- modifier blockers: **161**, down from 178;
+- item-input blockers: **1,218**;
+- item-output blockers: **961**;
+- fluid blockers: **457**;
+- non-constant EU/t blockers: **417**;
+- missing-duration blockers: **332**;
+- missing-EU/t blockers: **24**;
+- chance blockers: **50**.
+
+The three tier adapters remove 32 metadata blockers but do not independently complete any recipes because all affected corpus entries overlap other blockers. Separating source-only builder policy unlocks 11 complete recipes while preserving the original annotations for archaeology and migration tooling.
