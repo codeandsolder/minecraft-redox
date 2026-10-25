@@ -170,6 +170,7 @@ fn lower_recipe_internal(
             fluid_outputs,
             requirements: lowered_metadata.requirements,
             unlock: lowered_metadata.unlock,
+            startup_energy_eu: lowered_metadata.startup_energy_eu,
             duration_ticks,
             eut,
         });
@@ -238,6 +239,7 @@ fn structural_blockers(recipe: &RecipeDefinition) -> Vec<RecipeLoweringBlocker> 
 struct LoweredMetadata {
     requirements: Vec<RecipeRequirement>,
     unlock: Option<RecipeUnlock>,
+    startup_energy_eu: u64,
 }
 
 fn lower_metadata(
@@ -248,6 +250,7 @@ fn lower_metadata(
 ) -> LoweredMetadata {
     let mut minimum_heat_kelvin = None;
     let mut minimum_capabilities = BTreeMap::new();
+    let mut startup_energy_eu = 0;
     let mut research_item = None;
     let mut scanning = None;
 
@@ -286,16 +289,8 @@ fn lower_metadata(
         };
 
         if key == "gregtech.api.util.GTRecipeConstants.COIL_HEAT" {
-            match lower_nonnegative_scalar(value, bindings, project) {
-                Some(kelvin) => minimum_heat_kelvin = Some(kelvin),
-                None => push_blocker(
-                    blockers,
-                    RecipeLoweringBlockerKind::Metadata,
-                    format!(
-                        "COIL_HEAT is not a static non-negative Kelvin value: {}",
-                        call.arguments.join(", ")
-                    ),
-                ),
+            if let Some(kelvin) = lower_coil_heat(call, value, bindings, project, blockers) {
+                minimum_heat_kelvin = Some(kelvin);
             }
         } else if let Some(capability) = casing_capability(&key) {
             match lower_nonnegative_scalar(value, bindings, project) {
@@ -310,6 +305,12 @@ fn lower_metadata(
                         call.arguments.join(", ")
                     ),
                 ),
+            }
+        } else if key == "gregtech.api.util.GTRecipeConstants.FUSION_THRESHOLD" {
+            if let Some(value) =
+                lower_fusion_startup_energy(recipe, call, value, bindings, project, blockers)
+            {
+                startup_energy_eu = value;
             }
         } else if matches!(
             key.as_str(),
@@ -347,7 +348,62 @@ fn lower_metadata(
     LoweredMetadata {
         requirements,
         unlock,
+        startup_energy_eu,
     }
+}
+
+fn lower_coil_heat(
+    call: &crate::BuilderCall,
+    value: &JavaExpression,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+    blockers: &mut Vec<RecipeLoweringBlocker>,
+) -> Option<u64> {
+    let value = lower_nonnegative_scalar(value, bindings, project);
+    if value.is_none() {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            format!(
+                "COIL_HEAT is not a static non-negative Kelvin value: {}",
+                call.arguments.join(", ")
+            ),
+        );
+    }
+    value
+}
+
+fn lower_fusion_startup_energy(
+    recipe: &RecipeDefinition,
+    call: &crate::BuilderCall,
+    value: &JavaExpression,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+    blockers: &mut Vec<RecipeLoweringBlocker>,
+) -> Option<u64> {
+    if recipe.recipe_map != "gregtech.api.recipe.RecipeMaps.fusionRecipes" {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            format!(
+                "fusion startup energy used on recipe map {}",
+                recipe.recipe_map
+            ),
+        );
+        return None;
+    }
+    let value = lower_nonnegative_scalar(value, bindings, project);
+    if value.is_none() {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            format!(
+                "FUSION_THRESHOLD is not a static non-negative startup energy: {}",
+                call.arguments.join(", ")
+            ),
+        );
+    }
+    value
 }
 
 fn lower_recipe_requirements(
@@ -2057,6 +2113,72 @@ mod tests {
         assert!(failure.blockers.iter().any(|blocker| {
             blocker.kind == RecipeLoweringBlockerKind::Metadata
                 && blocker.detail.contains("has no RESEARCH_ITEM")
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn lowers_fusion_threshold_as_one_time_startup_energy() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.recipe.RecipeMaps.fusionRecipes;
+            import static gregtech.api.util.GTRecipeConstants.FUSION_THRESHOLD;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .fluidInputs(Materials.Hydrogen.getGas(1000))
+                    .fluidOutputs(Materials.Helium.getGas(1000))
+                    .metadata(FUSION_THRESHOLD, 480_000_000L)
+                    .duration(40)
+                    .eut(2048)
+                    .addTo(fusionRecipes);
+            }}
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let recovery = recover(&analysis);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let lowered = lower_recipe(recipe, &analysis.bindings)
+            .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
+        assert_eq!(lowered.startup_energy_eu, 480_000_000);
+        assert_eq!(lowered.duration_ticks, 40);
+        assert_eq!(lowered.eut, 2048);
+        Ok(())
+    }
+
+    #[test]
+    fn fusion_threshold_on_non_fusion_map_stays_blocked() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+            import static gregtech.api.util.GTRecipeConstants.FUSION_THRESHOLD;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .itemInputs(Materials.Iron.getDust(1))
+                    .itemOutputs(Materials.Steel.getDust(1))
+                    .metadata(FUSION_THRESHOLD, 480_000_000L)
+                    .duration(20)
+                    .eut(2)
+                    .addTo(compressorRecipes);
+            }}
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let recovery = recover(&analysis);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let failure = lower_recipe(recipe, &analysis.bindings)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("non-fusion startup metadata unexpectedly lowered"))?;
+        assert!(failure.blockers.iter().any(|blocker| {
+            blocker.kind == RecipeLoweringBlockerKind::Metadata
+                && blocker
+                    .detail
+                    .contains("fusion startup energy used on recipe map")
         }));
         Ok(())
     }

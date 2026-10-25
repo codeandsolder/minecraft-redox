@@ -482,3 +482,24 @@ Full GT5 result after this pass:
 - chance blockers: **50**.
 
 This removes metadata as a blocker from 126 recipes and adds 32 fully lowered recipes. The remaining valid research-sample failures are content-identity problems, not research semantics: seven `Loaders.NeutronAccelerators[index]` stacks are populated procedurally from a registration loop, and `LanthItemList.TARGET_CHAMBER` is a mutable static `ItemStack` assigned during registration. Those should be solved by a general procedural content-identity pass rather than special-cased in Assembly Line research lowering.
+
+### Fusion ignition as generic startup energy
+
+`GTRecipeConstants.FUSION_THRESHOLD` is now lowered to the source-independent `ContentRecipe.startup_energy_eu` field rather than kept as fusion-specific metadata. The target value is a one-time energy charge at process start; ordinary recipe `eut` remains the continuous running draw.
+
+The source contract is unusually consistent. `GTRecipeConstants` documents the key as the fusion reactor ignition threshold. Standard and large fusion computers reject recipes whose threshold exceeds their energy-storage capability and deduct the threshold when starting the process (in addition to normal EU/t accounting). `FusionOverclockDescriber` also derives fusion overclock policy from the same raw quantity, but that policy remains machine-side rather than being baked into recipe content.
+
+Corpus characterization found **65 / 65** `FUSION_THRESHOLD` annotations on `RecipeMaps.fusionRecipes`, and all 65 values are literal longs. The importer therefore lowers this key only on the fusion recipe map; use on any other map remains fail-closed.
+
+Full GT5 result after this pass:
+
+- target recipes lowered: **3,550 / 5,791 (61.30%)**, up from 3,502 / 5,791 (60.47%);
+- metadata blockers: **681**, down from 746;
+- item-input blockers: **1,218**;
+- item-output blockers: **961**;
+- fluid blockers: **457**;
+- non-constant EU/t blockers: **417**;
+- modifier blockers: **178**;
+- chance blockers: **50**.
+
+This removes all 65 fusion-threshold metadata blockers and adds 48 fully lowered recipes. The target model deliberately retains the raw startup-energy quantity instead of importing GregTech's fusion-tier formulas, allowing machine implementations to decide how startup storage, overclocking, parallelism, or other policies relate to it.

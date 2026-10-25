@@ -184,6 +184,8 @@ pub struct ContentRecipe {
     pub fluid_outputs: Vec<FluidStackSpec>,
     pub requirements: Vec<RecipeRequirement>,
     pub unlock: Option<RecipeUnlock>,
+    /// One-time energy charged when the recipe starts, in EU.
+    pub startup_energy_eu: u64,
     pub duration_ticks: u64,
     pub eut: i64,
 }
