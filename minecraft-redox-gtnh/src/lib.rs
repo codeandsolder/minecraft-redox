@@ -79,6 +79,8 @@ pub struct RecipeDefinition {
     pub environment_calls: Vec<BuilderCall>,
     /// Source execution-policy calls represented directly in target recipe semantics.
     pub execution_policy_calls: Vec<BuilderCall>,
+    /// Source conditions controlling whether the recipe is registered at all.
+    pub availability_calls: Vec<BuilderCall>,
     pub modifiers: Vec<BuilderCall>,
     pub post_add_calls: Vec<BuilderCall>,
     pub unhandled_calls: Vec<BuilderCall>,
@@ -365,6 +367,7 @@ fn empty_recipe_definition(
         execution_hints: Vec::new(),
         environment_calls: Vec::new(),
         execution_policy_calls: Vec::new(),
+        availability_calls: Vec::new(),
         modifiers: Vec::new(),
         post_add_calls: Vec::new(),
         unhandled_calls: Vec::new(),
@@ -457,7 +460,8 @@ fn recognize_recipe(
                 recipe.environment_calls.push(call.into());
             }
             "fake" => recipe.execution_policy_calls.push(call.into()),
-            "noOptimize" | "enabled" | "disabled" | "requireMods" | "nbtSensitive" => {
+            "requireMods" => recipe.availability_calls.push(call.into()),
+            "noOptimize" | "enabled" | "disabled" | "nbtSensitive" => {
                 recipe.modifiers.push(call.into());
             }
             "addTo" => after_add = true,

@@ -622,3 +622,27 @@ Full GT5 result after this pass:
 - chance blockers: **50**.
 
 Only one additional recipe becomes completely lowerable because most reference-only recipes still contain other unresolved content semantics. The important result is that 52 recipes no longer report the wrong blocker: non-executability is now represented, not discarded.
+
+
+### Conditional recipe availability from required content modules
+
+`GTRecipeBuilder.requireMods(...)` is now recovered separately from process modifiers and lowered to source-independent recipe availability conditions. Each concrete `gregtech.api.enums.Mods.*` argument becomes `RecipeAvailabilityRequirement::RequiredContentModule`, expressing that the recipe content exists only when that module is available; it is not a machine requirement and does not alter process execution once present.
+
+The source behavior is fail-closed: `requireMods` sets the builder's skip flag when any required mod is absent, suppressing registration. The importer therefore accepts only statically identifiable `Mods.*` enum constants. A local or parameter merely typed as `Mods` is not treated as content identity and remains blocked.
+
+A regression test also guards the lowering control flow: availability validation runs before the final `blockers.is_empty()` decision, so a dynamically unresolved availability condition cannot add a blocker too late and accidentally return a successful recipe.
+
+Full GT5 result after this pass:
+
+- target recipes lowered: **3,791 / 5,791 (65.46%)**, up from 3,783 / 5,791 (65.33%);
+- modifier blockers: **6**, down from 14;
+- metadata blockers: **472**;
+- item-input blockers: **1,218**;
+- item-output blockers: **961**;
+- fluid blockers: **457**;
+- non-constant EU/t blockers: **417**;
+- missing-duration blockers: **332**;
+- missing-EU/t blockers: **24**;
+- chance blockers: **50**.
+
+All eight corpus `requireMods(...)` recipes become fully lowerable. The remaining modifier blockers are NBT-sensitive matching semantics, which require structured item state rather than registration policy modeling.

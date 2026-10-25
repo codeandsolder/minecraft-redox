@@ -4,8 +4,8 @@ use minecraft_redox_core::{
     SourceOrigin,
     content::{
         ContentId, ContentRecipe, FluidSelector, FluidStackSpec, ItemInputSpec, ItemInputStackSpec,
-        ItemOutputSpec, ItemSelector, ItemStackSpec, Probability, RecipeExecutionMode,
-        RecipeRequirement, RecipeUnlock,
+        ItemOutputSpec, ItemSelector, ItemStackSpec, Probability, RecipeAvailabilityRequirement,
+        RecipeExecutionMode, RecipeRequirement, RecipeUnlock,
     },
 };
 use minecraft_redox_java::{JavaBindings, JavaExpression, JavaProjectIndex};
@@ -161,6 +161,7 @@ fn lower_recipe_internal(
         "output",
         &mut blockers,
     );
+    let availability_requirements = lower_availability_requirements(recipe, bindings, &mut blockers);
 
     if blockers.is_empty()
         && let (Some(duration_ticks), Some(eut)) = (duration_ticks, eut)
@@ -170,6 +171,7 @@ fn lower_recipe_internal(
             recipe_map: lowered_metadata
                 .recipe_map_override
                 .unwrap_or_else(|| ContentId::new(recipe.recipe_map.clone())),
+            availability_requirements,
             execution_mode: lower_execution_mode(recipe),
             item_inputs,
             item_outputs,
@@ -188,6 +190,44 @@ fn lower_recipe_internal(
         origin: recipe.origin.clone(),
         blockers,
     }))
+}
+
+fn lower_availability_requirements(
+    recipe: &RecipeDefinition,
+    bindings: &JavaBindings,
+    blockers: &mut Vec<RecipeLoweringBlocker>,
+) -> Vec<RecipeAvailabilityRequirement> {
+    let mut modules = BTreeSet::new();
+    for call in &recipe.availability_calls {
+        if call.name != "requireMods" {
+            push_blocker(
+                blockers,
+                RecipeLoweringBlockerKind::Modifiers,
+                format!("unsupported recipe availability call: {}", call.name),
+            );
+            continue;
+        }
+        for expression in &call.argument_expressions {
+            let module = resolved_reference_name(expression, bindings)
+                .filter(|module| module.starts_with("gregtech.api.enums.Mods."));
+            let Some(module) = module else {
+                push_blocker(
+                    blockers,
+                    RecipeLoweringBlockerKind::Modifiers,
+                    format!(
+                        "required content module is not statically identifiable: {}",
+                        call.arguments.join(", ")
+                    ),
+                );
+                continue;
+            };
+            modules.insert(ContentId::new(module));
+        }
+    }
+    modules
+        .into_iter()
+        .map(|module| RecipeAvailabilityRequirement::RequiredContentModule { module })
+        .collect()
 }
 
 fn lower_execution_mode(recipe: &RecipeDefinition) -> RecipeExecutionMode {
@@ -1840,8 +1880,8 @@ fn push_blocker(
 #[cfg(test)]
 mod tests {
     use minecraft_redox_core::content::{
-        FluidSelector, ItemInputSpec, ItemSelector, Probability, RecipeExecutionMode,
-        RecipeRequirement, RecipeUnlock,
+        FluidSelector, ItemInputSpec, ItemSelector, Probability, RecipeAvailabilityRequirement,
+        RecipeExecutionMode, RecipeRequirement, RecipeUnlock,
     };
     use minecraft_redox_java::{JavaExpression, JavaProjectIndex, analyze_source};
 
@@ -3141,6 +3181,90 @@ mod tests {
 
         lower_recipe(recipe, &analysis.bindings)
             .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn lowers_required_source_modules_as_availability_conditions() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.enums.Mods.Forestry;
+            import static gregtech.api.enums.Mods.Railcraft;
+            import static gregtech.api.recipe.RecipeMaps.cutterRecipes;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .itemInputs(Materials.Iron.getDust(1))
+                    .itemOutputs(Materials.Steel.getDust(1))
+                    .requireMods(Railcraft, Forestry, Forestry)
+                    .duration(20)
+                    .eut(2)
+                    .addTo(cutterRecipes);
+            }}
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let recovery = recover(&analysis);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        assert_eq!(recipe.modifiers.as_slice(), []);
+        let lowered = lower_recipe(recipe, &analysis.bindings)
+            .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
+        assert_eq!(lowered.availability_requirements.len(), 2);
+        assert!(
+            lowered
+                .availability_requirements
+                .iter()
+                .any(|requirement| matches!(
+                    requirement,
+                    RecipeAvailabilityRequirement::RequiredContentModule { module }
+                        if module.as_str() == "gregtech.api.enums.Mods.Forestry"
+                ))
+        );
+        assert!(
+            lowered
+                .availability_requirements
+                .iter()
+                .any(|requirement| matches!(
+                    requirement,
+                    RecipeAvailabilityRequirement::RequiredContentModule { module }
+                        if module.as_str() == "gregtech.api.enums.Mods.Railcraft"
+                ))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dynamic_required_source_module_remains_fail_closed() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.recipe.RecipeMaps.cutterRecipes;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            import gregtech.api.enums.Mods;
+            class Recipes { void run(Mods module) {
+                GTValues.RA.stdBuilder()
+                    .itemInputs(Materials.Iron.getDust(1))
+                    .itemOutputs(Materials.Steel.getDust(1))
+                    .requireMods(module)
+                    .duration(20)
+                    .eut(2)
+                    .addTo(cutterRecipes);
+            }}
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let recovery = recover(&analysis);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let failure = lower_recipe(recipe, &analysis.bindings)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("dynamic module condition unexpectedly lowered"))?;
+        assert!(failure.blockers.iter().any(|blocker| {
+            blocker.kind == RecipeLoweringBlockerKind::Modifiers
+                && blocker.detail.contains("not statically identifiable")
+        }));
         Ok(())
     }
 

@@ -174,6 +174,14 @@ pub enum RecipeUnlock {
     },
 }
 
+/// A source-independent condition controlling whether recipe content is available at all.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RecipeAvailabilityRequirement {
+    /// A named content module must be present before this recipe is registered.
+    RequiredContentModule { module: ContentId },
+}
+
 /// Whether a recipe participates in executable process lookup.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -192,6 +200,7 @@ pub enum RecipeExecutionMode {
 pub struct ContentRecipe {
     pub origin: SourceOrigin,
     pub recipe_map: ContentId,
+    pub availability_requirements: Vec<RecipeAvailabilityRequirement>,
     pub execution_mode: RecipeExecutionMode,
     pub item_inputs: Vec<ItemInputSpec>,
     pub item_outputs: Vec<ItemOutputSpec>,
