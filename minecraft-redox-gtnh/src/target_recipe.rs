@@ -412,7 +412,8 @@ fn lower_metadata(
     let mut environment_metadata = Vec::new();
 
     for call in &recipe.metadata {
-        let Some((key, value)) = lower_metadata_call(call, bindings, blockers) else {
+        let Some((key, value)) = lower_metadata_call(recipe, call, bindings, project, blockers)
+        else {
             continue;
         };
 
@@ -623,8 +624,10 @@ fn lower_coil_heat(
 }
 
 fn lower_metadata_call<'a>(
+    recipe: &RecipeDefinition,
     call: &'a crate::BuilderCall,
     bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
     blockers: &mut Vec<RecipeLoweringBlocker>,
 ) -> Option<(String, &'a JavaExpression)> {
     if call.name != "metadata" {
@@ -646,7 +649,9 @@ fn lower_metadata_call<'a>(
         );
         return None;
     };
-    let Some(key) = resolved_reference_name(key, bindings) else {
+    let Some(key) =
+        resolve_metadata_key(key, bindings, project, &recipe.origin.path, call.byte_end)
+    else {
         push_blocker(
             blockers,
             RecipeLoweringBlockerKind::Metadata,
@@ -658,6 +663,74 @@ fn lower_metadata_call<'a>(
         return None;
     };
     Some((key, value))
+}
+
+fn resolve_metadata_key(
+    expression: &JavaExpression,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+    source_path: &str,
+    byte_position: usize,
+) -> Option<String> {
+    let direct = resolved_reference_name(expression, bindings)?;
+    let Some(project) = project else {
+        return Some(direct);
+    };
+    resolve_metadata_key_alias(
+        expression,
+        bindings,
+        project,
+        project
+            .enclosing_method(source_path, byte_position)
+            .map(|method| method.owner.as_str()),
+        0,
+    )
+    .or(Some(direct))
+}
+
+fn resolve_metadata_key_alias(
+    expression: &JavaExpression,
+    bindings: &JavaBindings,
+    project: &JavaProjectIndex,
+    current_owner: Option<&str>,
+    depth: usize,
+) -> Option<String> {
+    if depth >= 16 {
+        return None;
+    }
+    let reference = resolved_reference_name(expression, bindings)?;
+    let field = if reference.contains('.') {
+        let (owner, name) = reference.rsplit_once('.')?;
+        let resolved_owner = bindings.resolve_reference(owner);
+        project
+            .resolve_field(&resolved_owner, name, Some(true))
+            .or_else(|| {
+                bindings.package.as_deref().and_then(|package| {
+                    project.resolve_field(&format!("{package}.{resolved_owner}"), name, Some(true))
+                })
+            })
+    } else {
+        current_owner.and_then(|owner| project.resolve_field(owner, &reference, Some(true)))
+    };
+    let Some(field) = field else {
+        return Some(reference);
+    };
+    if !field.is_final {
+        return Some(reference);
+    }
+    let Some(initializer @ (JavaExpression::Reference(_) | JavaExpression::FieldAccess { .. })) =
+        field.initializer.as_ref()
+    else {
+        return Some(reference);
+    };
+    let field_bindings = project.bindings_for_path(&field.origin.path)?;
+    resolve_metadata_key_alias(
+        initializer,
+        field_bindings,
+        project,
+        Some(&field.owner),
+        depth + 1,
+    )
 }
 
 fn capture_assembly_line_research<'a>(
@@ -707,7 +780,20 @@ fn lower_capability_requirement(
         );
         return None;
     };
-    if key == "gregtech.api.util.GTRecipeConstants.COMPRESSION_TIER" {
+    if key == "gregtech.api.recipe.metadata.PCBFactoryTierKey.INSTANCE"
+        && recipe.recipe_map != "gregtech.api.recipe.RecipeMaps.pcbFactoryRecipes"
+    {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            format!(
+                "PCB factory tier used on unsupported recipe map {}",
+                recipe.recipe_map
+            ),
+        );
+        return None;
+    }
+    if is_compression_tier_key(key) {
         if recipe.recipe_map != "gregtech.api.recipe.RecipeMaps.compressorRecipes" {
             push_blocker(
                 blockers,
@@ -1211,6 +1297,14 @@ fn lower_metadata_item(
     lower_item_semantic(recovered.first()?.semantic.as_ref()?, bindings, project)
 }
 
+fn is_compression_tier_key(key: &str) -> bool {
+    matches!(
+        key,
+        "gregtech.api.util.GTRecipeConstants.COMPRESSION_TIER"
+            | "gregtech.api.recipe.metadata.CompressionTierKey.INSTANCE"
+    )
+}
+
 fn minimum_capability_metadata(key: &str) -> Option<ContentId> {
     let capability = match key {
         "gregtech.api.util.GTRecipeConstants.COAL_CASING_TIER" => {
@@ -1231,8 +1325,12 @@ fn minimum_capability_metadata(key: &str) -> Option<ContentId> {
         "gregtech.api.util.GTRecipeConstants.NFR_COIL_TIER" => {
             "machine_capability.naquadah_fuel_refine_coil"
         }
-        "gregtech.api.util.GTRecipeConstants.COMPRESSION_TIER" => {
+        "gregtech.api.util.GTRecipeConstants.COMPRESSION_TIER"
+        | "gregtech.api.recipe.metadata.CompressionTierKey.INSTANCE" => {
             "machine_capability.advanced_compression"
+        }
+        "gregtech.api.recipe.metadata.PCBFactoryTierKey.INSTANCE" => {
+            "machine_capability.pcb_factory_tier"
         }
         _ => return None,
     };
@@ -3182,6 +3280,46 @@ mod tests {
                 }]
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn lowers_final_metadata_key_alias_to_pcb_factory_tier() -> anyhow::Result<()> {
+        let source = r"
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            import gregtech.api.recipe.RecipeMaps;
+            import gregtech.api.recipe.metadata.PCBFactoryTierKey;
+            class Recipes {
+                private static final PCBFactoryTierKey TIER = PCBFactoryTierKey.INSTANCE;
+                void run() {
+                    GTValues.RA.stdBuilder()
+                        .itemInputs(Materials.Iron.getDust(1))
+                        .itemOutputs(Materials.Steel.getDust(1))
+                        .metadata(TIER, 2)
+                        .duration(20).eut(2).addTo(RecipeMaps.pcbFactoryRecipes);
+                }
+            }
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let mut project = JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let recovery = recover_with_project(&analysis, &project);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let lowered = lower_recipe_with_project(recipe, &analysis.bindings, &project)
+            .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
+        assert_eq!(
+            lowered.requirements,
+            [RecipeRequirement::MinimumCapability {
+                capability: minecraft_redox_core::content::ContentId::new(
+                    "machine_capability.pcb_factory_tier"
+                ),
+                level: 2,
+            }]
+        );
         Ok(())
     }
 

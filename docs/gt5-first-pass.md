@@ -694,3 +694,26 @@ Full GT5 result after this pass:
 - chance blockers: **50**.
 
 This adds six fully lowered recipes. The two other newly understood static annotations overlap independent blockers; the three material-derived cases are intentionally left for a general scalar-dataflow pass.
+
+### Final metadata-key aliases and PCB Factory minimum tier
+
+Metadata-key identity now follows final static alias fields through simple reference/field-access initializers before dispatching source semantics. This is necessary for loaders that hide the actual key behind a local constant, such as `PCBFactoryRecipes.TIER = PCBFactoryTierKey.INSTANCE`, and is implemented generically rather than by naming the loader class. Mutable fields, non-reference initializers, unresolved owners, and alias chains beyond the bounded resolver remain fail-closed.
+
+The PCB Factory tier key is a direct source-independent minimum capability: its key class documents it as the minimum factory tier, and `MTEPCBFactory` rejects recipes when `requiredPCBTier > mTier`. It therefore lowers to `RecipeRequirement::MinimumCapability { capability: machine_capability.pcb_factory_tier, level }` only on `RecipeMaps.pcbFactoryRecipes`.
+
+The alias pass also exposed an important canonicalization edge case: `GTRecipeConstants.COMPRESSION_TIER` itself aliases `CompressionTierKey.INSTANCE`. Capability dispatch now recognizes both the archaeological public alias and the underlying canonical key so project-aware alias resolution cannot regress previously supported compression recipes.
+
+Full GT5 result after this pass:
+
+- target recipes lowered: **3,846 / 5,791 (66.41%)**, unchanged because all newly understood PCB-tier recipes still overlap other unresolved PCB metadata;
+- metadata blockers: **407**, down from 412;
+- modifier blockers: **6**;
+- item-input blockers: **1,218**;
+- item-output blockers: **961**;
+- fluid blockers: **457**;
+- non-constant EU/t blockers: **417**;
+- missing-duration blockers: **332**;
+- missing-EU/t blockers: **24**;
+- chance blockers: **50**.
+
+The remaining PCB blockers are real machine semantics: tier-2/3 recipes require a particular nanite material whose stored count controls parallelism, and BIO recipes require an active bio-chamber upgrade. Those should become explicit resource/capability semantics rather than being folded into the tier field.
