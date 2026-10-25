@@ -122,6 +122,12 @@ pub struct RecipePolicySpec {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ItemStackIntegerPair {
+    pub item: ItemStackSpec,
+    pub value: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RecipeMetadataValue {
     Integer { value: i64 },
@@ -130,6 +136,7 @@ pub enum RecipeMetadataValue {
     ContentRef { id: ContentId },
     ItemStack { value: ItemStackSpec },
     ItemStacks { values: Vec<ItemStackSpec> },
+    ItemStackIntegerPairs { values: Vec<ItemStackIntegerPair> },
     Scanning { duration_ticks: u64, voltage: i64 },
     Sievert { value: i64, exact: bool },
 }

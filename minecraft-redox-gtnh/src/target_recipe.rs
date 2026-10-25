@@ -2,8 +2,9 @@ use minecraft_redox_core::{
     SourceOrigin,
     content::{
         ContentId, ContentRecipe, FluidInputSpec, FluidSelector, FluidStackSpec, ItemInputSpec,
-        ItemSelector, ItemStackSpec, RecipeBehavior, RecipeCondition, RecipeMetadataSpec,
-        RecipeMetadataValue, RecipePolicySpec, RecipeSlotChance, RecipeSpecialSpec,
+        ItemSelector, ItemStackIntegerPair, ItemStackSpec, RecipeBehavior, RecipeCondition,
+        RecipeMetadataSpec, RecipeMetadataValue, RecipePolicySpec, RecipeSlotChance,
+        RecipeSpecialSpec,
     },
 };
 use minecraft_redox_java::{
@@ -295,6 +296,8 @@ fn lower_metadata_entry(
         lower_item_stack_metadata(metadata, source_path, bindings, project)?
     } else if expected.ends_with("ItemStack[]") {
         lower_item_stack_array_metadata(metadata, source_path, bindings, project)?
+    } else if is_item_stack_integer_pair_array(expected) {
+        lower_item_stack_integer_pair_array_metadata(metadata, source_path, bindings, project)?
     } else if is_java_type(expected, "Scanning") {
         lower_scanning_metadata(&metadata.value_expression, bindings, project)?
     } else if is_java_type(expected, "Sievert") {
@@ -318,28 +321,47 @@ fn lower_metadata_entry(
     })
 }
 
+fn lower_metadata_item_expression(
+    source: &str,
+    expression: &JavaExpression,
+    source_path: &str,
+    byte_start: usize,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+) -> Option<ItemStackSpec> {
+    let sources = [source.to_owned()];
+    let expressions = [expression.clone()];
+    let recovered = if let Some(project) = project {
+        recover_items_with_project(
+            &sources,
+            &expressions,
+            bindings,
+            project,
+            source_path,
+            byte_start,
+        )
+    } else {
+        crate::recipe_expression::recover_items(&sources, &expressions, bindings)
+    };
+    lower_recovered_stack(recovered.first()?, bindings)
+}
+
 fn lower_item_stack_metadata(
     metadata: &RecipeMetadataDefinition,
     source_path: &str,
     bindings: &JavaBindings,
     project: Option<&JavaProjectIndex>,
 ) -> Option<RecipeMetadataValue> {
-    let source = [metadata.value_source.clone()];
-    let expression = [metadata.value_expression.clone()];
-    let recovered = if let Some(project) = project {
-        recover_items_with_project(
-            &source,
-            &expression,
-            bindings,
-            project,
+    Some(RecipeMetadataValue::ItemStack {
+        value: lower_metadata_item_expression(
+            &metadata.value_source,
+            &metadata.value_expression,
             source_path,
             metadata.byte_start,
-        )
-    } else {
-        crate::recipe_expression::recover_items(&source, &expression, bindings)
-    };
-    let stack = lower_recovered_stack(recovered.first()?, bindings)?;
-    Some(RecipeMetadataValue::ItemStack { value: stack })
+            bindings,
+            project,
+        )?,
+    })
 }
 
 fn lower_item_stack_array_metadata(
@@ -351,25 +373,66 @@ fn lower_item_stack_array_metadata(
     let JavaExpression::Array { elements, .. } = &metadata.value_expression else {
         return None;
     };
-    let mut values = Vec::with_capacity(elements.len());
-    for expression in elements {
-        let source = [metadata.value_source.clone()];
-        let expressions = [expression.clone()];
-        let recovered = if let Some(project) = project {
-            recover_items_with_project(
-                &source,
-                &expressions,
-                bindings,
-                project,
+    let values = elements
+        .iter()
+        .map(|expression| {
+            lower_metadata_item_expression(
+                &metadata.value_source,
+                expression,
                 source_path,
                 metadata.byte_start,
+                bindings,
+                project,
             )
-        } else {
-            crate::recipe_expression::recover_items(&source, &expressions, bindings)
-        };
-        values.push(lower_recovered_stack(recovered.first()?, bindings)?);
-    }
+        })
+        .collect::<Option<Vec<_>>>()?;
     Some(RecipeMetadataValue::ItemStacks { values })
+}
+
+fn is_item_stack_integer_pair_array(expected: &str) -> bool {
+    let Some(element_type) = expected.strip_suffix("[]") else {
+        return false;
+    };
+    element_type.contains("Pair<")
+        && element_type.contains("ItemStack")
+        && element_type.ends_with(", Integer>")
+}
+
+fn lower_item_stack_integer_pair_array_metadata(
+    metadata: &RecipeMetadataDefinition,
+    source_path: &str,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+) -> Option<RecipeMetadataValue> {
+    let JavaExpression::Array { elements, .. } = &metadata.value_expression else {
+        return None;
+    };
+    let values = elements
+        .iter()
+        .map(|element| {
+            let JavaExpression::Call {
+                method, arguments, ..
+            } = element
+            else {
+                return None;
+            };
+            if method != "of" || arguments.len() != 2 {
+                return None;
+            }
+            Some(ItemStackIntegerPair {
+                item: lower_metadata_item_expression(
+                    &metadata.value_source,
+                    &arguments[0],
+                    source_path,
+                    metadata.byte_start,
+                    bindings,
+                    project,
+                )?,
+                value: metadata_i64(&arguments[1], bindings, project)?,
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(RecipeMetadataValue::ItemStackIntegerPairs { values })
 }
 
 fn linked_metadata_field_i64(
@@ -1178,6 +1241,49 @@ mod tests {
         assert_eq!(values.len(), 2);
         assert_eq!(values[0].amount, 1);
         assert_eq!(values[1].amount, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn lowers_item_stack_integer_pair_array_metadata() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+            import gregtech.api.enums.GTValues;
+            import net.minecraft.item.ItemStack;
+            class RecipeMetadataKey<T> {}
+            class Pair<A, B> { static <A, B> Pair<A, B> of(A a, B b) { return null; } }
+            class ItemList {
+                static final Entry A = new Entry();
+                static class Entry { ItemStack get(long amount) { return null; } }
+            }
+            class Keys { static RecipeMetadataKey<Pair<ItemStack, Integer>[]> FUEL; }
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .metadata(Keys.FUEL, new Pair[] { Pair.of(ItemList.A.get(3), 7) })
+                    .duration(20)
+                    .eut(2)
+                    .addTo(compressorRecipes);
+            }}
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let mut project = JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let recovery = crate::recover_with_project(&analysis, &project);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let lowered = super::lower_recipe_with_project(recipe, &analysis.bindings, &project)
+            .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
+        let RecipeMetadataValue::ItemStackIntegerPairs { values } = &lowered.metadata[0].value
+        else {
+            return Err(anyhow::anyhow!(
+                "metadata was not an item/integer pair array"
+            ));
+        };
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].item.amount, 3);
+        assert_eq!(values[0].value, 7);
         Ok(())
     }
 
