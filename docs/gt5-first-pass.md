@@ -30,6 +30,8 @@ is recovered as a recipe whose builder is `gregtech.api.enums.GTValues.RA` and w
 
 ## 2026-10-22 GT5-Unofficial measurement
 
+The measurement corpus is pinned to GT5-Unofficial commit `23d75c0b014a79a92de298b7b8b84444cca6659e` (2026-10-17). After the original scratch checkout was cleaned up, this revision was recovered by matching the recorded 3,374-Java-file fingerprint; a fresh summary scan independently reproduced all 5,791 recipes and the other corpus counts below. The persistent archaeology checkout now lives at `/home/jan/projects/GT5-Unofficial` on branch `redox-corpus-20261017`.
+
 A full scan of `GT5-Unofficial/src/main/java` sees:
 
 - 3,374 Java files
@@ -646,3 +648,26 @@ Full GT5 result after this pass:
 - chance blockers: **50**.
 
 All eight corpus `requireMods(...)` recipes become fully lowerable. The remaining modifier blockers are NBT-sensitive matching semantics, which require structured item state rather than registration policy modeling.
+
+### Recycling Universal Arc Furnace as an exact synthetic-map transform
+
+`GTRecipeConstants.UniversalArcFurnace` is a source-side recipe expander rather than a real executable recipe map. Its `RECYCLE=true` path is nevertheless one-to-one and is now lowered exactly: the target map becomes `RecipeMaps.arcFurnaceRecipes`, the source builder's duration is multiplied by 5/4 with the same integer truncation and minimum-one behavior, and integrated circuit config 1 is appended as a required non-consumed input. The `RECYCLE` marker itself and `ADDITIVE_AMOUNT` are not retained because the recycling branch does not use gas-additive quantity after dispatch.
+
+The source transformer first rejects builders containing no non-circuit item. The target reproduces that source-drop condition instead of manufacturing a circuit-only arc recipe. `RECYCLE` omitted, `RECYCLE=false`, or a dynamic recycle flag remains fail-closed because those paths generate multiple gas/plasma recipes and require genuine one-to-many target lowering.
+
+Corpus characterization makes the bounded transform especially useful: all **52** direct `RECYCLE` annotations are literal `true`, and all 52 add to `UniversalArcFurnace`; there are no non-recycling `UniversalArcFurnace` call sites in the pinned corpus.
+
+Full GT5 result after this pass:
+
+- target recipes lowered: **3,840 / 5,791 (66.31%)**, up from 3,791 / 5,791 (65.46%);
+- metadata blockers: **420**, down from 472;
+- modifier blockers: **6**;
+- item-input blockers: **1,218**;
+- item-output blockers: **961**;
+- fluid blockers: **457**;
+- non-constant EU/t blockers: **417**;
+- missing-duration blockers: **332**;
+- missing-EU/t blockers: **24**;
+- chance blockers: **50**.
+
+This removes all 52 `RECYCLE` metadata blockers and adds 49 fully lowered recipes. The remaining three overlap independent unresolved semantics rather than synthetic arc-furnace behavior.

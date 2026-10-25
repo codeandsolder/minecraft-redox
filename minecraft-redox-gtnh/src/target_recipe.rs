@@ -98,7 +98,7 @@ fn lower_recipe_internal(
     validate_recipe_category(recipe, bindings, &mut blockers);
     let lowered_metadata = lower_metadata(recipe, bindings, project, &mut blockers);
 
-    let duration_ticks = match recipe.duration_ticks {
+    let mut duration_ticks = match recipe.duration_ticks {
         None if lowered_metadata.fuel_energy_eu_per_liter.is_some() => Some(0),
         None => {
             push_blocker(
@@ -146,7 +146,7 @@ fn lower_recipe_internal(
         }
     };
 
-    let (item_inputs, item_outputs) = lower_item_io(recipe, bindings, project, &mut blockers);
+    let (mut item_inputs, item_outputs) = lower_item_io(recipe, bindings, project, &mut blockers);
     let fluid_inputs = lower_fluids(
         &recipe.fluid_input_semantics,
         bindings,
@@ -161,7 +161,14 @@ fn lower_recipe_internal(
         "output",
         &mut blockers,
     );
-    let availability_requirements = lower_availability_requirements(recipe, bindings, &mut blockers);
+    apply_synthetic_recipe_transform(
+        lowered_metadata.synthetic_transform,
+        &mut duration_ticks,
+        &mut item_inputs,
+        &mut blockers,
+    );
+    let availability_requirements =
+        lower_availability_requirements(recipe, bindings, &mut blockers);
 
     if blockers.is_empty()
         && let (Some(duration_ticks), Some(eut)) = (duration_ticks, eut)
@@ -373,12 +380,18 @@ fn validate_recipe_category(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SyntheticRecipeTransform {
+    ArcFurnaceRecycling,
+}
+
 struct LoweredMetadata {
     requirements: Vec<RecipeRequirement>,
     unlock: Option<RecipeUnlock>,
     startup_energy_eu: u64,
     fuel_energy_eu_per_liter: Option<u64>,
     recipe_map_override: Option<ContentId>,
+    synthetic_transform: Option<SyntheticRecipeTransform>,
 }
 
 fn lower_metadata(
@@ -394,6 +407,8 @@ fn lower_metadata(
     let mut fuel_type = None;
     let mut research_item = None;
     let mut scanning = None;
+    let mut recycle = None;
+    let mut arc_additive_amount = None;
     let mut environment_metadata = Vec::new();
 
     for call in &recipe.metadata {
@@ -422,6 +437,12 @@ fn lower_metadata(
             fuel_value = Some((call, value));
         } else if key == "gregtech.api.util.GTRecipeConstants.FUEL_TYPE" {
             fuel_type = Some((call, value));
+        } else if key == "gregtech.api.util.GTRecipeConstants.RECYCLE" {
+            recycle = Some((call, value));
+        } else if key == "gregtech.api.util.GTRecipeConstants.ADDITIVE_AMOUNT"
+            && recipe.recipe_map == "gregtech.api.util.GTRecipeConstants.UniversalArcFurnace"
+        {
+            arc_additive_amount = Some((call, value));
         } else if matches!(
             key.as_str(),
             "gregtech.api.util.GTRecipeConstants.RESEARCH_ITEM"
@@ -454,15 +475,129 @@ fn lower_metadata(
     );
     let unlock =
         lower_assembly_line_unlock(recipe, research_item, scanning, bindings, project, blockers);
-    let (fuel_energy_eu_per_liter, recipe_map_override) =
+    let (fuel_energy_eu_per_liter, fuel_map_override) =
         lower_fuel_metadata(recipe, fuel_value, fuel_type, bindings, project, blockers);
+    let (synthetic_transform, synthetic_map_override) =
+        lower_universal_arc_furnace(recipe, recycle, arc_additive_amount, blockers);
+    let recipe_map_override = synthetic_map_override.or(fuel_map_override);
     LoweredMetadata {
         requirements,
         unlock,
         startup_energy_eu,
         fuel_energy_eu_per_liter,
         recipe_map_override,
+        synthetic_transform,
     }
+}
+
+fn lower_universal_arc_furnace<'a>(
+    recipe: &RecipeDefinition,
+    recycle: Option<(&'a crate::BuilderCall, &'a JavaExpression)>,
+    _additive_amount: Option<(&'a crate::BuilderCall, &'a JavaExpression)>,
+    blockers: &mut Vec<RecipeLoweringBlocker>,
+) -> (Option<SyntheticRecipeTransform>, Option<ContentId>) {
+    const UNIVERSAL_ARC: &str = "gregtech.api.util.GTRecipeConstants.UniversalArcFurnace";
+    if recipe.recipe_map != UNIVERSAL_ARC {
+        if let Some((call, _)) = recycle {
+            push_blocker(
+                blockers,
+                RecipeLoweringBlockerKind::Metadata,
+                format!(
+                    "RECYCLE metadata used outside UniversalArcFurnace: {}",
+                    call.arguments.join(", ")
+                ),
+            );
+        }
+        return (None, None);
+    }
+
+    let Some((call, value)) = recycle else {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            "UniversalArcFurnace without RECYCLE=true expands into multiple gas/plasma recipes",
+        );
+        return (None, None);
+    };
+    match literal_boolean(value) {
+        Some(true) => (
+            Some(SyntheticRecipeTransform::ArcFurnaceRecycling),
+            Some(ContentId::new(
+                "gregtech.api.recipe.RecipeMaps.arcFurnaceRecipes",
+            )),
+        ),
+        Some(false) => {
+            push_blocker(
+                blockers,
+                RecipeLoweringBlockerKind::Metadata,
+                "UniversalArcFurnace RECYCLE=false expands into multiple gas/plasma recipes",
+            );
+            (None, None)
+        }
+        None => {
+            push_blocker(
+                blockers,
+                RecipeLoweringBlockerKind::Metadata,
+                format!(
+                    "UniversalArcFurnace RECYCLE is not a static boolean: {}",
+                    call.arguments.join(", ")
+                ),
+            );
+            (None, None)
+        }
+    }
+}
+
+fn apply_synthetic_recipe_transform(
+    transform: Option<SyntheticRecipeTransform>,
+    duration_ticks: &mut Option<u64>,
+    item_inputs: &mut Vec<ItemInputSpec>,
+    blockers: &mut Vec<RecipeLoweringBlocker>,
+) {
+    let Some(SyntheticRecipeTransform::ArcFurnaceRecycling) = transform else {
+        return;
+    };
+    if !item_inputs
+        .iter()
+        .any(|input| !is_integrated_circuit_input(input))
+    {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::ItemInput,
+            "UniversalArcFurnace source drops recipes without a non-circuit item input",
+        );
+        return;
+    }
+    if let Some(duration) = duration_ticks.as_mut() {
+        let Some(scaled) = duration.checked_mul(5).map(|value| value / 4) else {
+            push_blocker(
+                blockers,
+                RecipeLoweringBlockerKind::InvalidDuration,
+                "UniversalArcFurnace recycling duration overflowed during 5/4 scaling",
+            );
+            return;
+        };
+        *duration = scaled.max(1);
+    }
+    item_inputs.push(ItemInputSpec::Stack(ItemInputStackSpec {
+        selector: ItemSelector::Named {
+            id: ContentId::new("gregtech.api.enums.ItemList.Circuit_Integrated"),
+            variant: Some(1),
+        },
+        amount: 1,
+        consumption_probability: Probability::ZERO,
+    }));
+}
+
+fn is_integrated_circuit_input(input: &ItemInputSpec) -> bool {
+    let ItemInputSpec::Stack(stack) = input else {
+        return false;
+    };
+    matches!(
+        &stack.selector,
+        ItemSelector::Named { id, .. }
+            if id.as_str() == "gregtech.api.enums.ItemList.Circuit_Integrated"
+    )
 }
 
 fn lower_coil_heat(
@@ -2675,6 +2810,132 @@ mod tests {
         assert!(failure.blockers.iter().any(|blocker| {
             blocker.kind == RecipeLoweringBlockerKind::Metadata
                 && blocker.detail.contains("has no RESEARCH_ITEM")
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn lowers_recycling_universal_arc_furnace_to_real_recipe() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.util.GTRecipeConstants.ADDITIVE_AMOUNT;
+            import static gregtech.api.util.GTRecipeConstants.RECYCLE;
+            import static gregtech.api.util.GTRecipeConstants.UniversalArcFurnace;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .itemInputs(Materials.Iron.getDust(1))
+                    .itemOutputs(Materials.Steel.getDust(1))
+                    .metadata(ADDITIVE_AMOUNT, 999)
+                    .metadata(RECYCLE, true)
+                    .duration(21)
+                    .eut(30)
+                    .addTo(UniversalArcFurnace);
+            }}
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let recovery = recover(&analysis);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let lowered = lower_recipe(recipe, &analysis.bindings)
+            .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
+        assert_eq!(
+            lowered.recipe_map.as_str(),
+            "gregtech.api.recipe.RecipeMaps.arcFurnaceRecipes"
+        );
+        assert_eq!(lowered.duration_ticks, 26);
+        assert_eq!(lowered.item_inputs.len(), 2);
+        let ItemInputSpec::Stack(circuit) = &lowered.item_inputs[1] else {
+            return Err(anyhow::anyhow!("synthetic circuit was not a stack"));
+        };
+        assert_eq!(circuit.amount, 1);
+        assert_eq!(circuit.consumption_probability, Probability::ZERO);
+        assert!(matches!(
+            &circuit.selector,
+            ItemSelector::Named {
+                id,
+                variant: Some(1),
+            } if id.as_str() == "gregtech.api.enums.ItemList.Circuit_Integrated"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn unsupported_universal_arc_furnace_expansions_stay_blocked() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.util.GTRecipeConstants.RECYCLE;
+            import static gregtech.api.util.GTRecipeConstants.UniversalArcFurnace;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            class Recipes {
+                void omitted() {
+                    GTValues.RA.stdBuilder()
+                        .itemInputs(Materials.Iron.getDust(1))
+                        .itemOutputs(Materials.Steel.getDust(1))
+                        .duration(20).eut(30).addTo(UniversalArcFurnace);
+                }
+                void disabled() {
+                    GTValues.RA.stdBuilder()
+                        .itemInputs(Materials.Iron.getDust(1))
+                        .itemOutputs(Materials.Steel.getDust(1))
+                        .metadata(RECYCLE, false)
+                        .duration(20).eut(30).addTo(UniversalArcFurnace);
+                }
+                void dynamic(boolean recycle) {
+                    GTValues.RA.stdBuilder()
+                        .itemInputs(Materials.Iron.getDust(1))
+                        .itemOutputs(Materials.Steel.getDust(1))
+                        .metadata(RECYCLE, recycle)
+                        .duration(20).eut(30).addTo(UniversalArcFurnace);
+                }
+            }
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let recovery = recover(&analysis);
+        assert_eq!(recovery.recipes.len(), 3);
+        for recipe in &recovery.recipes {
+            let failure = lower_recipe(recipe, &analysis.bindings)
+                .err()
+                .ok_or_else(|| anyhow::anyhow!("one-to-many synthetic arc recipe lowered"))?;
+            assert!(
+                failure
+                    .blockers
+                    .iter()
+                    .any(|blocker| blocker.kind == RecipeLoweringBlockerKind::Metadata)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn universal_arc_furnace_without_real_item_is_source_dropped() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.util.GTRecipeConstants.RECYCLE;
+            import static gregtech.api.util.GTRecipeConstants.UniversalArcFurnace;
+            import gregtech.api.enums.GTValues;
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .circuit(7)
+                    .metadata(RECYCLE, true)
+                    .duration(20)
+                    .eut(30)
+                    .addTo(UniversalArcFurnace);
+            }}
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let recovery = recover(&analysis);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let failure = lower_recipe(recipe, &analysis.bindings)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("source-dropped arc recipe unexpectedly lowered"))?;
+        assert!(failure.blockers.iter().any(|blocker| {
+            blocker.kind == RecipeLoweringBlockerKind::ItemInput
+                && blocker.detail.contains("non-circuit item input")
         }));
         Ok(())
     }
