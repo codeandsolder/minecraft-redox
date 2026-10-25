@@ -271,7 +271,11 @@ fn lower_metadata_entry(
 ) -> Option<RecipeMetadataSpec> {
     let key = resolved_reference_name(&metadata.key_expression, bindings)
         .unwrap_or_else(|| bindings.resolve_reference(&metadata.key_source));
-    let expected = metadata.expected_value_type.as_deref()?;
+    let inferred_expected = infer_metadata_expected_type(metadata, bindings, project);
+    let expected = metadata
+        .expected_value_type
+        .as_deref()
+        .or(inferred_expected.as_deref())?;
     let value = if is_java_type(expected, "Integer") || is_java_type(expected, "Long") {
         RecipeMetadataValue::Integer {
             value: metadata_i64(&metadata.value_expression, bindings, project)
@@ -344,6 +348,26 @@ fn lower_metadata_item_expression(
         crate::recipe_expression::recover_items(&sources, &expressions, bindings)
     };
     lower_recovered_stack(recovered.first()?, bindings)
+}
+
+fn infer_metadata_expected_type(
+    metadata: &RecipeMetadataDefinition,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+) -> Option<String> {
+    let project = project?;
+    let key = resolved_reference_name(&metadata.key_expression, bindings)
+        .unwrap_or_else(|| bindings.resolve_reference(&metadata.key_source));
+    let (owner, field_name) = key.rsplit_once('.')?;
+    let field = project.resolve_field(owner, field_name, Some(true))?;
+    if let Some(start) = field.type_name.find('<') {
+        let end = field.type_name.rfind('>')?;
+        let raw = field.type_name.get(..start)?.trim();
+        if raw.ends_with("RecipeMetadataKey") {
+            return Some(field.type_name.get(start + 1..end)?.trim().to_owned());
+        }
+    }
+    project.generic_supertype_argument(&field.type_name, "RecipeMetadataKey", 0)
 }
 
 fn lower_item_stack_metadata(
@@ -1201,6 +1225,55 @@ mod tests {
                 .map(minecraft_redox_core::content::ContentId::as_str),
             Some("RecipeCategory.SPECIAL")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn infers_metadata_payload_type_from_static_imported_key_field() -> anyhow::Result<()> {
+        let constants = analyze_source(
+            "GTRecipeConstants.java",
+            "gt5",
+            None,
+            r"
+                package gregtech.api.util;
+                class RecipeMetadataKey<T> {}
+                class GTRecipeConstants {
+                    static final RecipeMetadataKey<Integer> COIL_HEAT = null;
+                }
+            ",
+        )?;
+        let analysis = analyze_source(
+            "Recipes.java",
+            "gt5",
+            None,
+            r"
+                package demo;
+                import static gregtech.api.util.GTRecipeConstants.COIL_HEAT;
+                class GTValues { static final RA RA = new RA(); static class RA { Builder stdBuilder() { return null; } } }
+                class Builder { Builder metadata(Object k, Object v) { return this; } Builder duration(int v) { return this; } Builder eut(int v) { return this; } void addTo(Object m) {} }
+                class Recipes { void run() {
+                    GTValues.RA.stdBuilder()
+                        .metadata(COIL_HEAT, 4000)
+                        .duration(20)
+                        .eut(2)
+                        .addTo(blastFurnaceRecipes);
+                }}
+            ",
+        )?;
+        let mut project = JavaProjectIndex::default();
+        project.add_analysis(&constants);
+        project.add_analysis(&analysis);
+        let recovery = crate::recover_with_project(&analysis, &project);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let lowered = super::lower_recipe_with_project(recipe, &analysis.bindings, &project)
+            .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
+        assert!(matches!(
+            lowered.metadata[0].value,
+            RecipeMetadataValue::Integer { value: 4000 }
+        ));
         Ok(())
     }
 
