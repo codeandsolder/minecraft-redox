@@ -94,6 +94,7 @@ fn lower_recipe_internal(
     project: Option<&JavaProjectIndex>,
 ) -> Result<ContentRecipe, Box<RecipeLoweringFailure>> {
     let mut blockers = structural_blockers(recipe);
+    validate_recipe_category(recipe, bindings, &mut blockers);
     let lowered_metadata = lower_metadata(recipe, bindings, project, &mut blockers);
 
     let duration_ticks = match recipe.duration_ticks {
@@ -239,6 +240,83 @@ fn structural_blockers(recipe: &RecipeDefinition) -> Vec<RecipeLoweringBlocker> 
         );
     }
     blockers
+}
+
+fn validate_recipe_category(
+    recipe: &RecipeDefinition,
+    bindings: &JavaBindings,
+    blockers: &mut Vec<RecipeLoweringBlocker>,
+) {
+    let Some(call) = recipe.recipe_category.as_ref() else {
+        return;
+    };
+    let [category] = call.argument_expressions.as_slice() else {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            format!(
+                "recipeCategory does not have exactly one argument: {:?}",
+                call.arguments
+            ),
+        );
+        return;
+    };
+    let Some(category) = resolved_reference_name(category, bindings) else {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            format!(
+                "recipeCategory is not statically identifiable: {}",
+                call.arguments.join(", ")
+            ),
+        );
+        return;
+    };
+    let expected_map = match category.as_str() {
+        "gregtech.api.recipe.RecipeCategories.arcFurnaceRecycling" => {
+            "gregtech.api.recipe.RecipeMaps.arcFurnaceRecipes"
+        }
+        "gregtech.api.recipe.RecipeCategories.maceratorRecycling" => {
+            "gregtech.api.recipe.RecipeMaps.maceratorRecipes"
+        }
+        "gregtech.api.recipe.RecipeCategories.fluidExtractorRecycling" => {
+            "gregtech.api.recipe.RecipeMaps.fluidExtractionRecipes"
+        }
+        "gregtech.api.recipe.RecipeCategories.alloySmelterRecycling"
+        | "gregtech.api.recipe.RecipeCategories.alloySmelterMolding" => {
+            "gregtech.api.recipe.RecipeMaps.alloySmelterRecipes"
+        }
+        "gregtech.api.recipe.RecipeCategories.forgeHammerRecycling" => {
+            "gregtech.api.recipe.RecipeMaps.hammerRecipes"
+        }
+        "gregtech.api.recipe.RecipeCategories.ticPartExtruding" => {
+            "gregtech.api.recipe.RecipeMaps.extruderRecipes"
+        }
+        "gregtech.api.recipe.RecipeCategories.ticBoltMolding" => {
+            "gregtech.api.recipe.RecipeMaps.fluidSolidifierRecipes"
+        }
+        "gregtech.api.recipe.RecipeCategories.absNonAlloyRecipes" => {
+            "gregtech.api.recipe.RecipeMaps.alloyBlastSmelterRecipes"
+        }
+        _ => {
+            push_blocker(
+                blockers,
+                RecipeLoweringBlockerKind::Metadata,
+                format!("unsupported recipe category: {category}"),
+            );
+            return;
+        }
+    };
+    if recipe.recipe_map != expected_map {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            format!(
+                "recipe category {category} belongs to {expected_map}, not {}",
+                recipe.recipe_map
+            ),
+        );
+    }
 }
 
 struct LoweredMetadata {
@@ -1593,6 +1671,55 @@ mod tests {
         lower_recipe_with_project,
     };
     use crate::{recover, recover_with_project};
+
+    #[test]
+    fn validates_recipe_category_ownership_without_treating_it_as_process_metadata()
+    -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+            import static gregtech.api.recipe.RecipeMaps.maceratorRecipes;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            import gregtech.api.recipe.RecipeCategories;
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .itemInputs(Materials.Iron.getDust(1))
+                    .itemOutputs(Materials.WroughtIron.getDust(1))
+                    .recipeCategory(RecipeCategories.maceratorRecycling)
+                    .duration(20)
+                    .eut(2)
+                    .addTo(maceratorRecipes);
+                GTValues.RA.stdBuilder()
+                    .itemInputs(Materials.Iron.getDust(1))
+                    .itemOutputs(Materials.WroughtIron.getDust(1))
+                    .recipeCategory(RecipeCategories.maceratorRecycling)
+                    .duration(20)
+                    .eut(2)
+                    .addTo(compressorRecipes);
+            }}
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let recovery = recover(&analysis);
+        let [valid, invalid] = recovery.recipes.as_slice() else {
+            return Err(anyhow::anyhow!("expected two recipes"));
+        };
+
+        let lowered = lower_recipe(valid, &analysis.bindings)
+            .map_err(|failure| anyhow::anyhow!("valid category failed: {failure:?}"))?;
+        assert_eq!(
+            lowered.recipe_map.as_str(),
+            "gregtech.api.recipe.RecipeMaps.maceratorRecipes"
+        );
+
+        let failure = lower_recipe(invalid, &analysis.bindings)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("mismatched category unexpectedly lowered"))?;
+        assert!(failure.blockers.iter().any(|blocker| {
+            blocker.kind == RecipeLoweringBlockerKind::Metadata
+                && blocker.detail.contains("belongs to")
+        }));
+        Ok(())
+    }
 
     #[test]
     fn lowers_literal_compressor_recipe() -> anyhow::Result<()> {

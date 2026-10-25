@@ -67,6 +67,8 @@ pub struct RecipeDefinition {
     pub special_value: Option<String>,
     pub special: Option<String>,
     pub metadata: Vec<BuilderCall>,
+    /// Explicit source presentation category, retained for archaeology/UI migration only.
+    pub recipe_category: Option<BuilderCall>,
     pub modifiers: Vec<BuilderCall>,
     pub post_add_calls: Vec<BuilderCall>,
     pub unhandled_calls: Vec<BuilderCall>,
@@ -347,6 +349,7 @@ fn empty_recipe_definition(
         special_value: None,
         special: None,
         metadata: Vec::new(),
+        recipe_category: None,
         modifiers: Vec::new(),
         post_add_calls: Vec::new(),
         unhandled_calls: Vec::new(),
@@ -423,7 +426,8 @@ fn recognize_recipe(
             "eut" => set_eut(&mut recipe, call, bindings, project),
             "specialValue" => recipe.special_value = one_argument(call),
             "special" => recipe.special = one_argument(call),
-            "metadata" | "recipeCategory" => recipe.metadata.push(call.into()),
+            "metadata" => recipe.metadata.push(call.into()),
+            "recipeCategory" => recipe.recipe_category = Some(call.into()),
             "circuit" => {
                 if let Some(input) = integrated_circuit_input(call) {
                     integrated_circuit_inputs.push(input);
@@ -681,22 +685,28 @@ mod tests {
     #[test]
     fn recognizes_gt_recipe_builder() -> anyhow::Result<()> {
         let source = r"
+            import static gregtech.api.recipe.RecipeMaps.maceratorRecipes;
             import static gregtech.api.util.GTRecipeBuilder.SECONDS;
+            import gregtech.api.recipe.RecipeCategories;
             class Recipes { void run() {
                 GTValues.RA.stdBuilder()
                     .circuit(7)
                     .itemInputs(ItemList.Cell_Water.get(1))
                     .itemOutputs(new ItemStack(Blocks.snow, 1))
+                    .recipeCategory(RecipeCategories.maceratorRecycling)
                     .duration(15 * SECONDS)
                     .eut(2)
-                    .addTo(compressorRecipes);
+                    .addTo(maceratorRecipes);
             }}
         ";
         let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
         let recovery = recover(&analysis);
         assert_eq!(recovery.recipes.len(), 1);
         let recipe = &recovery.recipes[0];
-        assert_eq!(recipe.recipe_map, "compressorRecipes");
+        assert_eq!(
+            recipe.recipe_map,
+            "gregtech.api.recipe.RecipeMaps.maceratorRecipes"
+        );
         assert_eq!(recipe.duration.as_deref(), Some("15 * SECONDS"));
         assert_eq!(recipe.duration_ticks, Some(300));
         assert_eq!(recipe.item_input_semantics.len(), 2);
@@ -713,6 +723,11 @@ mod tests {
                     JavaExpression::Literal(amount),
                     JavaExpression::Literal(config),
                 ] if amount == "0" && config == "7")
+        ));
+        assert_eq!(recipe.metadata.as_slice(), []);
+        assert!(matches!(
+            recipe.recipe_category.as_ref(),
+            Some(call) if call.arguments == ["RecipeCategories.maceratorRecycling"]
         ));
         assert_eq!(recipe.modifiers.as_slice(), []);
         assert_eq!(recipe.eut.as_deref(), Some("2"));

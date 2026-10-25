@@ -526,3 +526,22 @@ The full GT5 result after this pass is:
 - chance blockers: **50**.
 
 This adds 51 fully lowered recipes. The remaining 13 fuel definitions are genuinely data-dependent rather than unexplained static cases: material-parameter `mFuelPower`/`mFuelType` builders, two BartWorks pair-backed fuel values, a semi-fluid handler parameter, and one plasma value computed from runtime material mass. They remain fail-closed until the importer can prove the relevant material/value provenance generally.
+
+### Recipe categories are grouping metadata with map validation
+
+`GTRecipeBuilder.recipeCategory(...)` is now recovered separately from recipe process metadata. A category does not change inputs, outputs, duration, power, or machine behavior, so it is not carried into the target process IR merely because GregTech stores it alongside recipe-builder state.
+
+It is not safe to drop blindly, however. `RecipeMapBackend` rejects a recipe when its explicit category belongs to a different recipe map. The importer therefore preserves the source category long enough to validate that ownership, then discards the grouping detail from the executable target recipe. Known GT5 category/map pairs are checked explicitly; dynamic or unknown categories remain fail-closed.
+
+Full GT5 result after this pass:
+
+- target recipes lowered: **3,695 / 5,791 (63.81%)**, up from 3,601 / 5,791 (62.18%);
+- metadata blockers: **504**, down from 623;
+- item-input blockers: **1,218**;
+- item-output blockers: **961**;
+- fluid blockers: **457**;
+- non-constant EU/t blockers: **417**;
+- modifier blockers: **178**;
+- chance blockers: **50**.
+
+This adds 94 fully lowered recipes and removes metadata as a blocker from 119 recipes without weakening source validity checks. The distinction is useful beyond GT5: presentation/grouping provenance can be retained for migration or UI work without being mistaken for runtime recipe semantics.
