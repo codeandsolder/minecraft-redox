@@ -184,6 +184,28 @@ pub enum RecipeUnlock {
     },
 }
 
+/// One named runtime resource whose consumption drives process progress.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProgressResourceSpec {
+    pub resource: ContentId,
+    pub amount: u64,
+}
+
+/// What advances an executable recipe toward completion.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RecipeProgress {
+    /// Progress advances with wall-clock machine ticks.
+    Timed { duration_ticks: u64 },
+    /// Progress advances only by consuming the listed runtime resources.
+    ///
+    /// The process completes once every required amount has been consumed; resources may
+    /// arrive incrementally while the recipe remains active.
+    ResourceDriven {
+        resources: Vec<ProgressResourceSpec>,
+    },
+}
+
 /// A source-independent condition controlling whether recipe content is available at all.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -222,6 +244,6 @@ pub struct ContentRecipe {
     pub startup_energy_eu: u64,
     /// Fuel energy density, in EU per litre, when this entry defines a generator fuel.
     pub fuel_energy_eu_per_liter: Option<u64>,
-    pub duration_ticks: u64,
+    pub progress: RecipeProgress,
     pub eut: i64,
 }

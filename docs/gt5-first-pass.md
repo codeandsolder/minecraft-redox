@@ -895,3 +895,36 @@ Full pinned-corpus result:
 - missing-EU/t blockers: **24**;
 - post-add blockers: **7**;
 - modifier blockers: **6**.
+
+
+### Resource-driven process progress and Beam Crafter particles
+
+Target recipe IR no longer assumes every process advances purely with wall-clock ticks. `ContentRecipe` now carries `RecipeProgress`:
+
+```rust
+pub enum RecipeProgress {
+    Timed { duration_ticks: u64 },
+    ResourceDriven { resources: Vec<ProgressResourceSpec> },
+}
+```
+
+`ProgressResourceSpec` is a named runtime resource plus the amount that must be consumed to complete the process. Resource-driven processes may remain active while the resource is unavailable and resume when more arrives; this is intentionally different from an up-front recipe input or a machine-capability requirement.
+
+GT5's Beam Crafter is the first source adapter. Source inspection of `MTEBeamCrafter` shows that the metadata's two particle IDs and amounts replace time-based progress: beam particles are buffered, consumed incrementally, and each consumed particle advances progress by one. The machine sets completion progress to `amount_A + amount_B`; if both metadata slots name the same particle, both draw from the same buffer. The target therefore maps `BEAMCRAFTER_METADATA` to named particle resources, summing amounts for duplicate particle identities. The recipe's EU/t remains the real electrical draw while the machine-specific no-overclock/parallel policy stays machine-side.
+
+Only `gregtech.api.recipe.RecipeMaps.beamcrafterRecipes` accepts this metadata. The builder must be the exact same-package `BeamCrafterMetadata.builder()` chain, both particle IDs must resolve to named `gtnhlanth.common.beamline.Particle` enum constants, and both amounts must be positive static scalars. Wrong maps, dynamic particles, malformed builders, and invalid amounts stay fail-closed.
+
+Full pinned-corpus result:
+
+- target recipes lowered: **3,951 / 5,791 (68.23%)**, up from 3,929 / 5,791 (67.85%);
+- metadata blockers: **357**, down from 379;
+- fluid blockers: **388**;
+- item-input blockers: **1,218**;
+- item-output blockers: **961**;
+- non-constant EU/t blockers: **417**;
+- missing-duration blockers: **332**;
+- chance blockers: **50**;
+- special blockers: **31**;
+- missing-EU/t blockers: **24**;
+- post-add blockers: **7**;
+- modifier blockers: **6**.

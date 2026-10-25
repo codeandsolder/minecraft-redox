@@ -5,7 +5,8 @@ use minecraft_redox_core::{
     content::{
         ContentId, ContentRecipe, FluidInputSpec, FluidSelector, FluidStackSpec, ItemInputSpec,
         ItemInputStackSpec, ItemOutputSpec, ItemSelector, ItemStackSpec, Probability,
-        RecipeAvailabilityRequirement, RecipeExecutionMode, RecipeRequirement, RecipeUnlock,
+        ProgressResourceSpec, RecipeAvailabilityRequirement, RecipeExecutionMode, RecipeProgress,
+        RecipeRequirement, RecipeUnlock,
     },
 };
 use minecraft_redox_java::{JavaBindings, JavaExpression, JavaProjectIndex};
@@ -192,7 +193,9 @@ fn lower_recipe_internal(
             unlock: lowered_metadata.unlock,
             startup_energy_eu: lowered_metadata.startup_energy_eu,
             fuel_energy_eu_per_liter: lowered_metadata.fuel_energy_eu_per_liter,
-            duration_ticks,
+            progress: lowered_metadata
+                .progress_override
+                .unwrap_or(RecipeProgress::Timed { duration_ticks }),
             eut,
         });
     }
@@ -396,6 +399,7 @@ struct LoweredMetadata {
     fuel_energy_eu_per_liter: Option<u64>,
     recipe_map_override: Option<ContentId>,
     synthetic_transform: Option<SyntheticRecipeTransform>,
+    progress_override: Option<RecipeProgress>,
 }
 
 #[derive(Default)]
@@ -411,6 +415,7 @@ struct MetadataAccumulator<'a> {
     recycle: Option<(&'a crate::BuilderCall, &'a JavaExpression)>,
     arc_additive_amount: Option<(&'a crate::BuilderCall, &'a JavaExpression)>,
     environment_metadata: Vec<(&'a crate::BuilderCall, ContentId, &'a JavaExpression)>,
+    progress_override: Option<RecipeProgress>,
 }
 
 fn lower_metadata(
@@ -471,6 +476,7 @@ fn lower_metadata(
         fuel_energy_eu_per_liter,
         recipe_map_override,
         synthetic_transform,
+        progress_override: state.progress_override,
     }
 }
 
@@ -513,6 +519,12 @@ fn collect_metadata_entry<'a>(
             &mut state.minimum_capabilities,
             blockers,
         );
+    } else if key == "gregtech.api.recipe.RecipeMaps.BEAMCRAFTER_METADATA" {
+        if let Some(progress) =
+            lower_beamcrafter_progress(recipe, call, value, bindings, project, blockers)
+        {
+            state.progress_override = Some(progress);
+        }
     } else if key == "gregtech.api.util.GTRecipeConstants.FUSION_THRESHOLD" {
         if let Some(value) =
             lower_fusion_startup_energy(recipe, call, value, bindings, project, blockers)
@@ -552,6 +564,188 @@ fn collect_metadata_entry<'a>(
             format!("unsupported recipe metadata key: {key}"),
         );
     }
+}
+
+fn lower_beamcrafter_progress(
+    recipe: &RecipeDefinition,
+    call: &crate::BuilderCall,
+    value: &JavaExpression,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+    blockers: &mut Vec<RecipeLoweringBlocker>,
+) -> Option<RecipeProgress> {
+    const BEAM_MAP: &str = "gregtech.api.recipe.RecipeMaps.beamcrafterRecipes";
+    if recipe.recipe_map != BEAM_MAP {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            format!(
+                "BEAMCRAFTER_METADATA used on unsupported recipe map {}",
+                recipe.recipe_map
+            ),
+        );
+        return None;
+    }
+    let Some((setters, root)) = beamcrafter_builder_chain(value) else {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            format!(
+                "unsupported Beam Crafter metadata shape: {}",
+                call.arguments.join(", ")
+            ),
+        );
+        return None;
+    };
+    let resolved_root = bindings.resolve_reference(&root);
+    let resolved_root = if resolved_root == "BeamCrafterMetadata"
+        && bindings.package.as_deref() == Some("gregtech.loaders.postload.recipes.beamcrafter")
+    {
+        String::from("gregtech.loaders.postload.recipes.beamcrafter.BeamCrafterMetadata")
+    } else {
+        resolved_root
+    };
+    if resolved_root != "gregtech.loaders.postload.recipes.beamcrafter.BeamCrafterMetadata" {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            format!("unexpected Beam Crafter metadata builder: {root}"),
+        );
+        return None;
+    }
+
+    let mut particle_a = None;
+    let mut particle_b = None;
+    let mut amount_a = None;
+    let mut amount_b = None;
+    for (method, arguments) in setters.into_iter().rev() {
+        let [argument] = arguments else {
+            push_blocker(
+                blockers,
+                RecipeLoweringBlockerKind::Metadata,
+                format!("Beam Crafter metadata setter {method} must have one argument"),
+            );
+            return None;
+        };
+        match method {
+            "particleID_A" => particle_a = beam_particle_resource(argument, bindings),
+            "particleID_B" => particle_b = beam_particle_resource(argument, bindings),
+            "amount_A" => amount_a = positive_scalar(argument, bindings, project),
+            "amount_B" => amount_b = positive_scalar(argument, bindings, project),
+            _ => {
+                push_blocker(
+                    blockers,
+                    RecipeLoweringBlockerKind::Metadata,
+                    format!("unsupported Beam Crafter metadata setter: {method}"),
+                );
+                return None;
+            }
+        }
+    }
+    let (Some(particle_a), Some(particle_b), Some(amount_a), Some(amount_b)) =
+        (particle_a, particle_b, amount_a, amount_b)
+    else {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            "Beam Crafter metadata does not statically define both particles and amounts",
+        );
+        return None;
+    };
+
+    let mut resources = BTreeMap::<ContentId, u64>::new();
+    for (resource, amount) in [(particle_a, amount_a), (particle_b, amount_b)] {
+        let current = resources.entry(resource).or_default();
+        let Some(total) = current.checked_add(amount) else {
+            push_blocker(
+                blockers,
+                RecipeLoweringBlockerKind::Metadata,
+                "Beam Crafter resource amount overflows target range",
+            );
+            return None;
+        };
+        *current = total;
+    }
+    Some(RecipeProgress::ResourceDriven {
+        resources: resources
+            .into_iter()
+            .map(|(resource, amount)| ProgressResourceSpec { resource, amount })
+            .collect(),
+    })
+}
+
+type BeamCrafterSetter<'a> = (&'a str, &'a [JavaExpression]);
+
+fn beamcrafter_builder_chain(
+    expression: &JavaExpression,
+) -> Option<(Vec<BeamCrafterSetter<'_>>, String)> {
+    let JavaExpression::Call {
+        receiver: Some(receiver),
+        method,
+        arguments,
+    } = expression
+    else {
+        return None;
+    };
+    if method != "build" || !arguments.is_empty() {
+        return None;
+    }
+    let mut current = receiver.as_ref();
+    let mut setters = Vec::new();
+    loop {
+        let JavaExpression::Call {
+            receiver: Some(receiver),
+            method,
+            arguments,
+        } = current
+        else {
+            return None;
+        };
+        if method == "builder" {
+            if !arguments.is_empty() {
+                return None;
+            }
+            let JavaExpression::Reference(root) = receiver.as_ref() else {
+                return None;
+            };
+            return Some((setters, root.clone()));
+        }
+        setters.push((method.as_str(), arguments.as_slice()));
+        current = receiver.as_ref();
+    }
+}
+
+fn beam_particle_resource(
+    expression: &JavaExpression,
+    bindings: &JavaBindings,
+) -> Option<ContentId> {
+    let JavaExpression::Call {
+        receiver: Some(receiver),
+        method,
+        arguments,
+    } = expression
+    else {
+        return None;
+    };
+    if method != "getId" || !arguments.is_empty() {
+        return None;
+    }
+    let reference = resolved_reference_name(receiver, bindings)?;
+    reference
+        .starts_with("gtnhlanth.common.beamline.Particle.")
+        .then(|| ContentId::new(reference))
+}
+
+fn positive_scalar(
+    expression: &JavaExpression,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+) -> Option<u64> {
+    let value = project.map_or_else(
+        || literal_i64(expression),
+        |project| scalar_i64(expression, bindings, project),
+    )?;
+    (value > 0).then(|| u64::try_from(value).ok()).flatten()
 }
 
 fn lower_universal_arc_furnace<'a>(
@@ -2413,7 +2607,8 @@ fn push_blocker(
 mod tests {
     use minecraft_redox_core::content::{
         FluidInputSpec, FluidSelector, ItemInputSpec, ItemSelector, Probability,
-        RecipeAvailabilityRequirement, RecipeExecutionMode, RecipeRequirement, RecipeUnlock,
+        RecipeAvailabilityRequirement, RecipeExecutionMode, RecipeProgress, RecipeRequirement,
+        RecipeUnlock,
     };
     use minecraft_redox_java::{JavaExpression, JavaProjectIndex, analyze_source};
 
@@ -2505,7 +2700,12 @@ mod tests {
             lowered.recipe_map.as_str(),
             "gregtech.api.recipe.RecipeMaps.compressorRecipes"
         );
-        assert_eq!(lowered.duration_ticks, 100);
+        assert_eq!(
+            lowered.progress,
+            RecipeProgress::Timed {
+                duration_ticks: 100
+            }
+        );
         assert_eq!(lowered.eut, 2);
         assert_eq!(lowered.item_inputs.len(), 1);
         let ItemInputSpec::Stack(input) = &lowered.item_inputs[0] else {
@@ -3242,7 +3442,10 @@ mod tests {
             lowered.recipe_map.as_str(),
             "gregtech.api.recipe.RecipeMaps.arcFurnaceRecipes"
         );
-        assert_eq!(lowered.duration_ticks, 26);
+        assert_eq!(
+            lowered.progress,
+            RecipeProgress::Timed { duration_ticks: 26 }
+        );
         assert_eq!(lowered.item_inputs.len(), 2);
         let ItemInputSpec::Stack(circuit) = &lowered.item_inputs[1] else {
             return Err(anyhow::anyhow!("synthetic circuit was not a stack"));
@@ -3363,7 +3566,10 @@ mod tests {
         let lowered = lower_recipe(recipe, &analysis.bindings)
             .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
         assert_eq!(lowered.startup_energy_eu, 480_000_000);
-        assert_eq!(lowered.duration_ticks, 40);
+        assert_eq!(
+            lowered.progress,
+            RecipeProgress::Timed { duration_ticks: 40 }
+        );
         assert_eq!(lowered.eut, 2048);
         Ok(())
     }
@@ -3903,7 +4109,10 @@ mod tests {
             "gregtech.api.recipe.RecipeMaps.gasTurbineFuels"
         );
         assert_eq!(lowered.fuel_energy_eu_per_liter, Some(537));
-        assert_eq!(lowered.duration_ticks, 0);
+        assert_eq!(
+            lowered.progress,
+            RecipeProgress::Timed { duration_ticks: 0 }
+        );
         assert_eq!(lowered.eut, 0);
         Ok(())
     }
@@ -3969,7 +4178,10 @@ mod tests {
             "gregtech.api.recipe.RecipeMaps.semiFluidFuels"
         );
         assert_eq!(lowered.fuel_energy_eu_per_liter, Some(96));
-        assert_eq!(lowered.duration_ticks, 0);
+        assert_eq!(
+            lowered.progress,
+            RecipeProgress::Timed { duration_ticks: 0 }
+        );
         assert_eq!(lowered.eut, 0);
         Ok(())
     }
@@ -4002,7 +4214,10 @@ mod tests {
             "gregtech.api.recipe.RecipeMaps.gasTurbineFuels"
         );
         assert_eq!(lowered.fuel_energy_eu_per_liter, Some(0));
-        assert_eq!(lowered.duration_ticks, 0);
+        assert_eq!(
+            lowered.progress,
+            RecipeProgress::Timed { duration_ticks: 0 }
+        );
         assert_eq!(lowered.eut, 0);
         Ok(())
     }
@@ -4800,6 +5015,120 @@ mod tests {
                 .blockers
                 .iter()
                 .any(|blocker| blocker.kind == RecipeLoweringBlockerKind::Fluids)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn lowers_beamcrafter_metadata_to_resource_driven_progress() -> anyhow::Result<()> {
+        let source = r"
+            package gregtech.loaders.postload.recipes.beamcrafter;
+            import static gregtech.api.recipe.RecipeMaps.BEAMCRAFTER_METADATA;
+            import static gregtech.api.recipe.RecipeMaps.beamcrafterRecipes;
+            import static gtnhlanth.common.beamline.Particle.NEUTRON;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            class BeamCrafterMetadata {
+                static Builder builder() { return null; }
+                static class Builder {
+                    Builder particleID_A(int value) { return this; }
+                    Builder particleID_B(int value) { return this; }
+                    Builder amount_A(int value) { return this; }
+                    Builder amount_B(int value) { return this; }
+                    BeamCrafterMetadata build() { return null; }
+                }
+            }
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .itemInputs(Materials.Iron.getDust(1))
+                    .itemOutputs(Materials.Steel.getDust(1))
+                    .metadata(
+                        BEAMCRAFTER_METADATA,
+                        BeamCrafterMetadata.builder()
+                            .particleID_A(NEUTRON.getId())
+                            .particleID_B(NEUTRON.getId())
+                            .amount_A(25 * 10)
+                            .amount_B(25 * 10)
+                            .build())
+                    .duration(40).eut(32).addTo(beamcrafterRecipes);
+            }}
+        ";
+        let analysis = analyze_source("BeamCrafterRecipes.java", "gt5", None, source)?;
+        let mut project = JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let recovery = crate::recover_with_project(&analysis, &project);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let lowered = super::lower_recipe_with_project(recipe, &analysis.bindings, &project)
+            .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
+        let RecipeProgress::ResourceDriven { resources } = &lowered.progress else {
+            return Err(anyhow::anyhow!(
+                "Beam Crafter progress remained time-driven"
+            ));
+        };
+        assert_eq!(resources.len(), 1);
+        assert_eq!(
+            resources[0].resource.as_str(),
+            "gtnhlanth.common.beamline.Particle.NEUTRON"
+        );
+        assert_eq!(resources[0].amount, 500);
+        Ok(())
+    }
+
+    #[test]
+    fn beamcrafter_metadata_on_wrong_map_stays_blocked() -> anyhow::Result<()> {
+        let source = r"
+            package gregtech.loaders.postload.recipes.beamcrafter;
+            import static gregtech.api.recipe.RecipeMaps.BEAMCRAFTER_METADATA;
+            import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+            import static gtnhlanth.common.beamline.Particle.PROTON;
+            import static gtnhlanth.common.beamline.Particle.ELECTRON;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            class BeamCrafterMetadata {
+                static Builder builder() { return null; }
+                static class Builder {
+                    Builder particleID_A(int value) { return this; }
+                    Builder particleID_B(int value) { return this; }
+                    Builder amount_A(int value) { return this; }
+                    Builder amount_B(int value) { return this; }
+                    BeamCrafterMetadata build() { return null; }
+                }
+            }
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .itemInputs(Materials.Iron.getDust(1))
+                    .itemOutputs(Materials.Steel.getDust(1))
+                    .metadata(
+                        BEAMCRAFTER_METADATA,
+                        BeamCrafterMetadata.builder()
+                            .particleID_A(PROTON.getId())
+                            .particleID_B(ELECTRON.getId())
+                            .amount_A(1).amount_B(1).build())
+                    .duration(20).eut(2).addTo(compressorRecipes);
+            }}
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let mut project = JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let recovery = crate::recover_with_project(&analysis, &project);
+        let failure = super::lower_recipe_with_project(
+            recovery
+                .recipes
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("recipe missing"))?,
+            &analysis.bindings,
+            &project,
+        )
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("wrong-map Beam Crafter metadata unexpectedly lowered"))?;
+        assert!(
+            failure
+                .blockers
+                .iter()
+                .any(|blocker| blocker.kind == RecipeLoweringBlockerKind::Metadata)
         );
         Ok(())
     }
