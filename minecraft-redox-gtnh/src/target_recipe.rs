@@ -15,6 +15,7 @@ use serde::Serialize;
 use crate::{
     ExpressionSemantic, FluidSemantic, ItemSemantic, NumericSemantic, RecipeDefinition,
     RecipeMetadataDefinition, RecoveredExpression,
+    fixed_decimal::fixed_decimal_value,
     recipe_expression::{literal_i64, recover_items_with_project, resolved_reference_name},
     scalar_expression::{scalar_i64, scalar_static_field_i64},
 };
@@ -281,6 +282,12 @@ fn lower_metadata_entry(
             value: metadata_i64(&metadata.value_expression, bindings, project)
                 .or_else(|| linked_metadata_field_i64(&metadata.value_semantic, project))?,
         }
+    } else if is_java_type(expected, "Float") || is_java_type(expected, "Double") {
+        RecipeMetadataValue::Decimal {
+            value: fixed_decimal_value(&metadata.value_expression)?,
+        }
+    } else if is_decimal_triple_type(expected) {
+        lower_decimal_triple_metadata(&metadata.value_expression)?
     } else if is_java_type(expected, "Boolean") {
         RecipeMetadataValue::Boolean {
             value: literal_boolean(&metadata.value_expression)?,
@@ -368,6 +375,31 @@ fn infer_metadata_expected_type(
         }
     }
     project.generic_supertype_argument(&field.type_name, "RecipeMetadataKey", 0)
+}
+
+fn is_decimal_triple_type(expected: &str) -> bool {
+    let compact: String = expected
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    compact.ends_with("Triple<Double,Double,Double>")
+}
+
+fn lower_decimal_triple_metadata(expression: &JavaExpression) -> Option<RecipeMetadataValue> {
+    let JavaExpression::Call {
+        method, arguments, ..
+    } = expression
+    else {
+        return None;
+    };
+    if method != "of" || arguments.len() != 3 {
+        return None;
+    }
+    Some(RecipeMetadataValue::DecimalTriple {
+        first: fixed_decimal_value(&arguments[0])?,
+        second: fixed_decimal_value(&arguments[1])?,
+        third: fixed_decimal_value(&arguments[2])?,
+    })
 }
 
 fn lower_item_stack_metadata(
@@ -1357,6 +1389,65 @@ mod tests {
         assert_eq!(values.len(), 1);
         assert_eq!(values[0].item.amount, 3);
         assert_eq!(values[0].value, 7);
+        Ok(())
+    }
+
+    #[test]
+    fn lowers_decimal_and_decimal_triple_metadata() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+            import gregtech.api.enums.GTValues;
+            class RecipeMetadataKey<T> {}
+            class Triple<A, B, C> { static <A, B, C> Triple<A, B, C> of(A a, B b, C c) { return null; } }
+            class Keys {
+                static RecipeMetadataKey<Float> FACTOR;
+                static RecipeMetadataKey<Triple<Double, Double, Double>> MODIFIERS;
+            }
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .metadata(Keys.FACTOR, 0.0f)
+                    .metadata(Keys.MODIFIERS, Triple.of(0.1d, 0.80d, 1.1d))
+                    .duration(20)
+                    .eut(2)
+                    .addTo(compressorRecipes);
+            }}
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let mut project = JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let recovery = crate::recover_with_project(&analysis, &project);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let lowered = super::lower_recipe_with_project(recipe, &analysis.bindings, &project)
+            .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
+        assert!(matches!(
+            lowered.metadata[0].value,
+            RecipeMetadataValue::Decimal {
+                value: minecraft_redox_core::content::FixedDecimal {
+                    coefficient: 0,
+                    decimal_places: 0
+                }
+            }
+        ));
+        assert!(matches!(
+            lowered.metadata[1].value,
+            RecipeMetadataValue::DecimalTriple {
+                first: minecraft_redox_core::content::FixedDecimal {
+                    coefficient: 1,
+                    decimal_places: 1
+                },
+                second: minecraft_redox_core::content::FixedDecimal {
+                    coefficient: 8,
+                    decimal_places: 1
+                },
+                third: minecraft_redox_core::content::FixedDecimal {
+                    coefficient: 11,
+                    decimal_places: 1
+                }
+            }
+        ));
         Ok(())
     }
 

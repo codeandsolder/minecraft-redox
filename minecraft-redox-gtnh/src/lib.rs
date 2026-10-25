@@ -1,5 +1,6 @@
 //! GTNH-specific semantic recognizers built on Minecraft Redox Java structure.
 
+mod fixed_decimal;
 mod recipe_expression;
 mod scalar_expression;
 mod target_material;

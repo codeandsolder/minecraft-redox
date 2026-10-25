@@ -130,15 +130,43 @@ pub struct ItemStackIntegerPair {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RecipeMetadataValue {
-    Integer { value: i64 },
-    Boolean { value: bool },
-    Text { value: String },
-    ContentRef { id: ContentId },
-    ItemStack { value: ItemStackSpec },
-    ItemStacks { values: Vec<ItemStackSpec> },
-    ItemStackIntegerPairs { values: Vec<ItemStackIntegerPair> },
-    Scanning { duration_ticks: u64, voltage: i64 },
-    Sievert { value: i64, exact: bool },
+    Integer {
+        value: i64,
+    },
+    Decimal {
+        value: FixedDecimal,
+    },
+    DecimalTriple {
+        first: FixedDecimal,
+        second: FixedDecimal,
+        third: FixedDecimal,
+    },
+    Boolean {
+        value: bool,
+    },
+    Text {
+        value: String,
+    },
+    ContentRef {
+        id: ContentId,
+    },
+    ItemStack {
+        value: ItemStackSpec,
+    },
+    ItemStacks {
+        values: Vec<ItemStackSpec>,
+    },
+    ItemStackIntegerPairs {
+        values: Vec<ItemStackIntegerPair>,
+    },
+    Scanning {
+        duration_ticks: u64,
+        voltage: i64,
+    },
+    Sievert {
+        value: i64,
+        exact: bool,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
