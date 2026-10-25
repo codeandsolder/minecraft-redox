@@ -167,6 +167,12 @@ pub enum RecipeMetadataValue {
         value: i64,
         exact: bool,
     },
+    BeamCrafter {
+        particle_a: ContentId,
+        particle_b: ContentId,
+        amount_a: i64,
+        amount_b: i64,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

@@ -313,6 +313,8 @@ fn lower_metadata_entry(
         lower_scanning_metadata(&metadata.value_expression, bindings, project)?
     } else if is_java_type(expected, "Sievert") {
         lower_sievert_metadata(&metadata.value_expression, bindings, project)?
+    } else if is_java_type(expected, "BeamCrafterMetadata") {
+        lower_beam_crafter_metadata(&metadata.value_expression, bindings, project)?
     } else if project.is_some_and(|project| {
         let owner = bindings.resolve_reference(expected);
         project.type_kind(&owner) == Some(JavaTypeKind::Enum)
@@ -559,6 +561,101 @@ fn lower_sievert_metadata(
         value: metadata_i64(&arguments[0], bindings, project)?,
         exact,
     })
+}
+
+fn lower_beam_crafter_metadata(
+    expression: &JavaExpression,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+) -> Option<RecipeMetadataValue> {
+    let mut calls = Vec::new();
+    let root = flatten_expression_call_chain(expression, &mut calls)?;
+    let root_name = resolved_reference_name(root, bindings)?;
+    if !root_name.ends_with("BeamCrafterMetadata")
+        || calls.first()?.0 != "builder"
+        || calls.last()?.0 != "build"
+    {
+        return None;
+    }
+
+    let mut particle_a = None;
+    let mut particle_b = None;
+    let mut amount_a = None;
+    let mut amount_b = None;
+    let middle_len = calls.len().saturating_sub(2);
+    for (method, arguments) in calls.iter().skip(1).take(middle_len) {
+        match (*method, *arguments) {
+            ("particleID_A", [argument]) => {
+                particle_a = Some(lower_particle_id_expression(argument, bindings, project)?);
+            }
+            ("particleID_B", [argument]) => {
+                particle_b = Some(lower_particle_id_expression(argument, bindings, project)?);
+            }
+            ("amount_A", [argument]) => {
+                amount_a = Some(metadata_i64(argument, bindings, project)?);
+            }
+            ("amount_B", [argument]) => {
+                amount_b = Some(metadata_i64(argument, bindings, project)?);
+            }
+            _ => return None,
+        }
+    }
+    Some(RecipeMetadataValue::BeamCrafter {
+        particle_a: particle_a?,
+        particle_b: particle_b?,
+        amount_a: amount_a?,
+        amount_b: amount_b?,
+    })
+}
+
+fn flatten_expression_call_chain<'a>(
+    expression: &'a JavaExpression,
+    calls: &mut Vec<(&'a str, &'a [JavaExpression])>,
+) -> Option<&'a JavaExpression> {
+    let JavaExpression::Call {
+        receiver: Some(receiver),
+        method,
+        arguments,
+    } = expression
+    else {
+        return Some(expression);
+    };
+    let root = flatten_expression_call_chain(receiver, calls)?;
+    calls.push((method.as_str(), arguments.as_slice()));
+    Some(root)
+}
+
+fn lower_particle_id_expression(
+    expression: &JavaExpression,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+) -> Option<ContentId> {
+    let JavaExpression::Call {
+        receiver: Some(receiver),
+        method,
+        arguments,
+    } = expression
+    else {
+        return None;
+    };
+    if method != "getId" || !arguments.is_empty() {
+        return None;
+    }
+    let reference = resolved_reference_name(receiver, bindings)?;
+    let (owner, constant) = reference.rsplit_once('.')?;
+    let normalized_owner = if project.is_some_and(|project| project.type_kind(owner).is_some()) {
+        owner.to_owned()
+    } else if let (Some(project), Some(package)) = (project, bindings.package.as_deref()) {
+        let candidate = format!("{package}.{owner}");
+        if project.type_kind(&candidate).is_some() {
+            candidate
+        } else {
+            owner.to_owned()
+        }
+    } else {
+        owner.to_owned()
+    };
+    Some(ContentId::new(format!("{normalized_owner}.{constant}")))
 }
 
 fn lower_recipe_category(
@@ -1447,6 +1544,60 @@ mod tests {
                     decimal_places: 1
                 }
             }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn lowers_beam_crafter_metadata_builder() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+            import gregtech.api.enums.GTValues;
+            class RecipeMetadataKey<T> {}
+            enum Particle { PROTON, ELECTRON; int getId() { return ordinal(); } }
+            class BeamCrafterMetadata {
+                static Builder builder() { return null; }
+                static class Builder {
+                    Builder particleID_A(int v) { return this; }
+                    Builder particleID_B(int v) { return this; }
+                    Builder amount_A(int v) { return this; }
+                    Builder amount_B(int v) { return this; }
+                    BeamCrafterMetadata build() { return null; }
+                }
+            }
+            class Keys { static RecipeMetadataKey<BeamCrafterMetadata> BEAM; }
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .metadata(Keys.BEAM, BeamCrafterMetadata.builder()
+                        .particleID_A(Particle.PROTON.getId())
+                        .particleID_B(Particle.ELECTRON.getId())
+                        .amount_A(25 * 10)
+                        .amount_B(120)
+                        .build())
+                    .duration(20)
+                    .eut(2)
+                    .addTo(compressorRecipes);
+            }}
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let mut project = JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let recovery = crate::recover_with_project(&analysis, &project);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let lowered = super::lower_recipe_with_project(recipe, &analysis.bindings, &project)
+            .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
+        assert!(matches!(
+            &lowered.metadata[0].value,
+            RecipeMetadataValue::BeamCrafter {
+                particle_a,
+                particle_b,
+                amount_a: 250,
+                amount_b: 120,
+            } if particle_a.as_str() == "Particle.PROTON"
+                && particle_b.as_str() == "Particle.ELECTRON"
         ));
         Ok(())
     }
