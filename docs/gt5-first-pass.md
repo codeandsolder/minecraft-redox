@@ -985,3 +985,36 @@ Full pinned-corpus result:
 - missing-EU/t blockers: **24**;
 - post-add blockers: **7**;
 - modifier blockers: **6**.
+
+
+### RTG item-fuel total energy and output rate
+
+Target recipe IR now distinguishes item fuels from the existing fluid-fuel energy-density model:
+
+```rust
+pub struct ItemFuelSpec {
+    pub total_energy_eu: u64,
+    pub output_eut: u64,
+}
+```
+
+GT++ RTG recipes use `RTG_DURATION_IN_DAYS` as source metadata, but the RTG machine does not consume a target-level "days" value directly. `MTERTGenerator` converts the metadata to ticks, multiplies by recipe EU/t (used as generator output voltage), clamps the resulting total energy to `Integer.MAX_VALUE`, and returns that energy to the basic generator. The target therefore stores the resulting one-item energy budget and output rate, while normal process `eut` is zero.
+
+The importer preserves GT++'s actual `MathUtils.roundToClosestInt` behavior, including its slightly odd half-step rounding followed by integer truncation. Float-suffixed Java literals are first rounded to Java `float` precision before applying the helper. Thus the pinned source's nominal metadata expressions normalize as `87.7f -> 87`, `28.8f -> 29`, `2.6f -> 2`, plus the literal 1 and 216 day values. The source's `Integer.MAX_VALUE` total-energy cap is preserved.
+
+Only `gregtech.api.recipe.RecipeMaps.rtgFuels` accepts this metadata, with exactly one item input, no other item/fluid I/O, a positive static day count, and a positive statically-resolved recipe EU/t. Wrong maps or unresolved values remain fail-closed.
+
+Full pinned-corpus result:
+
+- target recipes lowered: **3,971 / 5,791 (68.57%)**, up from 3,966 / 5,791 (68.49%);
+- metadata blockers: **336**, down from 341;
+- fluid blockers: **388**;
+- item-input blockers: **1,218**;
+- item-output blockers: **961**;
+- non-constant EU/t blockers: **417**;
+- missing-duration blockers: **332**;
+- chance blockers: **50**;
+- special blockers: **31**;
+- missing-EU/t blockers: **24**;
+- post-add blockers: **7**;
+- modifier blockers: **6**.

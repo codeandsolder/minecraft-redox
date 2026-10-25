@@ -3,9 +3,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use minecraft_redox_core::{
     SourceOrigin,
     content::{
-        ContentId, ContentRecipe, FluidInputSpec, FluidSelector, FluidStackSpec, ItemInputSpec,
-        ItemInputStackSpec, ItemOutputSpec, ItemSelector, ItemStackSpec, Probability,
-        ProgressResourceSpec, RecipeAvailabilityRequirement, RecipeExecutionMode,
+        ContentId, ContentRecipe, FluidInputSpec, FluidSelector, FluidStackSpec, ItemFuelSpec,
+        ItemInputSpec, ItemInputStackSpec, ItemOutputSpec, ItemSelector, ItemStackSpec,
+        Probability, ProgressResourceSpec, RecipeAvailabilityRequirement, RecipeExecutionMode,
         RecipeInputConstraint, RecipeProgress, RecipeRequirement, RecipeUnlock,
     },
 };
@@ -173,6 +173,11 @@ fn lower_recipe_internal(
     if blockers.is_empty()
         && let (Some(duration_ticks), Some(eut)) = (duration_ticks, eut)
     {
+        let target_eut = if lowered_metadata.item_fuel.is_some() {
+            0
+        } else {
+            eut
+        };
         return Ok(ContentRecipe {
             origin: recipe.origin.clone(),
             recipe_map: lowered_metadata
@@ -189,10 +194,11 @@ fn lower_recipe_internal(
             unlock: lowered_metadata.unlock,
             startup_energy_eu: lowered_metadata.startup_energy_eu,
             fuel_energy_eu_per_liter: lowered_metadata.fuel_energy_eu_per_liter,
+            item_fuel: lowered_metadata.item_fuel,
             progress: lowered_metadata
                 .progress_override
                 .unwrap_or(RecipeProgress::Timed { duration_ticks }),
-            eut,
+            eut: target_eut,
         });
     }
 
@@ -393,6 +399,7 @@ struct LoweredMetadata {
     unlock: Option<RecipeUnlock>,
     startup_energy_eu: u64,
     fuel_energy_eu_per_liter: Option<u64>,
+    item_fuel: Option<ItemFuelSpec>,
     recipe_map_override: Option<ContentId>,
     synthetic_transform: Option<SyntheticRecipeTransform>,
     progress_override: Option<RecipeProgress>,
@@ -407,6 +414,7 @@ struct MetadataAccumulator<'a> {
     startup_energy_eu: u64,
     fuel_value: Option<(&'a crate::BuilderCall, &'a JavaExpression)>,
     fuel_type: Option<(&'a crate::BuilderCall, &'a JavaExpression)>,
+    rtg_duration_days: Option<(&'a crate::BuilderCall, &'a JavaExpression)>,
     research_item: Option<(&'a crate::BuilderCall, &'a JavaExpression)>,
     scanning: Option<&'a JavaExpression>,
     recycle: Option<(&'a crate::BuilderCall, &'a JavaExpression)>,
@@ -464,6 +472,8 @@ fn lower_metadata(
         project,
         blockers,
     );
+    let item_fuel =
+        lower_rtg_item_fuel(recipe, state.rtg_duration_days, bindings, project, blockers);
     let (synthetic_transform, synthetic_map_override) =
         lower_universal_arc_furnace(recipe, state.recycle, state.arc_additive_amount, blockers);
     let recipe_map_override = synthetic_map_override.or(fuel_map_override);
@@ -472,6 +482,7 @@ fn lower_metadata(
         unlock,
         startup_energy_eu: state.startup_energy_eu,
         fuel_energy_eu_per_liter,
+        item_fuel,
         recipe_map_override,
         synthetic_transform,
         progress_override: state.progress_override,
@@ -542,6 +553,8 @@ fn collect_metadata_entry<'a>(
         state.fuel_value = Some((call, value));
     } else if key == "gregtech.api.util.GTRecipeConstants.FUEL_TYPE" {
         state.fuel_type = Some((call, value));
+    } else if key == "gregtech.api.util.GTRecipeConstants.RTG_DURATION_IN_DAYS" {
+        state.rtg_duration_days = Some((call, value));
     } else if key == "gregtech.api.util.GTRecipeConstants.RECYCLE" {
         state.recycle = Some((call, value));
     } else if key == "gregtech.api.util.GTRecipeConstants.SKIP_CELL_RECIPE_GENERATION" {
@@ -1338,6 +1351,143 @@ fn lower_fusion_startup_energy(
         );
     }
     value
+}
+
+fn lower_rtg_item_fuel(
+    recipe: &RecipeDefinition,
+    duration_days: Option<(&crate::BuilderCall, &JavaExpression)>,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+    blockers: &mut Vec<RecipeLoweringBlocker>,
+) -> Option<ItemFuelSpec> {
+    const RTG_MAP: &str = "gregtech.api.recipe.RecipeMaps.rtgFuels";
+    let (call, days_expression) = duration_days?;
+    if recipe.recipe_map != RTG_MAP {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            format!(
+                "RTG_DURATION_IN_DAYS used on unsupported recipe map {}",
+                recipe.recipe_map
+            ),
+        );
+        return None;
+    }
+    if recipe.item_input_semantics.len() != 1
+        || !recipe.item_output_semantics.is_empty()
+        || !recipe.fluid_input_semantics.is_empty()
+        || !recipe.fluid_output_semantics.is_empty()
+    {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            "RTG fuel must have exactly one item input and no other item/fluid I/O",
+        );
+        return None;
+    }
+    let Some(days) = lower_rtg_days(days_expression, bindings, project) else {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            format!(
+                "RTG_DURATION_IN_DAYS is not a positive static day count: {}",
+                call.arguments.join(", ")
+            ),
+        );
+        return None;
+    };
+    let Some(output_eut) = recipe
+        .eut_expression
+        .as_ref()
+        .and_then(|expression| scalar_i64_optional(expression, bindings, project))
+        .and_then(|value| u64::try_from(value).ok())
+        .filter(|value| *value > 0)
+    else {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            "RTG fuel output EU/t is not a positive static value",
+        );
+        return None;
+    };
+
+    let ticks = rtg_days_to_ticks(days);
+    let total_energy_eu = ticks.saturating_mul(output_eut).min(i32::MAX as u64);
+    Some(ItemFuelSpec {
+        total_energy_eu,
+        output_eut,
+    })
+}
+
+fn lower_rtg_days(
+    expression: &JavaExpression,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+) -> Option<u64> {
+    if let Some(value) = scalar_i64_optional(expression, bindings, project) {
+        return u64::try_from(value).ok().filter(|value| *value > 0);
+    }
+    let JavaExpression::Call {
+        receiver: Some(receiver),
+        method,
+        arguments,
+    } = expression
+    else {
+        return None;
+    };
+    if method != "roundToClosestInt" || arguments.len() != 1 {
+        return None;
+    }
+    let receiver = resolved_reference_name(receiver, bindings)?;
+    if receiver != "gtPlusPlus.core.util.math.MathUtils" {
+        return None;
+    }
+    let JavaExpression::Literal(literal) = arguments.first()? else {
+        return None;
+    };
+    let value = java_positive_floating_literal(literal)?;
+    java_gtpp_round_to_closest_int(value)
+}
+
+fn java_positive_floating_literal(literal: &str) -> Option<f64> {
+    let compact = literal.replace('_', "");
+    let (number, is_float) = compact
+        .strip_suffix('f')
+        .or_else(|| compact.strip_suffix('F'))
+        .map_or((compact.as_str(), false), |number| (number, true));
+    let number = number
+        .strip_suffix('d')
+        .or_else(|| number.strip_suffix('D'))
+        .unwrap_or(number);
+    let value = if is_float {
+        f64::from(number.parse::<f32>().ok()?)
+    } else {
+        number.parse::<f64>().ok()?
+    };
+    value
+        .is_finite()
+        .then_some(value)
+        .filter(|value| *value > 0.0)
+}
+
+fn java_gtpp_round_to_closest_int(value: f64) -> Option<u64> {
+    let rounded_half_steps = (value * 2.0 + 0.5).floor();
+    let truncated = (rounded_half_steps / 2.0).trunc();
+    if !(1.0..=f64::from(i32::MAX)).contains(&truncated) {
+        return None;
+    }
+    integral_f64_to_u64(truncated)
+}
+
+fn integral_f64_to_u64(value: f64) -> Option<u64> {
+    if !value.is_finite() || value < 0.0 || value.fract() != 0.0 {
+        return None;
+    }
+    value.to_string().parse().ok()
+}
+
+fn rtg_days_to_ticks(days: u64) -> u64 {
+    days.saturating_mul(1_728_000).min(i32::MAX as u64)
 }
 
 fn lower_fuel_metadata(
@@ -4296,6 +4446,98 @@ mod tests {
             "gregtech.api.recipe.RecipeMaps.plasmaFuels"
         );
         assert_eq!(lowered.fuel_energy_eu_per_liter, Some(720_000));
+        Ok(())
+    }
+
+    #[test]
+    fn lowers_rtg_days_to_capped_item_fuel_energy() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.recipe.RecipeMaps.rtgFuels;
+            import static gregtech.api.util.GTRecipeConstants.RTG_DURATION_IN_DAYS;
+            import gtPlusPlus.core.util.math.MathUtils;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            class Recipes {
+                void shortFuel() {
+                    GTValues.RA.stdBuilder()
+                        .itemInputs(Materials.Iron.getDust(1))
+                        .duration(0).eut(32)
+                        .metadata(RTG_DURATION_IN_DAYS, MathUtils.roundToClosestInt(2.6f))
+                        .addTo(rtgFuels);
+                }
+                void cappedFuel() {
+                    GTValues.RA.stdBuilder()
+                        .itemInputs(Materials.Gold.getDust(1))
+                        .duration(0).eut(16)
+                        .metadata(RTG_DURATION_IN_DAYS, 216)
+                        .addTo(rtgFuels);
+                }
+            }
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let mut project = JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let recovery = crate::recover_with_project(&analysis, &project);
+        assert_eq!(recovery.recipes.len(), 2);
+
+        let short =
+            super::lower_recipe_with_project(&recovery.recipes[0], &analysis.bindings, &project)
+                .map_err(|failure| anyhow::anyhow!("short RTG lowering failed: {failure:?}"))?;
+        let short_fuel = short
+            .item_fuel
+            .ok_or_else(|| anyhow::anyhow!("short RTG fuel missing"))?;
+        assert_eq!(short_fuel.output_eut, 32);
+        assert_eq!(short_fuel.total_energy_eu, 110_592_000);
+        assert_eq!(short.eut, 0);
+
+        let capped =
+            super::lower_recipe_with_project(&recovery.recipes[1], &analysis.bindings, &project)
+                .map_err(|failure| anyhow::anyhow!("capped RTG lowering failed: {failure:?}"))?;
+        let capped_fuel = capped
+            .item_fuel
+            .ok_or_else(|| anyhow::anyhow!("capped RTG fuel missing"))?;
+        assert_eq!(capped_fuel.output_eut, 16);
+        assert_eq!(capped_fuel.total_energy_eu, i32::MAX as u64);
+        assert_eq!(capped.eut, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn rtg_duration_metadata_on_wrong_map_stays_blocked() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+            import static gregtech.api.util.GTRecipeConstants.RTG_DURATION_IN_DAYS;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .itemInputs(Materials.Iron.getDust(1))
+                    .itemOutputs(Materials.Steel.getDust(1))
+                    .duration(20).eut(32)
+                    .metadata(RTG_DURATION_IN_DAYS, 2)
+                    .addTo(compressorRecipes);
+            }}
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let mut project = JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let recovery = crate::recover_with_project(&analysis, &project);
+        let failure = super::lower_recipe_with_project(
+            recovery
+                .recipes
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("recipe missing"))?,
+            &analysis.bindings,
+            &project,
+        )
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("wrong-map RTG metadata unexpectedly lowered"))?;
+        assert!(
+            failure
+                .blockers
+                .iter()
+                .any(|blocker| blocker.kind == RecipeLoweringBlockerKind::Metadata)
+        );
         Ok(())
     }
 

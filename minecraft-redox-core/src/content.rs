@@ -206,6 +206,15 @@ pub struct ProgressResourceSpec {
     pub amount: u64,
 }
 
+/// Energy semantics for one consumed item fuel.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ItemFuelSpec {
+    /// Total electrical energy made available by consuming one item, in EU.
+    pub total_energy_eu: u64,
+    /// Electrical output rate while that stored fuel energy is being emitted, in EU/t.
+    pub output_eut: u64,
+}
+
 /// What advances an executable recipe toward completion.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -258,8 +267,10 @@ pub struct ContentRecipe {
     pub unlock: Option<RecipeUnlock>,
     /// One-time energy charged when the recipe starts, in EU.
     pub startup_energy_eu: u64,
-    /// Fuel energy density, in EU per litre, when this entry defines a generator fuel.
+    /// Fuel energy density, in EU per litre, when this entry defines a fluid generator fuel.
     pub fuel_energy_eu_per_liter: Option<u64>,
+    /// Total-energy/output-rate semantics when consuming one item as generator fuel.
+    pub item_fuel: Option<ItemFuelSpec>,
     pub progress: RecipeProgress,
     pub eut: i64,
 }
