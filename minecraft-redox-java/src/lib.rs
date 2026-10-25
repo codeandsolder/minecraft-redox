@@ -619,6 +619,31 @@ impl JavaProjectIndex {
     }
 
     #[must_use]
+    pub fn enum_constant_ordinal(&self, owner: &str, name: &str) -> Option<usize> {
+        let owner = self.normalize_owner_name(owner, None);
+        if self.type_kinds_by_owner.get(&owner) != Some(&JavaTypeKind::Enum) {
+            return None;
+        }
+        let mut ordinal = 0usize;
+        for index in self.fields_by_owner.get(&owner)? {
+            let field = &self.fields[*index];
+            let is_enum_constant = field.owner == owner
+                && field.type_name == owner
+                && field.is_static
+                && field.is_final
+                && field.initializer.is_none();
+            if !is_enum_constant {
+                continue;
+            }
+            if field.name == name {
+                return Some(ordinal);
+            }
+            ordinal = ordinal.checked_add(1)?;
+        }
+        None
+    }
+
+    #[must_use]
     pub fn resolve_field(
         &self,
         owner: &str,
@@ -4019,6 +4044,30 @@ mod tests {
         assert_eq!(
             index.generic_supertype_argument("demo.UpgradeKey", "RecipeMetadataKey", 0),
             Some(String::from("demo.Upgrade"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reports_enum_constant_ordinals() -> anyhow::Result<()> {
+        let source = r"
+            package demo;
+            enum FuelType { DIESEL, GAS, HOT, SEMI_FLUID, PLASMA, MAGIC; }
+        ";
+        let analysis = analyze_source("FuelType.java", "demo", None, source)?;
+        let mut index = super::JavaProjectIndex::default();
+        index.add_analysis(&analysis);
+        assert_eq!(
+            index.enum_constant_ordinal("demo.FuelType", "DIESEL"),
+            Some(0)
+        );
+        assert_eq!(
+            index.enum_constant_ordinal("demo.FuelType", "PLASMA"),
+            Some(4)
+        );
+        assert_eq!(
+            index.enum_constant_ordinal("demo.FuelType", "MAGIC"),
+            Some(5)
         );
         Ok(())
     }

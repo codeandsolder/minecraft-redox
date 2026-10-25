@@ -106,6 +106,19 @@ fn eval_i64(
         JavaExpression::Parenthesized(inner) => {
             eval_i64(inner, bindings, project, current_owner, depth + 1, seen)
         }
+        JavaExpression::Call {
+            receiver: Some(receiver),
+            method,
+            arguments,
+        } if method == "ordinal" && arguments.is_empty() => {
+            let reference = resolved_reference_name(receiver, bindings)?;
+            let (owner, name) = reference.rsplit_once('.')?;
+            let ordinal = project.enum_constant_ordinal(owner, name).or_else(|| {
+                let package = current_owner?.rsplit_once('.')?.0;
+                project.enum_constant_ordinal(&format!("{package}.{owner}"), name)
+            })?;
+            i64::try_from(ordinal).ok()
+        }
         JavaExpression::Call { .. }
         | JavaExpression::New { .. }
         | JavaExpression::Array { .. }
@@ -253,6 +266,23 @@ mod tests {
     use minecraft_redox_java::{JavaProjectIndex, analyze_source};
 
     use super::scalar_i64;
+
+    #[test]
+    fn evaluates_enum_ordinal() -> anyhow::Result<()> {
+        let source = r"
+            package demo;
+            enum FuelType { DIESEL, GAS, HOT, SEMI_FLUID, PLASMA, MAGIC; }
+            class Recipe { static final int VALUE = FuelType.PLASMA.ordinal(); }
+        ";
+        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
+        let mut project = JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        assert_eq!(
+            super::scalar_static_field_i64("demo.Recipe", "VALUE", &project),
+            Some(4)
+        );
+        Ok(())
+    }
 
     #[test]
     fn evaluates_gt_recipe_tier_from_source_definitions() -> anyhow::Result<()> {
