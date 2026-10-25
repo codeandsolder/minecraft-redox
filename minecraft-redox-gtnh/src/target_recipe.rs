@@ -293,6 +293,8 @@ fn lower_metadata_entry(
         }
     } else if is_java_type(expected, "ItemStack") {
         lower_item_stack_metadata(metadata, source_path, bindings, project)?
+    } else if expected.ends_with("ItemStack[]") {
+        lower_item_stack_array_metadata(metadata, source_path, bindings, project)?
     } else if is_java_type(expected, "Scanning") {
         lower_scanning_metadata(&metadata.value_expression, bindings, project)?
     } else if is_java_type(expected, "Sievert") {
@@ -338,6 +340,36 @@ fn lower_item_stack_metadata(
     };
     let stack = lower_recovered_stack(recovered.first()?, bindings)?;
     Some(RecipeMetadataValue::ItemStack { value: stack })
+}
+
+fn lower_item_stack_array_metadata(
+    metadata: &RecipeMetadataDefinition,
+    source_path: &str,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+) -> Option<RecipeMetadataValue> {
+    let JavaExpression::Array { elements, .. } = &metadata.value_expression else {
+        return None;
+    };
+    let mut values = Vec::with_capacity(elements.len());
+    for expression in elements {
+        let source = [metadata.value_source.clone()];
+        let expressions = [expression.clone()];
+        let recovered = if let Some(project) = project {
+            recover_items_with_project(
+                &source,
+                &expressions,
+                bindings,
+                project,
+                source_path,
+                metadata.byte_start,
+            )
+        } else {
+            crate::recipe_expression::recover_items(&source, &expressions, bindings)
+        };
+        values.push(lower_recovered_stack(recovered.first()?, bindings)?);
+    }
+    Some(RecipeMetadataValue::ItemStacks { values })
 }
 
 fn linked_metadata_field_i64(
@@ -1106,6 +1138,46 @@ mod tests {
                 .map(minecraft_redox_core::content::ContentId::as_str),
             Some("RecipeCategory.SPECIAL")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn lowers_item_stack_array_metadata() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+            import gregtech.api.enums.GTValues;
+            import net.minecraft.item.ItemStack;
+            class RecipeMetadataKey<T> {}
+            class ItemList {
+                static final Entry A = new Entry();
+                static final Entry B = new Entry();
+                static class Entry { ItemStack get(long amount) { return null; } }
+            }
+            class Keys { static RecipeMetadataKey<ItemStack[]> SHELL; }
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .metadata(Keys.SHELL, new ItemStack[] { ItemList.A.get(1), ItemList.B.get(2) })
+                    .duration(20)
+                    .eut(2)
+                    .addTo(compressorRecipes);
+            }}
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let mut project = JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let recovery = crate::recover_with_project(&analysis, &project);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let lowered = super::lower_recipe_with_project(recipe, &analysis.bindings, &project)
+            .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
+        let RecipeMetadataValue::ItemStacks { values } = &lowered.metadata[0].value else {
+            return Err(anyhow::anyhow!("metadata was not an item stack array"));
+        };
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0].amount, 1);
+        assert_eq!(values[1].amount, 2);
         Ok(())
     }
 

@@ -129,6 +129,7 @@ pub enum RecipeMetadataValue {
     Text { value: String },
     ContentRef { id: ContentId },
     ItemStack { value: ItemStackSpec },
+    ItemStacks { values: Vec<ItemStackSpec> },
     Scanning { duration_ticks: u64, voltage: i64 },
     Sievert { value: i64, exact: bool },
 }
