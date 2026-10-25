@@ -15,6 +15,19 @@ pub(crate) fn scalar_i64(
     eval_i64(expression, bindings, project, None, 0, &mut seen)
 }
 
+pub(crate) fn scalar_static_field_i64(
+    owner: &str,
+    name: &str,
+    project: &JavaProjectIndex,
+) -> Option<i64> {
+    let field = project.resolve_field(owner, name, Some(true))?;
+    if !field.is_final {
+        return None;
+    }
+    let mut seen = BTreeSet::new();
+    eval_field(field, project, 0, &mut seen)
+}
+
 fn eval_i64(
     expression: &JavaExpression,
     bindings: &JavaBindings,

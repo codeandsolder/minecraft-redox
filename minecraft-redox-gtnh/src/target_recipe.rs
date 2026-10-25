@@ -6,14 +6,16 @@ use minecraft_redox_core::{
         RecipeMetadataValue, RecipePolicySpec, RecipeSlotChance, RecipeSpecialSpec,
     },
 };
-use minecraft_redox_java::{JavaBindings, JavaExpression, JavaProjectIndex, JavaTypeKind};
+use minecraft_redox_java::{
+    JavaBindings, JavaExpression, JavaProjectIndex, JavaTypeKind, JavaValueKind,
+};
 use serde::Serialize;
 
 use crate::{
-    FluidSemantic, ItemSemantic, NumericSemantic, RecipeDefinition, RecipeMetadataDefinition,
-    RecoveredExpression,
+    ExpressionSemantic, FluidSemantic, ItemSemantic, NumericSemantic, RecipeDefinition,
+    RecipeMetadataDefinition, RecoveredExpression,
     recipe_expression::{literal_i64, recover_items_with_project, resolved_reference_name},
-    scalar_expression::scalar_i64,
+    scalar_expression::{scalar_i64, scalar_static_field_i64},
 };
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -271,7 +273,8 @@ fn lower_metadata_entry(
     let expected = metadata.expected_value_type.as_deref()?;
     let value = if is_java_type(expected, "Integer") || is_java_type(expected, "Long") {
         RecipeMetadataValue::Integer {
-            value: metadata_i64(&metadata.value_expression, bindings, project)?,
+            value: metadata_i64(&metadata.value_expression, bindings, project)
+                .or_else(|| linked_metadata_field_i64(&metadata.value_semantic, project))?,
         }
     } else if is_java_type(expected, "Boolean") {
         RecipeMetadataValue::Boolean {
@@ -335,6 +338,22 @@ fn lower_item_stack_metadata(
     };
     let stack = lower_recovered_stack(recovered.first()?, bindings)?;
     Some(RecipeMetadataValue::ItemStack { value: stack })
+}
+
+fn linked_metadata_field_i64(
+    semantic: &ExpressionSemantic,
+    project: Option<&JavaProjectIndex>,
+) -> Option<i64> {
+    let ExpressionSemantic::LinkedValue {
+        value_id,
+        value_kind: JavaValueKind::Field,
+        ..
+    } = semantic
+    else {
+        return None;
+    };
+    let (owner, name) = value_id.split_once("::field:")?;
+    scalar_static_field_i64(owner, name, project?)
 }
 
 fn metadata_i64(
@@ -1035,12 +1054,13 @@ mod tests {
                 static RecipeMetadataKey<String> NAME;
                 static RecipeMetadataKey<Materials> MATERIAL;
             }
-            class Recipes { void run() {
+            class Recipes { static final int COAL = 7; void run() {
                 GTValues.RA.stdBuilder()
                     .metadata(Keys.HEAT, 1700)
                     .metadata(Keys.FLAG, true)
                     .metadata(Keys.NAME, "demo")
                     .metadata(Keys.MATERIAL, Materials.Iron)
+                    .metadata(Keys.HEAT, COAL)
                     .recipeCategory(RecipeCategory.SPECIAL)
                     .duration(20)
                     .eut(2)
@@ -1057,7 +1077,7 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
         let lowered = super::lower_recipe_with_project(recipe, &analysis.bindings, &project)
             .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
-        assert_eq!(lowered.metadata.len(), 4);
+        assert_eq!(lowered.metadata.len(), 5);
         assert!(matches!(
             lowered.metadata[0].value,
             RecipeMetadataValue::Integer { value: 1700 }
@@ -1074,6 +1094,10 @@ mod tests {
             &lowered.metadata[3].value,
             RecipeMetadataValue::ContentRef { id }
                 if id.as_str() == "gregtech.api.enums.Materials.Iron"
+        ));
+        assert!(matches!(
+            lowered.metadata[4].value,
+            RecipeMetadataValue::Integer { value: 7 }
         ));
         assert_eq!(
             lowered
