@@ -503,3 +503,26 @@ Full GT5 result after this pass:
 - chance blockers: **50**.
 
 This removes all 65 fusion-threshold metadata blockers and adds 48 fully lowered recipes. The target model deliberately retains the raw startup-energy quantity instead of importing GregTech's fusion-tier formulas, allowing machine implementations to decide how startup storage, overclocking, parallelism, or other policies relate to it.
+
+### Fuel energy density and synthetic fuel-map dispatch
+
+Fuel metadata now lowers to an explicit target quantity, `fuel_energy_eu_per_liter: Option<u64>`. The unit is deliberately EU/L rather than an inferred per-item energy: GregTech's `FuelSpecialValueFormatter` displays the recipe special value in fluid units, `TurbineFuelDumper` exports it as `eu_l`, plasma helpers return it as EU per litre, and fluid generators/turbines consume it on that basis. Item-container paths apply the source's conventional 1000 L/container conversion at the machine boundary rather than changing the stored fuel density.
+
+`GTRecipeConstants.Fuel` is not retained as a target recipe map. Source inspection shows that it is only a validating dispatcher: it requires exactly one item input, at most one item output, no fluid I/O, requires `FUEL_TYPE`, defaults `FUEL_VALUE` to zero, then forwards the builder to one of six real fuel maps. The importer reproduces that dispatch and its fail-closed behavior. Numeric values use the source mapping; named `FuelType.*.ordinal()` expressions are resolved by enum constant identity instead of coupling the target IR to Java ordinal numbers. Invalid numeric fuel types preserve the source fallback to semi-fluid/dense-liquid fuel.
+
+Fuel backends default omitted duration and EU/t to zero, so target fuel entries reproduce those defaults instead of reporting missing process timing. Direct `FUEL_VALUE` metadata is accepted only on source-inspected maps where the special value is actually EU/L; other `FuelBackend` maps are not generalized because some, such as RTG and rocket fuels, overload the same legacy special-value field with different semantics.
+
+The full GT5 result after this pass is:
+
+- target recipes lowered: **3,601 / 5,791 (62.18%)**, up from 3,550 / 5,791 (61.30%);
+- metadata blockers: **623**, down from 681;
+- missing-duration blockers: **332**, down from 363;
+- missing-EU/t blockers: **24**, down from 55;
+- item-input blockers: **1,218**;
+- item-output blockers: **961**;
+- fluid blockers: **457**;
+- non-constant EU/t blockers: **417**;
+- modifier blockers: **178**;
+- chance blockers: **50**.
+
+This adds 51 fully lowered recipes. The remaining 13 fuel definitions are genuinely data-dependent rather than unexplained static cases: material-parameter `mFuelPower`/`mFuelType` builders, two BartWorks pair-backed fuel values, a semi-fluid handler parameter, and one plasma value computed from runtime material mass. They remain fail-closed until the importer can prove the relevant material/value provenance generally.

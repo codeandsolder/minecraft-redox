@@ -97,6 +97,7 @@ fn lower_recipe_internal(
     let lowered_metadata = lower_metadata(recipe, bindings, project, &mut blockers);
 
     let duration_ticks = match recipe.duration_ticks {
+        None if lowered_metadata.fuel_energy_eu_per_liter.is_some() => Some(0),
         None => {
             push_blocker(
                 &mut blockers,
@@ -120,6 +121,7 @@ fn lower_recipe_internal(
     };
 
     let eut = match (recipe.eut_expression.as_ref(), recipe.eut_value) {
+        (None, _) if lowered_metadata.fuel_energy_eu_per_liter.is_some() => Some(0),
         (None, _) => {
             push_blocker(
                 &mut blockers,
@@ -163,7 +165,9 @@ fn lower_recipe_internal(
     {
         return Ok(ContentRecipe {
             origin: recipe.origin.clone(),
-            recipe_map: ContentId::new(recipe.recipe_map.clone()),
+            recipe_map: lowered_metadata
+                .recipe_map_override
+                .unwrap_or_else(|| ContentId::new(recipe.recipe_map.clone())),
             item_inputs,
             item_outputs,
             fluid_inputs,
@@ -171,6 +175,7 @@ fn lower_recipe_internal(
             requirements: lowered_metadata.requirements,
             unlock: lowered_metadata.unlock,
             startup_energy_eu: lowered_metadata.startup_energy_eu,
+            fuel_energy_eu_per_liter: lowered_metadata.fuel_energy_eu_per_liter,
             duration_ticks,
             eut,
         });
@@ -240,6 +245,8 @@ struct LoweredMetadata {
     requirements: Vec<RecipeRequirement>,
     unlock: Option<RecipeUnlock>,
     startup_energy_eu: u64,
+    fuel_energy_eu_per_liter: Option<u64>,
+    recipe_map_override: Option<ContentId>,
 }
 
 fn lower_metadata(
@@ -251,40 +258,13 @@ fn lower_metadata(
     let mut minimum_heat_kelvin = None;
     let mut minimum_capabilities = BTreeMap::new();
     let mut startup_energy_eu = 0;
+    let mut fuel_value = None;
+    let mut fuel_type = None;
     let mut research_item = None;
     let mut scanning = None;
 
     for call in &recipe.metadata {
-        if call.name != "metadata" {
-            push_blocker(
-                blockers,
-                RecipeLoweringBlockerKind::Metadata,
-                format!("unsupported recipe metadata call: {}", call.name),
-            );
-            continue;
-        }
-
-        let [key, value] = call.argument_expressions.as_slice() else {
-            push_blocker(
-                blockers,
-                RecipeLoweringBlockerKind::Metadata,
-                format!(
-                    "metadata call does not have key/value arguments: {:?}",
-                    call.arguments
-                ),
-            );
-            continue;
-        };
-
-        let Some(key) = resolved_reference_name(key, bindings) else {
-            push_blocker(
-                blockers,
-                RecipeLoweringBlockerKind::Metadata,
-                format!(
-                    "metadata key is not statically identifiable: {}",
-                    call.arguments.join(", ")
-                ),
-            );
+        let Some((key, value)) = lower_metadata_call(call, bindings, blockers) else {
             continue;
         };
 
@@ -293,18 +273,9 @@ fn lower_metadata(
                 minimum_heat_kelvin = Some(kelvin);
             }
         } else if let Some(capability) = casing_capability(&key) {
-            match lower_nonnegative_scalar(value, bindings, project) {
-                Some(level) => {
-                    minimum_capabilities.insert(capability, level);
-                }
-                None => push_blocker(
-                    blockers,
-                    RecipeLoweringBlockerKind::Metadata,
-                    format!(
-                        "casing requirement is not a static non-negative capability level: {}",
-                        call.arguments.join(", ")
-                    ),
-                ),
+            if let Some(level) = lower_casing_requirement(call, value, bindings, project, blockers)
+            {
+                minimum_capabilities.insert(capability, level);
             }
         } else if key == "gregtech.api.util.GTRecipeConstants.FUSION_THRESHOLD" {
             if let Some(value) =
@@ -312,27 +283,24 @@ fn lower_metadata(
             {
                 startup_energy_eu = value;
             }
+        } else if key == "gregtech.api.util.GTRecipeConstants.FUEL_VALUE" {
+            fuel_value = Some((call, value));
+        } else if key == "gregtech.api.util.GTRecipeConstants.FUEL_TYPE" {
+            fuel_type = Some((call, value));
         } else if matches!(
             key.as_str(),
             "gregtech.api.util.GTRecipeConstants.RESEARCH_ITEM"
                 | "gregtech.api.util.GTRecipeConstants.SCANNING"
         ) {
-            if recipe.recipe_map != "gregtech.api.util.GTRecipeConstants.AssemblyLine" {
-                push_blocker(
-                    blockers,
-                    RecipeLoweringBlockerKind::Metadata,
-                    format!(
-                        "assembly-line research metadata used on recipe map {}",
-                        recipe.recipe_map
-                    ),
-                );
-                continue;
-            }
-            if key.ends_with(".RESEARCH_ITEM") {
-                research_item = Some((call, value));
-            } else {
-                scanning = Some(value);
-            }
+            capture_assembly_line_research(
+                recipe,
+                call,
+                &key,
+                value,
+                &mut research_item,
+                &mut scanning,
+                blockers,
+            );
         } else {
             push_blocker(
                 blockers,
@@ -345,10 +313,14 @@ fn lower_metadata(
     let requirements = lower_recipe_requirements(minimum_heat_kelvin, minimum_capabilities);
     let unlock =
         lower_assembly_line_unlock(recipe, research_item, scanning, bindings, project, blockers);
+    let (fuel_energy_eu_per_liter, recipe_map_override) =
+        lower_fuel_metadata(recipe, fuel_value, fuel_type, bindings, project, blockers);
     LoweredMetadata {
         requirements,
         unlock,
         startup_energy_eu,
+        fuel_energy_eu_per_liter,
+        recipe_map_override,
     }
 }
 
@@ -371,6 +343,92 @@ fn lower_coil_heat(
         );
     }
     value
+}
+
+fn lower_metadata_call<'a>(
+    call: &'a crate::BuilderCall,
+    bindings: &JavaBindings,
+    blockers: &mut Vec<RecipeLoweringBlocker>,
+) -> Option<(String, &'a JavaExpression)> {
+    if call.name != "metadata" {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            format!("unsupported recipe metadata call: {}", call.name),
+        );
+        return None;
+    }
+    let [key, value] = call.argument_expressions.as_slice() else {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            format!(
+                "metadata call does not have key/value arguments: {:?}",
+                call.arguments
+            ),
+        );
+        return None;
+    };
+    let Some(key) = resolved_reference_name(key, bindings) else {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            format!(
+                "metadata key is not statically identifiable: {}",
+                call.arguments.join(", ")
+            ),
+        );
+        return None;
+    };
+    Some((key, value))
+}
+
+fn capture_assembly_line_research<'a>(
+    recipe: &RecipeDefinition,
+    call: &'a crate::BuilderCall,
+    key: &str,
+    value: &'a JavaExpression,
+    research_item: &mut Option<(&'a crate::BuilderCall, &'a JavaExpression)>,
+    scanning: &mut Option<&'a JavaExpression>,
+    blockers: &mut Vec<RecipeLoweringBlocker>,
+) {
+    if recipe.recipe_map != "gregtech.api.util.GTRecipeConstants.AssemblyLine" {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            format!(
+                "assembly-line research metadata used on recipe map {}",
+                recipe.recipe_map
+            ),
+        );
+        return;
+    }
+    if key.ends_with(".RESEARCH_ITEM") {
+        *research_item = Some((call, value));
+    } else {
+        *scanning = Some(value);
+    }
+}
+
+fn lower_casing_requirement(
+    call: &crate::BuilderCall,
+    value: &JavaExpression,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+    blockers: &mut Vec<RecipeLoweringBlocker>,
+) -> Option<u64> {
+    let level = lower_nonnegative_scalar(value, bindings, project);
+    if level.is_none() {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            format!(
+                "casing requirement is not a static non-negative capability level: {}",
+                call.arguments.join(", ")
+            ),
+        );
+    }
+    level
 }
 
 fn lower_fusion_startup_energy(
@@ -404,6 +462,164 @@ fn lower_fusion_startup_energy(
         );
     }
     value
+}
+
+fn lower_fuel_metadata(
+    recipe: &RecipeDefinition,
+    fuel_value: Option<(&crate::BuilderCall, &JavaExpression)>,
+    fuel_type: Option<(&crate::BuilderCall, &JavaExpression)>,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+    blockers: &mut Vec<RecipeLoweringBlocker>,
+) -> (Option<u64>, Option<ContentId>) {
+    if fuel_value.is_none() && fuel_type.is_none() {
+        return (None, None);
+    }
+
+    if recipe.recipe_map == "gregtech.api.util.GTRecipeConstants.Fuel" {
+        if !has_valid_universal_fuel_shape(recipe) {
+            push_blocker(
+                blockers,
+                RecipeLoweringBlockerKind::Metadata,
+                "GTRecipeConstants.Fuel recipe violates the source dispatcher's 1 item input, <=1 item output, and no-fluid contract",
+            );
+            return (None, None);
+        }
+        let Some((type_call, type_expression)) = fuel_type else {
+            push_blocker(
+                blockers,
+                RecipeLoweringBlockerKind::Metadata,
+                "GTRecipeConstants.Fuel recipe has no FUEL_TYPE and is dropped by the source dispatcher",
+            );
+            return (None, None);
+        };
+        let target = lower_fuel_dispatch_target(type_expression, bindings, project);
+        if target.is_none() {
+            push_blocker(
+                blockers,
+                RecipeLoweringBlockerKind::Metadata,
+                format!(
+                    "FUEL_TYPE is not statically dispatchable: {}",
+                    type_call.arguments.join(", ")
+                ),
+            );
+        }
+        let energy = fuel_value.map_or(Some(0), |(call, expression)| {
+            lower_fuel_energy(call, expression, bindings, project, blockers)
+        });
+        return (energy, target.map(ContentId::new));
+    }
+
+    if fuel_type.is_some() {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            format!(
+                "FUEL_TYPE used outside GTRecipeConstants.Fuel on {}",
+                recipe.recipe_map
+            ),
+        );
+        return (None, None);
+    }
+    let Some((value_call, value_expression)) = fuel_value else {
+        return (None, None);
+    };
+    let energy = lower_fuel_energy(value_call, value_expression, bindings, project, blockers);
+    if !is_eu_per_liter_fuel_map(&recipe.recipe_map) {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            format!(
+                "FUEL_VALUE does not have proven EU/L semantics on {}",
+                recipe.recipe_map
+            ),
+        );
+        return (None, None);
+    }
+    (energy, None)
+}
+
+fn lower_fuel_energy(
+    call: &crate::BuilderCall,
+    expression: &JavaExpression,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+    blockers: &mut Vec<RecipeLoweringBlocker>,
+) -> Option<u64> {
+    let energy = lower_nonnegative_scalar(expression, bindings, project);
+    if energy.is_none() {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            format!(
+                "FUEL_VALUE is not a static non-negative EU/L value: {}",
+                call.arguments.join(", ")
+            ),
+        );
+    }
+    energy
+}
+
+fn has_valid_universal_fuel_shape(recipe: &RecipeDefinition) -> bool {
+    recipe.item_input_semantics.len() == 1
+        && recipe.fluid_input_semantics.is_empty()
+        && recipe.item_output_semantics.len() <= 1
+        && recipe.fluid_output_semantics.is_empty()
+}
+
+fn lower_fuel_dispatch_target(
+    expression: &JavaExpression,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+) -> Option<&'static str> {
+    if let JavaExpression::Call {
+        receiver: Some(receiver),
+        method,
+        arguments,
+    } = expression
+        && method == "ordinal"
+        && arguments.is_empty()
+        && let Some(name) = resolved_reference_name(receiver, bindings)
+    {
+        return match name.rsplit('.').next()? {
+            "DieselFuel" => Some("gregtech.api.recipe.RecipeMaps.dieselFuels"),
+            "GasTurbine" => Some("gregtech.api.recipe.RecipeMaps.gasTurbineFuels"),
+            "HotFuel" => Some("gregtech.api.recipe.RecipeMaps.hotFuels"),
+            "SemiFluid" => Some("gregtech.api.recipe.RecipeMaps.denseLiquidFuels"),
+            "PlasmaTurbine" => Some("gregtech.api.recipe.RecipeMaps.plasmaFuels"),
+            "Magic" => Some("gregtech.api.recipe.RecipeMaps.magicFuels"),
+            _ => None,
+        };
+    }
+    let value = scalar_i64_optional(expression, bindings, project)?;
+    Some(match value {
+        0 => "gregtech.api.recipe.RecipeMaps.dieselFuels",
+        1 => "gregtech.api.recipe.RecipeMaps.gasTurbineFuels",
+        2 => "gregtech.api.recipe.RecipeMaps.hotFuels",
+        4 => "gregtech.api.recipe.RecipeMaps.plasmaFuels",
+        5 => "gregtech.api.recipe.RecipeMaps.magicFuels",
+        _ => "gregtech.api.recipe.RecipeMaps.denseLiquidFuels",
+    })
+}
+
+fn is_eu_per_liter_fuel_map(recipe_map: &str) -> bool {
+    matches!(
+        recipe_map,
+        "gregtech.api.recipe.RecipeMaps.dieselFuels"
+            | "gregtech.api.recipe.RecipeMaps.extremeDieselFuels"
+            | "gregtech.api.recipe.RecipeMaps.gasTurbineFuels"
+            | "gregtech.api.recipe.RecipeMaps.hotFuels"
+            | "gregtech.api.recipe.RecipeMaps.denseLiquidFuels"
+            | "gregtech.api.recipe.RecipeMaps.plasmaFuels"
+            | "gregtech.api.recipe.RecipeMaps.magicFuels"
+            | "gregtech.api.recipe.RecipeMaps.semiFluidFuels"
+            | "gregtech.api.recipe.RecipeMaps.smallNaquadahReactorFuels"
+            | "gregtech.api.recipe.RecipeMaps.largeNaquadahReactorFuels"
+            | "gregtech.api.recipe.RecipeMaps.hugeNaquadahReactorFuels"
+            | "gregtech.api.recipe.RecipeMaps.extremeNaquadahReactorFuels"
+            | "gregtech.api.recipe.RecipeMaps.ultraHugeNaquadahReactorFuels"
+            | "bartworks.API.recipe.BartWorksRecipeMaps.acidGenFuels"
+    )
 }
 
 fn lower_recipe_requirements(
@@ -2340,6 +2556,202 @@ mod tests {
                 .iter()
                 .any(|blocker| blocker.kind == RecipeLoweringBlockerKind::Metadata)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn lowers_universal_fuel_dispatch_to_energy_density() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.util.GTRecipeConstants.FUEL_TYPE;
+            import static gregtech.api.util.GTRecipeConstants.FUEL_VALUE;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            import gregtech.api.util.GTRecipeConstants;
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .itemInputs(Materials.Methane.getCells(1))
+                    .metadata(FUEL_VALUE, 537)
+                    .metadata(FUEL_TYPE, 1)
+                    .addTo(GTRecipeConstants.Fuel);
+            }}
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let recovery = recover(&analysis);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let lowered = lower_recipe(recipe, &analysis.bindings)
+            .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
+
+        assert_eq!(
+            lowered.recipe_map.as_str(),
+            "gregtech.api.recipe.RecipeMaps.gasTurbineFuels"
+        );
+        assert_eq!(lowered.fuel_energy_eu_per_liter, Some(537));
+        assert_eq!(lowered.duration_ticks, 0);
+        assert_eq!(lowered.eut, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn lowers_named_fuel_type_ordinal_without_numeric_enum_dependency() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.util.GTRecipeConstants.FUEL_TYPE;
+            import static gregtech.api.util.GTRecipeConstants.FUEL_VALUE;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            import gregtech.api.util.GTRecipeConstants;
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .itemInputs(Materials.Helium.getCells(1))
+                    .metadata(FUEL_VALUE, 720_000)
+                    .metadata(FUEL_TYPE, GTRecipeConstants.FuelType.PlasmaTurbine.ordinal())
+                    .addTo(GTRecipeConstants.Fuel);
+            }}
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let recovery = recover(&analysis);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let lowered = lower_recipe(recipe, &analysis.bindings)
+            .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
+
+        assert_eq!(
+            lowered.recipe_map.as_str(),
+            "gregtech.api.recipe.RecipeMaps.plasmaFuels"
+        );
+        assert_eq!(lowered.fuel_energy_eu_per_liter, Some(720_000));
+        Ok(())
+    }
+
+    #[test]
+    fn lowers_direct_fuel_map_and_defaults_backend_timing() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.recipe.RecipeMaps.semiFluidFuels;
+            import static gregtech.api.util.GTRecipeConstants.FUEL_VALUE;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .fluidInputs(Materials.Creosote.getFluid(1))
+                    .metadata(FUEL_VALUE, 96)
+                    .addTo(semiFluidFuels);
+            }}
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let recovery = recover(&analysis);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let lowered = lower_recipe(recipe, &analysis.bindings)
+            .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
+
+        assert_eq!(
+            lowered.recipe_map.as_str(),
+            "gregtech.api.recipe.RecipeMaps.semiFluidFuels"
+        );
+        assert_eq!(lowered.fuel_energy_eu_per_liter, Some(96));
+        assert_eq!(lowered.duration_ticks, 0);
+        assert_eq!(lowered.eut, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn universal_fuel_defaults_missing_value_to_zero() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.util.GTRecipeConstants.FUEL_TYPE;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            import gregtech.api.util.GTRecipeConstants;
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .itemInputs(Materials.Methane.getCells(1))
+                    .metadata(FUEL_TYPE, 1)
+                    .addTo(GTRecipeConstants.Fuel);
+            }}
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let recovery = recover(&analysis);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let lowered = lower_recipe(recipe, &analysis.bindings)
+            .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
+
+        assert_eq!(
+            lowered.recipe_map.as_str(),
+            "gregtech.api.recipe.RecipeMaps.gasTurbineFuels"
+        );
+        assert_eq!(lowered.fuel_energy_eu_per_liter, Some(0));
+        assert_eq!(lowered.duration_ticks, 0);
+        assert_eq!(lowered.eut, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn universal_fuel_without_type_stays_blocked_like_source_drop() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.util.GTRecipeConstants.FUEL_VALUE;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            import gregtech.api.util.GTRecipeConstants;
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .itemInputs(Materials.Methane.getCells(1))
+                    .metadata(FUEL_VALUE, 537)
+                    .addTo(GTRecipeConstants.Fuel);
+            }}
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let recovery = recover(&analysis);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let failure = lower_recipe(recipe, &analysis.bindings)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("source-dropped fuel unexpectedly lowered"))?;
+        assert!(failure.blockers.iter().any(|blocker| {
+            blocker.kind == RecipeLoweringBlockerKind::Metadata
+                && blocker.detail.contains("has no FUEL_TYPE")
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_universal_fuel_shape_stays_blocked_like_source_drop() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.util.GTRecipeConstants.FUEL_TYPE;
+            import static gregtech.api.util.GTRecipeConstants.FUEL_VALUE;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            import gregtech.api.util.GTRecipeConstants;
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .itemInputs(Materials.Methane.getCells(1), Materials.Propane.getCells(1))
+                    .metadata(FUEL_VALUE, 537)
+                    .metadata(FUEL_TYPE, 1)
+                    .addTo(GTRecipeConstants.Fuel);
+            }}
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let recovery = recover(&analysis);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let failure = lower_recipe(recipe, &analysis.bindings)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("invalid universal fuel unexpectedly lowered"))?;
+        assert!(failure.blockers.iter().any(|blocker| {
+            blocker.kind == RecipeLoweringBlockerKind::Metadata
+                && blocker.detail.contains("source dispatcher's")
+        }));
         Ok(())
     }
 
