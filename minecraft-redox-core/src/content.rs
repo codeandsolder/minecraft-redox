@@ -174,6 +174,15 @@ pub enum RecipeUnlock {
     },
 }
 
+/// Whether a recipe participates in executable process lookup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecipeExecutionMode {
+    Executable,
+    /// Retained for recipe browsers, documentation, or other reference surfaces, but never run.
+    ReferenceOnly,
+}
+
 /// Minimal target recipe IR.
 ///
 /// This deliberately starts smaller than GTNH's full recipe vocabulary. A source
@@ -183,6 +192,7 @@ pub enum RecipeUnlock {
 pub struct ContentRecipe {
     pub origin: SourceOrigin,
     pub recipe_map: ContentId,
+    pub execution_mode: RecipeExecutionMode,
     pub item_inputs: Vec<ItemInputSpec>,
     pub item_outputs: Vec<ItemOutputSpec>,
     pub fluid_inputs: Vec<FluidStackSpec>,

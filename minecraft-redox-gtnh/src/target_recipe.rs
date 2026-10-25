@@ -4,7 +4,8 @@ use minecraft_redox_core::{
     SourceOrigin,
     content::{
         ContentId, ContentRecipe, FluidSelector, FluidStackSpec, ItemInputSpec, ItemInputStackSpec,
-        ItemOutputSpec, ItemSelector, ItemStackSpec, Probability, RecipeRequirement, RecipeUnlock,
+        ItemOutputSpec, ItemSelector, ItemStackSpec, Probability, RecipeExecutionMode,
+        RecipeRequirement, RecipeUnlock,
     },
 };
 use minecraft_redox_java::{JavaBindings, JavaExpression, JavaProjectIndex};
@@ -169,6 +170,7 @@ fn lower_recipe_internal(
             recipe_map: lowered_metadata
                 .recipe_map_override
                 .unwrap_or_else(|| ContentId::new(recipe.recipe_map.clone())),
+            execution_mode: lower_execution_mode(recipe),
             item_inputs,
             item_outputs,
             fluid_inputs,
@@ -186,6 +188,18 @@ fn lower_recipe_internal(
         origin: recipe.origin.clone(),
         blockers,
     }))
+}
+
+fn lower_execution_mode(recipe: &RecipeDefinition) -> RecipeExecutionMode {
+    if recipe
+        .execution_policy_calls
+        .iter()
+        .any(|call| call.name == "fake")
+    {
+        RecipeExecutionMode::ReferenceOnly
+    } else {
+        RecipeExecutionMode::Executable
+    }
 }
 
 fn lower_item_io(
@@ -1826,7 +1840,8 @@ fn push_blocker(
 #[cfg(test)]
 mod tests {
     use minecraft_redox_core::content::{
-        FluidSelector, ItemInputSpec, ItemSelector, Probability, RecipeRequirement, RecipeUnlock,
+        FluidSelector, ItemInputSpec, ItemSelector, Probability, RecipeExecutionMode,
+        RecipeRequirement, RecipeUnlock,
     };
     use minecraft_redox_java::{JavaExpression, JavaProjectIndex, analyze_source};
 
@@ -3130,7 +3145,7 @@ mod tests {
     }
 
     #[test]
-    fn fake_recipe_remains_a_process_blocker() -> anyhow::Result<()> {
+    fn fake_recipe_lowers_as_reference_only() -> anyhow::Result<()> {
         let source = r"
             import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
             import gregtech.api.enums.GTValues;
@@ -3151,15 +3166,18 @@ mod tests {
             .recipes
             .first()
             .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
-        let failure = lower_recipe(recipe, &analysis.bindings)
-            .err()
-            .ok_or_else(|| anyhow::anyhow!("fake recipe unexpectedly lowered as executable"))?;
-        assert!(
-            failure
-                .blockers
+        assert_eq!(
+            recipe
+                .execution_policy_calls
                 .iter()
-                .any(|blocker| blocker.kind == RecipeLoweringBlockerKind::Modifiers)
+                .map(|call| call.name.as_str())
+                .collect::<Vec<_>>(),
+            ["fake"]
         );
+        assert_eq!(recipe.modifiers.as_slice(), []);
+        let lowered = lower_recipe(recipe, &analysis.bindings)
+            .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
+        assert_eq!(lowered.execution_mode, RecipeExecutionMode::ReferenceOnly);
         Ok(())
     }
 

@@ -599,3 +599,26 @@ Full GT5 result after this pass:
 - chance blockers: **50**.
 
 This adds 76 fully lowered recipes while keeping cleanroom quality effects as machine/environment behavior rather than source-specific recipe constants.
+
+### Reference-only recipes instead of fake-recipe blockers
+
+GregTech `fake()` recipes are now represented explicitly by `RecipeExecutionMode::ReferenceOnly`. The target keeps their recipe data for browsers, documentation, unlock displays, cost displays, or other reference surfaces, but executable recipe lookup must never run them. Ordinary recipes use `RecipeExecutionMode::Executable`.
+
+This is a direct semantic match for GT5's `mFakeRecipe`: the source comment states that fake recipes remain in recipe-map hash structures so input-presence queries can see them, while `findRecipe` and the newer lookup builder exclude them from executable lookup. Treating them as an unsupported process modifier was therefore unnecessarily lossy.
+
+The importer keeps the source `fake()` call in a dedicated execution-policy provenance bucket and lowers it to the target execution mode. Other unresolved modifiers remain fail-closed; in particular, NBT-sensitive matching cannot be represented until item state is first-class, and conditional source registration still needs an availability model.
+
+Full GT5 result after this pass:
+
+- target recipes lowered: **3,783 / 5,791 (65.33%)**, up from 3,782 / 5,791 (65.31%);
+- modifier blockers: **14**, down from 66;
+- metadata blockers: **472**;
+- item-input blockers: **1,218**;
+- item-output blockers: **961**;
+- fluid blockers: **457**;
+- non-constant EU/t blockers: **417**;
+- missing-duration blockers: **332**;
+- missing-EU/t blockers: **24**;
+- chance blockers: **50**.
+
+Only one additional recipe becomes completely lowerable because most reference-only recipes still contain other unresolved content semantics. The important result is that 52 recipes no longer report the wrong blocker: non-executability is now represented, not discarded.
