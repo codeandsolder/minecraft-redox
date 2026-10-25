@@ -858,9 +858,7 @@ fn lower_fluid_semantic(
             amount: scalar_amount_u64(amount, bindings, project)?,
         }),
         FluidSemantic::FluidStack { fluid, amount } => Some(FluidStackSpec {
-            selector: FluidSelector::Named {
-                id: ContentId::new(resolved_reference_name(fluid, bindings)?),
-            },
+            selector: fluid_stack_selector(fluid, bindings)?,
             amount: scalar_amount_u64(amount, bindings, project)?,
         }),
         FluidSemantic::RegistryFluid {
@@ -883,6 +881,37 @@ fn lower_fluid_semantic(
         | FluidSemantic::LinkedValue { .. }
         | FluidSemantic::TypedExpression { .. } => None,
     }
+}
+
+fn fluid_stack_selector(fluid: &JavaExpression, bindings: &JavaBindings) -> Option<FluidSelector> {
+    if let Some(reference) = resolved_reference_name(fluid, bindings) {
+        let id = match reference.as_str() {
+            "net.minecraftforge.fluids.FluidRegistry.WATER" | "FluidRegistry.WATER" => "water",
+            "net.minecraftforge.fluids.FluidRegistry.LAVA" | "FluidRegistry.LAVA" => "lava",
+            _ => reference.as_str(),
+        };
+        return Some(FluidSelector::Named {
+            id: ContentId::new(id),
+        });
+    }
+    let JavaExpression::Call {
+        receiver: Some(receiver),
+        method,
+        arguments,
+    } = fluid
+    else {
+        return None;
+    };
+    if method != "getFluid" || arguments.len() != 1 {
+        return None;
+    }
+    let owner = resolved_reference_name(receiver, bindings)?;
+    if !owner.ends_with("FluidRegistry") {
+        return None;
+    }
+    Some(FluidSelector::Named {
+        id: ContentId::new(simple_string_literal(arguments.first()?)?),
+    })
 }
 
 fn lower_gt_mod_handler_fluid(
@@ -1723,6 +1752,46 @@ mod tests {
         assert!(matches!(
             &lowered.fluid_outputs[0].selector,
             FluidSelector::Named { id } if id.as_str() == "ic2hotwater"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn lowers_fluid_registry_constructor_identities() -> anyhow::Result<()> {
+        let source = r#"
+            import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+            import gregtech.api.enums.GTValues;
+            import net.minecraftforge.fluids.FluidRegistry;
+            import net.minecraftforge.fluids.FluidStack;
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .fluidInputs(new FluidStack(FluidRegistry.WATER, 750))
+                    .fluidOutputs(new FluidStack(FluidRegistry.getFluid("potion.tea"), 750))
+                    .duration(20)
+                    .eut(2)
+                    .addTo(compressorRecipes);
+            }}
+        "#;
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let mut project = JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let recovery = crate::recover_with_project(&analysis, &project);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let lowered = super::lower_recipe_with_project(recipe, &analysis.bindings, &project)
+            .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
+        let FluidInputSpec::Stack(input) = &lowered.fluid_inputs[0] else {
+            return Err(anyhow::anyhow!("fluid input was not a stack"));
+        };
+        assert!(matches!(
+            &input.selector,
+            FluidSelector::Named { id } if id.as_str() == "water"
+        ));
+        assert!(matches!(
+            &lowered.fluid_outputs[0].selector,
+            FluidSelector::Named { id } if id.as_str() == "potion.tea"
         ));
         Ok(())
     }
