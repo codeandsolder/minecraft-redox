@@ -1191,3 +1191,36 @@ Full pinned-corpus result:
 - missing-EU/t blockers: **24**;
 - post-add blockers: **7**;
 - modifier blockers: **6**.
+
+
+### Concrete fluid receiver provenance and GT++ material fluids
+
+Fluid lowering now distinguishes concrete content fields from local/parameter receiver names instead of treating every syntactically simple receiver as a material identity.
+
+The Java project index exposes a fully-qualified field reference at a use site only when the name resolves to a same-class field or an explicit/wildcard static-imported field and is not shadowed by a local or parameter. GT fluid recovery uses that provenance to qualify source expressions such as `Lubricant.getFluid(...)` imported through `Materials.*`, while a loop/local receiver such as `rubber.getMolten(...)` remains dynamic.
+
+This also fixes effectively-final local fluid aliases: an initializer such as `sodiumTungsten = SodiumTungstate.getFluidOrGas(...)` retains the qualified `BotWerkstoffMaterialPool.SodiumTungstate` identity when inlined.
+
+Concrete GT++ `Material` fluids are lowered source-independently:
+
+- `Material#getFluidStack(int)` on a concrete GT++ receiver becomes the material's `fluid` form with the supplied amount;
+- zero-argument `getFluid()` / `getPlasma()` used inside `new FluidStack(...)` become `fluid` / `plasma` forms;
+- `MaterialsElements.getInstance().FIELD` is canonicalized to `MaterialsElements.FIELD`, reusing the item-receiver identity rule;
+- dynamic `Material` parameters/locals remain fail-closed.
+
+The stricter target boundary deliberately exposes dynamic receiver expressions that older lowering silently turned into bogus IDs such as `material`, `aMaterial`, or `rubber`. These additional fluid blockers are all non-sole in the pinned corpus; no fully lowerable recipe is lost by the correctness repair.
+
+Full pinned-corpus result:
+
+- target recipes lowered: **4,218 / 5,791 (72.84%)**, up from 4,186 / 5,791 (72.28%);
+- fluid blockers: **320**; the count is higher than the old 254 because 66 genuinely dynamic expressions are now correctly blocked rather than misidentified;
+- item-input blockers: **1,086**;
+- item-output blockers: **945**;
+- metadata blockers: **331**;
+- non-constant EU/t blockers: **417**;
+- missing-duration blockers: **332**;
+- chance blockers: **50**;
+- special blockers: **31**;
+- missing-EU/t blockers: **24**;
+- post-add blockers: **7**;
+- modifier blockers: **6**.

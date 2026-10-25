@@ -758,6 +758,35 @@ impl JavaProjectIndex {
         })
     }
 
+    /// Resolve a field reference at a use site to its fully-qualified owner/member name.
+    /// Locals and parameters shadowing the same simple name deliberately return `None`.
+    #[must_use]
+    pub fn qualified_field_reference_at(
+        &self,
+        path: &str,
+        byte_position: usize,
+        reference_name: &str,
+        bindings: &JavaBindings,
+    ) -> Option<String> {
+        let method = self.enclosing_method(path, byte_position)?;
+        if method.local_variables.iter().any(|local| {
+            local.name == reference_name
+                && local.declaration_byte <= byte_position
+                && byte_position < local.scope_end_byte
+        }) || method
+            .parameters
+            .iter()
+            .any(|parameter| parameter.name == reference_name)
+        {
+            return None;
+        }
+        if let Some(field) = self.resolve_field(&method.owner, reference_name, None) {
+            return Some(format!("{}.{}", field.owner, field.name));
+        }
+        let field = self.imported_static_field(bindings, reference_name)?;
+        Some(format!("{}.{}", field.owner, field.name))
+    }
+
     /// Return the initializer for the nearest in-scope local when its binding has not
     /// been reassigned or updated between declaration and `byte_position`.
     #[must_use]
@@ -2358,6 +2387,48 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("enum receiver was not resolved"))?;
         assert_eq!(resolved.owner, "demo.Component");
         assert_eq!(receiver_type.as_deref(), Some("demo.Component"));
+        Ok(())
+    }
+
+    #[test]
+    fn qualifies_static_wildcard_fields_without_overriding_locals() -> anyhow::Result<()> {
+        let source = r"
+            package demo;
+            import static demo.Registry.*;
+            class Material { void getFluid(int amount) {} }
+            class Registry { static final Material Lubricant = new Material(); }
+            class Recipe {
+                void staticUse() { sink(Lubricant); }
+                void localUse(Material Lubricant) { sink(Lubricant); }
+            }
+        ";
+        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
+        let mut index = super::JavaProjectIndex::default();
+        index.add_analysis(&analysis);
+        let calls: Vec<_> = analysis
+            .call_chains
+            .iter()
+            .flat_map(|chain| &chain.calls)
+            .filter(|call| call.name == "sink")
+            .collect();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            index.qualified_field_reference_at(
+                "Recipe.java",
+                calls[0].byte_start,
+                "Lubricant",
+                &analysis.bindings,
+            ).as_deref(),
+            Some("demo.Registry.Lubricant")
+        );
+        assert!(index
+            .qualified_field_reference_at(
+                "Recipe.java",
+                calls[1].byte_start,
+                "Lubricant",
+                &analysis.bindings,
+            )
+            .is_none());
         Ok(())
     }
 

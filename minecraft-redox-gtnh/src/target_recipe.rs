@@ -3083,13 +3083,15 @@ fn lower_fluid_semantic(
             source_ref,
             accessor,
             amount,
-        } => Some(FluidStackSpec {
-            selector: FluidSelector::MaterialForm {
-                material: ContentId::new(source_ref.clone()),
-                form: ContentId::new(fluid_form(accessor)?),
-            },
-            amount: scalar_amount_u64(amount, bindings, project)?,
-        }),
+        } if source_ref.contains('.')
+            && !source_ref.starts_with("this.")
+            && !source_ref.starts_with("super.") => Some(FluidStackSpec {
+                selector: FluidSelector::MaterialForm {
+                    material: ContentId::new(source_ref.clone()),
+                    form: ContentId::new(fluid_form(accessor)?),
+                },
+                amount: scalar_amount_u64(amount, bindings, project)?,
+            }),
         FluidSemantic::FluidStack { fluid, amount } => Some(FluidStackSpec {
             selector: lower_fluid_selector_expression(fluid, bindings, project)?,
             amount: scalar_amount_u64(amount, bindings, project)?,
@@ -3107,13 +3109,22 @@ fn lower_fluid_semantic(
         }
         FluidSemantic::LinkedMethod {
             method_id,
+            receiver,
             arguments,
             ..
-        } => lower_transparent_linked_fluid_helper(method_id, arguments, bindings, project),
+        } => lower_transparent_linked_fluid_helper(
+            method_id,
+            receiver.as_ref(),
+            arguments,
+            bindings,
+            project,
+        ),
         FluidSemantic::InlinedValue { result, .. } => {
             lower_fluid_semantic(result, bindings, project)
         }
-        FluidSemantic::RegistryFluid { .. } | FluidSemantic::SolderingSubstitute { .. } => None,
+        FluidSemantic::FluidAccessor { .. }
+        | FluidSemantic::RegistryFluid { .. }
+        | FluidSemantic::SolderingSubstitute { .. } => None,
     }
 }
 
@@ -3132,8 +3143,8 @@ fn lower_fluid_selector_expression(
         method,
         arguments,
     } = expression
+        && let Some(provider) = resolved_reference_name(receiver, bindings)
     {
-        let provider = resolved_reference_name(receiver, bindings)?;
         if provider == "net.minecraftforge.fluids.FluidRegistry"
             && method == "getFluid"
             && arguments.len() == 1
@@ -3165,6 +3176,21 @@ fn lower_fluid_selector_expression(
             id: ContentId::new(simple_string_literal(arguments.first()?)?),
         });
     }
+    if let JavaExpression::Call {
+        receiver: Some(receiver),
+        method,
+        arguments,
+    } = expression
+        && arguments.is_empty()
+        && matches!(method.as_str(), "getFluid" | "getPlasma")
+        && let Some(material) = concrete_gtpp_material_receiver(receiver, bindings)
+        && material.starts_with("gtPlusPlus.")
+    {
+        return Some(FluidSelector::MaterialForm {
+            material: ContentId::new(material),
+            form: ContentId::new(fluid_form(method)?),
+        });
+    }
     crate::recipe_expression::fluid_semantic(expression, bindings)
         .and_then(|semantic| lower_fluid_semantic(&semantic, bindings, project))
         .map(|stack| stack.selector)
@@ -3186,10 +3212,26 @@ fn distilled_water_selector() -> FluidSelector {
 
 fn lower_transparent_linked_fluid_helper(
     method_id: &str,
+    receiver: Option<&JavaExpression>,
     arguments: &[JavaExpression],
     bindings: &JavaBindings,
     project: Option<&JavaProjectIndex>,
 ) -> Option<FluidStackSpec> {
+    if method_id == "gtPlusPlus.core.material.Material#getFluidStack(int)"
+        && arguments.len() == 1
+    {
+        let material = concrete_gtpp_material_receiver(receiver?, bindings)?;
+        if !material.starts_with("gtPlusPlus.") {
+            return None;
+        }
+        return Some(FluidStackSpec {
+            selector: FluidSelector::MaterialForm {
+                material: ContentId::new(material),
+                form: ContentId::new("fluid"),
+            },
+            amount: scalar_amount_u64(arguments.first()?, bindings, project)?,
+        });
+    }
     let amount = scalar_amount_u64(arguments.first()?, bindings, project)?;
     if method_id == "gregtech.api.util.GTModHandler#getDistilledWater(long)" {
         return Some(FluidStackSpec {
@@ -5692,6 +5734,98 @@ mod tests {
             lowered.item_outputs[1].production_probability,
             Probability::ONE
         );
+        Ok(())
+    }
+
+    #[test]
+    fn lowers_concrete_gtpp_material_fluids() -> anyhow::Result<()> {
+        let material_source = r"
+            package gtPlusPlus.core.material;
+            import net.minecraftforge.fluids.Fluid;
+            import net.minecraftforge.fluids.FluidStack;
+            class Material {
+                FluidStack getFluidStack(int amount) { return null; }
+                Fluid getPlasma() { return null; }
+            }
+        ";
+        let elements_source = r"
+            package gtPlusPlus.core.material;
+            class MaterialsElements {
+                private static final MaterialsElements INSTANCE = new MaterialsElements();
+                final Material RHENIUM = new Material();
+                final Material BROMINE = new Material();
+                static MaterialsElements getInstance() { return INSTANCE; }
+            }
+        ";
+        let recipe_source = r"
+            import static gregtech.api.recipe.RecipeMaps.chemicalReactorRecipes;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            import gtPlusPlus.core.material.Material;
+            import gtPlusPlus.core.material.MaterialsElements;
+            import net.minecraftforge.fluids.FluidStack;
+            class Recipes {
+                void concrete() {
+                    GTValues.RA.stdBuilder()
+                        .itemInputs(Materials.Iron.getDust(1))
+                        .itemOutputs(Materials.Steel.getDust(1))
+                        .fluidInputs(MaterialsElements.getInstance().RHENIUM.getFluidStack(12))
+                        .fluidOutputs(new FluidStack(MaterialsElements.getInstance().BROMINE.getPlasma(), 34))
+                        .duration(20).eut(2).addTo(chemicalReactorRecipes);
+                }
+                void dynamic(Material material) {
+                    GTValues.RA.stdBuilder()
+                        .itemInputs(Materials.Iron.getDust(1))
+                        .itemOutputs(Materials.Steel.getDust(1))
+                        .fluidInputs(material.getFluidStack(12))
+                        .duration(20).eut(2).addTo(chemicalReactorRecipes);
+                }
+            }
+        ";
+        let material = analyze_source("Material.java", "gt5", None, material_source)?;
+        let elements = analyze_source("MaterialsElements.java", "gt5", None, elements_source)?;
+        let recipe = analyze_source("Recipes.java", "gt5", None, recipe_source)?;
+        let mut project = JavaProjectIndex::default();
+        for analysis in [&material, &elements, &recipe] {
+            project.add_analysis(analysis);
+        }
+        let recovery = crate::recover_with_project(&recipe, &project);
+        assert_eq!(recovery.recipes.len(), 2);
+        let lowered = super::lower_recipe_with_project(
+            &recovery.recipes[0],
+            &recipe.bindings,
+            &project,
+        )
+        .map_err(|failure| anyhow::anyhow!("GT++ fluid lowering failed: {failure:?}"))?;
+        let FluidInputSpec::Stack(input) = &lowered.fluid_inputs[0] else {
+            return Err(anyhow::anyhow!("GT++ fluid input became alternatives"));
+        };
+        assert_eq!(input.amount, 12);
+        assert!(matches!(
+            &input.selector,
+            FluidSelector::MaterialForm { material, form }
+                if material.as_str() == "gtPlusPlus.core.material.MaterialsElements.RHENIUM"
+                    && form.as_str() == "fluid"
+        ));
+        assert_eq!(lowered.fluid_outputs[0].amount, 34);
+        assert!(matches!(
+            &lowered.fluid_outputs[0].selector,
+            FluidSelector::MaterialForm { material, form }
+                if material.as_str() == "gtPlusPlus.core.material.MaterialsElements.BROMINE"
+                    && form.as_str() == "plasma"
+        ));
+
+        let failure = super::lower_recipe_with_project(
+            &recovery.recipes[1],
+            &recipe.bindings,
+            &project,
+        )
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("dynamic GT++ material fluid unexpectedly lowered"))?;
+        assert!(failure
+            .blockers
+            .iter()
+            .any(|blocker| blocker.kind == RecipeLoweringBlockerKind::Fluids));
         Ok(())
     }
 

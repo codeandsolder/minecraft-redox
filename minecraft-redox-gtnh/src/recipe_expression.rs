@@ -230,9 +230,20 @@ pub fn recover_fluids_with_project(
     byte_position: usize,
 ) -> Vec<RecoveredExpression<FluidSemantic>> {
     recover_values(sources, expressions, |expression| {
-        fluid_semantic(expression, bindings).or_else(|| {
-            project_fluid_semantic(expression, bindings, project, source_path, byte_position)
-        })
+        fluid_semantic(expression, bindings)
+            .map(|semantic| {
+                enrich_fluid_semantic_with_project(
+                    semantic,
+                    expression,
+                    bindings,
+                    project,
+                    source_path,
+                    byte_position,
+                )
+            })
+            .or_else(|| {
+                project_fluid_semantic(expression, bindings, project, source_path, byte_position)
+            })
     })
 }
 
@@ -551,6 +562,46 @@ fn linked_method_semantic(
     })
 }
 
+fn enrich_fluid_semantic_with_project(
+    semantic: FluidSemantic,
+    expression: &JavaExpression,
+    bindings: &JavaBindings,
+    project: &JavaProjectIndex,
+    source_path: &str,
+    byte_position: usize,
+) -> FluidSemantic {
+    match (semantic, expression) {
+        (
+            FluidSemantic::FluidAccessor {
+                source_ref,
+                accessor,
+                amount,
+            },
+            JavaExpression::Call {
+                receiver: Some(receiver),
+                ..
+            },
+        ) if !source_ref.contains('.') => {
+            let JavaExpression::Reference(reference) = receiver.as_ref() else {
+                return FluidSemantic::FluidAccessor {
+                    source_ref,
+                    accessor,
+                    amount,
+                };
+            };
+            let source_ref = project
+                .qualified_field_reference_at(source_path, byte_position, reference, bindings)
+                .unwrap_or(source_ref);
+            FluidSemantic::FluidAccessor {
+                source_ref,
+                accessor,
+                amount,
+            }
+        }
+        (semantic, _) => semantic,
+    }
+}
+
 fn project_fluid_semantic(
     expression: &JavaExpression,
     bindings: &JavaBindings,
@@ -565,6 +616,14 @@ fn project_fluid_semantic(
             let initializer =
                 project.stable_local_initializer_at(source_path, byte_position, reference)?;
             let result = fluid_semantic(&initializer, bindings)?;
+            let result = enrich_fluid_semantic_with_project(
+                result,
+                &initializer,
+                bindings,
+                project,
+                source_path,
+                byte_position,
+            );
             Some(FluidSemantic::InlinedValue {
                 value_id: value.value_id,
                 result: Box::new(result),
@@ -1067,6 +1126,57 @@ mod tests {
             return Err(anyhow::anyhow!("local method was not linked"));
         };
         assert_eq!(method_id, "R#get(String,int)");
+        Ok(())
+    }
+
+    #[test]
+    fn qualifies_wildcard_static_material_fluid_receivers() -> anyhow::Result<()> {
+        let material = analyze_source(
+            "Materials.java",
+            "gt5",
+            None,
+            r"
+                package gregtech.api.enums;
+                import net.minecraftforge.fluids.FluidStack;
+                class Materials {
+                    static final Materials Lubricant = new Materials();
+                    FluidStack getFluid(int amount) { return null; }
+                }
+            ",
+        )?;
+        let source = r"
+            import static gregtech.api.enums.Materials.*;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            import net.minecraftforge.fluids.FluidStack;
+            class Recipes {
+                void concrete() {
+                    GTValues.RA.stdBuilder()
+                        .fluidInputs(Lubricant.getFluid(1000))
+                        .duration(20).eut(2).addTo(gregtech.api.recipe.RecipeMaps.chemicalReactorRecipes);
+                }
+                void local(Materials Lubricant) {
+                    GTValues.RA.stdBuilder()
+                        .fluidInputs(Lubricant.getFluid(1000))
+                        .duration(20).eut(2).addTo(gregtech.api.recipe.RecipeMaps.chemicalReactorRecipes);
+                }
+            }
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let mut project = JavaProjectIndex::default();
+        project.add_analysis(&material);
+        project.add_analysis(&analysis);
+        let recovery = crate::recover_with_project(&analysis, &project);
+        assert_eq!(recovery.recipes.len(), 2);
+        assert!(matches!(
+            &recovery.recipes[0].fluid_input_semantics[0].semantic,
+            Some(FluidSemantic::FluidAccessor { source_ref, .. })
+                if source_ref == "gregtech.api.enums.Materials.Lubricant"
+        ));
+        assert!(matches!(
+            &recovery.recipes[1].fluid_input_semantics[0].semantic,
+            Some(FluidSemantic::FluidAccessor { source_ref, .. }) if source_ref == "Lubricant"
+        ));
         Ok(())
     }
 
