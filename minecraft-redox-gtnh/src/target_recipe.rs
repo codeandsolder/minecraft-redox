@@ -696,6 +696,28 @@ fn lower_linked_item_method(
         });
     }
 
+    if matches!(
+        method_id,
+        "bartworks.system.material.Werkstoff#get(gregtech.api.enums.OrePrefixes,int)"
+            | "bartworks.system.material.Werkstoff#get(gregtech.api.enums.OrePrefixes)"
+    ) && matches!(arguments.len(), 1 | 2)
+    {
+        let material = qualified_reference_name(receiver?, bindings)?;
+        let form = qualified_reference_name(arguments.first()?, bindings)?;
+        if !form.contains("OrePrefixes.") {
+            return None;
+        }
+        return Some(ItemStackSpec {
+            selector: ItemSelector::MaterialForm {
+                material: ContentId::new(material),
+                form: ContentId::new(form),
+            },
+            amount: arguments.get(1).map_or(Some(1), |amount| {
+                scalar_amount_u64(amount, bindings, project)
+            })?,
+        });
+    }
+
     if method_id == "goodgenerator.util.ItemRefer#get(int)" && arguments.len() == 1 {
         let item = qualified_reference_name(receiver?, bindings)?;
         if !item.contains("ItemRefer.") {
@@ -1147,6 +1169,73 @@ mod tests {
             &lowered.item_outputs[0].stack.selector,
             ItemSelector::Named { id, variant: None }
                 if id.as_str() == "goodgenerator.util.ItemRefer.Radiation_Protection_Plate"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn lowers_concrete_werkstoff_receivers_to_material_forms() -> anyhow::Result<()> {
+        let werkstoff = r"
+            package bartworks.system.material;
+            import gregtech.api.enums.OrePrefixes;
+            import net.minecraft.item.ItemStack;
+            class Werkstoff {
+                ItemStack get(OrePrefixes prefix) { return null; }
+                ItemStack get(OrePrefixes prefix, int amount) { return null; }
+            }
+        ";
+        let loader = r"
+            package bartworks.system.material;
+            class WerkstoffLoader {
+                static final Werkstoff CalciumChloride = new Werkstoff();
+            }
+        ";
+        let recipe_source = r"
+            package demo;
+            import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+            import bartworks.system.material.WerkstoffLoader;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.OrePrefixes;
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .itemInputs(WerkstoffLoader.CalciumChloride.get(OrePrefixes.dust, 3))
+                    .itemOutputs(WerkstoffLoader.CalciumChloride.get(OrePrefixes.plate))
+                    .duration(20)
+                    .eut(2)
+                    .addTo(compressorRecipes);
+            }}
+        ";
+        let werkstoff = analyze_source("Werkstoff.java", "gt5", None, werkstoff)?;
+        let loader = analyze_source("WerkstoffLoader.java", "gt5", None, loader)?;
+        let recipe = analyze_source("Recipes.java", "gt5", None, recipe_source)?;
+        let mut project = JavaProjectIndex::default();
+        for analysis in [&werkstoff, &loader, &recipe] {
+            project.add_analysis(analysis);
+        }
+        let recovery = crate::recover_with_project(&recipe, &project);
+        let recovered = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let lowered = super::lower_recipe_with_project(recovered, &recipe.bindings, &project)
+            .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
+
+        let ItemInputSpec::Stack(input) = &lowered.item_inputs[0] else {
+            return Err(anyhow::anyhow!("Werkstoff input was not a stack"));
+        };
+        assert_eq!(input.amount, 3);
+        assert!(matches!(
+            &input.selector,
+            ItemSelector::MaterialForm { material, form }
+                if material.as_str() == "bartworks.system.material.WerkstoffLoader.CalciumChloride"
+                    && form.as_str() == "gregtech.api.enums.OrePrefixes.dust"
+        ));
+        assert_eq!(lowered.item_outputs[0].stack.amount, 1);
+        assert!(matches!(
+            &lowered.item_outputs[0].stack.selector,
+            ItemSelector::MaterialForm { material, form }
+                if material.as_str() == "bartworks.system.material.WerkstoffLoader.CalciumChloride"
+                    && form.as_str() == "gregtech.api.enums.OrePrefixes.plate"
         ));
         Ok(())
     }

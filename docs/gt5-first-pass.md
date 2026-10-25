@@ -369,3 +369,23 @@ Full GT5 result after this pass:
 - chance blockers: **50**.
 
 This adds 78 fully lowered recipes and removes metadata as a blocker from 107 recipes. Fuel metadata is intentionally deferred because `FUEL_TYPE` dispatches builders into different fuel recipe maps and `FUEL_VALUE` then becomes generator fuel semantics; treating those as generic requirements would be wrong. `RESEARCH_ITEM` plus `SCANNING` likewise form one Assembly Line research/unlock process and should eventually become a dedicated target research primitive rather than unrelated metadata fields.
+
+
+### Concrete Werkstoff linked receivers
+
+Project-linked `bartworks.system.material.Werkstoff#get(OrePrefixes[, int])` calls now lower to `ItemSelector::MaterialForm` when the receiver expression itself identifies a concrete material, for example `WerkstoffLoader.CalciumChloride`. The adapter preserves the receiver as material identity, the `OrePrefixes` argument as form identity, and the optional amount through the project scalar evaluator.
+
+Calls on merely typed dynamic receivers such as a local `Werkstoff w` remain fail-closed: knowing that an expression is *some* Werkstoff is insufficient to choose a material. This is the same receiver-provenance rule used by the existing `ItemRefer` adapter and avoids converting type information into false content identity.
+
+Full GT5 result after this pass:
+
+- target recipes lowered: **3,367 / 5,791 (58.14%)**, up from 3,235 / 5,791 (55.86%);
+- item-input blockers: **1,304**, down from 1,403;
+- item-output blockers: **1,021**, down from 1,126;
+- metadata blockers: **872**;
+- fluid blockers: **457**;
+- non-constant EU/t blockers: **417**;
+- modifier blockers: **178**;
+- chance blockers: **50**.
+
+This adds 132 fully lowered recipes from a small source-backed adapter. The same pattern should be considered for other project-linked material helper types only when their concrete receiver expression is preserved and their helper implementation is a transparent material/form wrapper.
