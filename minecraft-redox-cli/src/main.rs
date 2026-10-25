@@ -92,8 +92,10 @@ fn print_gtnh_target(path: &str) -> Result<()> {
         let target = lower_target_content(&analysis, &recovery, &project);
         if target.materials.is_empty()
             && target.material_failures.is_empty()
+            && target.oracle_materials.is_empty()
             && target.recipes.is_empty()
             && target.recipe_failures.is_empty()
+            && target.oracle_recipes.is_empty()
         {
             continue;
         }

@@ -127,8 +127,10 @@ pub struct GtnhRecovery {
 pub struct TargetContentRecovery {
     pub materials: Vec<ContentMaterial>,
     pub material_failures: Vec<MaterialLoweringFailure>,
+    pub oracle_materials: Vec<SourceOrigin>,
     pub recipes: Vec<ContentRecipe>,
     pub recipe_failures: Vec<RecipeLoweringFailure>,
+    pub oracle_recipes: Vec<SourceOrigin>,
 }
 
 #[must_use]
@@ -139,18 +141,38 @@ pub fn lower_target_content(
 ) -> TargetContentRecovery {
     let mut target = TargetContentRecovery::default();
     for material in &recovery.materials {
+        if is_oracle_source(&material.origin.path) {
+            target.oracle_materials.push(material.origin.clone());
+            continue;
+        }
         match target_material::lower_material_with_project(material, &analysis.bindings, project) {
             Ok(material) => target.materials.push(material),
             Err(failure) => target.material_failures.push(*failure),
         }
     }
     for recipe in &recovery.recipes {
+        if is_oracle_source(&recipe.origin.path) {
+            target.oracle_recipes.push(recipe.origin.clone());
+            continue;
+        }
         match target_recipe::lower_recipe_with_project(recipe, &analysis.bindings, project) {
             Ok(recipe) => target.recipes.push(recipe),
             Err(failure) => target.recipe_failures.push(*failure),
         }
     }
     target
+}
+
+fn is_oracle_source(path: &str) -> bool {
+    let normalized = path.replace(std::path::MAIN_SEPARATOR, "/");
+    [
+        "/src/test/",
+        "/src/functionalTest/",
+        "/src/integrationTest/",
+        "/src/testFixtures/",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
@@ -164,8 +186,10 @@ pub struct GtnhSummary {
     pub materials: usize,
     pub materials_builder_fully_normalized: usize,
     pub materials_lowered: usize,
+    pub materials_oracle: usize,
     pub material_lowering_blockers: BTreeMap<String, usize>,
     pub recipes_lowered: usize,
+    pub recipes_oracle: usize,
     pub recipe_lowering_blockers: BTreeMap<String, usize>,
     pub recipe_unhandled_methods: BTreeMap<String, usize>,
     pub material_unhandled_methods: BTreeMap<String, usize>,
@@ -235,11 +259,13 @@ impl GtnhSummary {
         self.materials += other.materials;
         self.materials_builder_fully_normalized += other.materials_builder_fully_normalized;
         self.materials_lowered += other.materials_lowered;
+        self.materials_oracle += other.materials_oracle;
         merge_counts(
             &mut self.material_lowering_blockers,
             other.material_lowering_blockers,
         );
         self.recipes_lowered += other.recipes_lowered;
+        self.recipes_oracle += other.recipes_oracle;
         merge_counts(
             &mut self.recipe_lowering_blockers,
             other.recipe_lowering_blockers,
@@ -329,6 +355,10 @@ impl GtnhSummary {
         project: Option<&JavaProjectIndex>,
     ) {
         for recipe in &recovery.recipes {
+            if is_oracle_source(&recipe.origin.path) {
+                self.recipes_oracle += 1;
+                continue;
+            }
             let lowered = project.map_or_else(
                 || target_recipe::lower_recipe(recipe, &analysis.bindings),
                 |project| {
@@ -361,6 +391,10 @@ impl GtnhSummary {
         project: Option<&JavaProjectIndex>,
     ) {
         for material in &recovery.materials {
+            if is_oracle_source(&material.origin.path) {
+                self.materials_oracle += 1;
+                continue;
+            }
             let lowered = project.map_or_else(
                 || target_material::lower_material(material, &analysis.bindings),
                 |project| {
@@ -1440,7 +1474,7 @@ mod tests {
         let mut summary = GtnhSummary::default();
         summary.absorb(&analysis, &recovery);
         assert_eq!(summary.recipes_lowered, 1);
-        assert!(summary.recipe_lowering_blockers.is_empty());
+        assert_eq!(summary.recipe_lowering_blockers.len(), 0);
         Ok(())
     }
 
@@ -1527,6 +1561,34 @@ mod tests {
         let material = &recovery.materials[0];
         assert_eq!(material.name.as_deref(), Some("\"Foo\""));
         assert_eq!(material.unhandled_calls.len(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn classifies_test_source_recipes_as_oracles() -> anyhow::Result<()> {
+        let source = r"
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .duration(20)
+                    .eut(2)
+                    .addTo(compressorRecipes);
+            }}
+        ";
+        let path = "/repo/src/functionalTest/java/Recipes.java";
+        let analysis = analyze_source(path, "gt5", None, source)?;
+        let mut project = JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let recovery = recover_with_project(&analysis, &project);
+        let target = super::lower_target_content(&analysis, &recovery, &project);
+        assert_eq!(target.recipes.len(), 0);
+        assert_eq!(target.recipe_failures.len(), 0);
+        assert_eq!(target.oracle_recipes.len(), 1);
+
+        let mut summary = GtnhSummary::default();
+        summary.absorb_with_project(&analysis, &recovery, &project);
+        assert_eq!(summary.recipes_oracle, 1);
+        assert_eq!(summary.recipes_lowered, 0);
+        assert!(summary.recipe_lowering_blockers.is_empty());
         Ok(())
     }
 }
