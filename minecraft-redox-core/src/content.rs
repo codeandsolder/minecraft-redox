@@ -31,6 +31,10 @@ pub enum ItemSelector {
         id: ContentId,
         variant: Option<i64>,
     },
+    NamedVariant {
+        id: ContentId,
+        variant: ContentId,
+    },
     MaterialForm {
         material: ContentId,
         form: ContentId,

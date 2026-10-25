@@ -432,3 +432,30 @@ Full GT5 result after this pass:
 - chance blockers: **50**.
 
 This adds 16 fully lowered recipes while keeping non-transparent convenience helpers fail-closed.
+
+
+### Semantic named item variants
+
+Target item identity now has a source-independent named-subtype form, `ItemSelector::NamedVariant { id, variant }`, for content whose legacy runtime representation is one base item plus a metadata/damage subtype but whose *semantic* subtype already has a stable name. This avoids reverse-engineering and preserving arbitrary Minecraft metadata integers when the source exposes a stronger identity.
+
+Source-backed adapters currently cover only transparent families whose constructor behavior was inspected:
+
+- GregTech bee combs: concrete `ItemComb.getStackForType(CombType, amount)` lowers as the concrete comb item plus named `CombType` subtype;
+- GT++ base particles: `Particle.getBaseParticle(Particle[, amount])` lowers as the standard particle base item plus named `Particle` subtype;
+- GT++ comb enum instances: concrete `GTPPCombType.X.getStackForType(amount)` lowers as the GT++ comb item plus named enum subtype;
+- KekzTech crafting components: `getStackOfAmountFromDamage(Items.X.getMetaID(), amount)` lowers as the crafting-component item plus named `kekztech.Items.X` subtype rather than the numeric meta ID.
+
+Dynamic comb receivers remain blocked. GT++ `Particle.getIon(...)` is deliberately excluded because it writes ion charge into NBT; representing it faithfully requires structured item state rather than a subtype selector. BartWorks `BioCulture`/`BioData` helpers are likewise excluded because their payloads are mutable biological state and can carry plasmid/data rather than a simple enum subtype.
+
+Full GT5 result after this pass:
+
+- target recipes lowered: **3,470 / 5,791 (59.92%)**, up from 3,434 / 5,791 (59.30%);
+- item-input blockers: **1,218**, down from 1,255;
+- item-output blockers: **961**, down from 977;
+- metadata blockers: **872**;
+- fluid blockers: **457**;
+- non-constant EU/t blockers: **417**;
+- modifier blockers: **178**;
+- chance blockers: **50**.
+
+The corpus is five fully lowered recipes short of 60%. No additional family was generalized merely to cross that threshold: the nearest remaining helpers either depend on dynamic material provenance or require structured item/NBT state.

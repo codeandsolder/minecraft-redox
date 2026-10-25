@@ -675,6 +675,104 @@ fn material_accessor_form(accessor: &str) -> Option<&'static str> {
     }
 }
 
+fn lower_named_subtype_item_helper(
+    method_id: &str,
+    receiver: Option<&JavaExpression>,
+    arguments: &[JavaExpression],
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+) -> Option<ItemStackSpec> {
+    if matches!(
+        method_id,
+        "gregtech.common.items.ItemComb#getStackForType(CombType,int)"
+            | "gregtech.common.items.ItemComb#getStackForType(CombType)"
+    ) && matches!(arguments.len(), 1 | 2)
+    {
+        let id = qualified_reference_name(receiver?, bindings)?;
+        let variant = qualified_reference_name(arguments.first()?, bindings)?;
+        let amount = arguments.get(1).map_or(Some(1), |amount| {
+            scalar_amount_u64(amount, bindings, project)
+        })?;
+        return Some(named_variant_stack(id, variant, amount));
+    }
+
+    if matches!(
+        method_id,
+        "gtPlusPlus.core.material.Particle#getBaseParticle(Particle)"
+            | "gtPlusPlus.core.material.Particle#getBaseParticle(Particle,int)"
+    ) && matches!(arguments.len(), 1 | 2)
+    {
+        let variant = qualified_reference_name(arguments.first()?, bindings)?;
+        if !variant.starts_with("gtPlusPlus.core.material.Particle.") {
+            return None;
+        }
+        let amount = arguments.get(1).map_or(Some(1), |amount| {
+            scalar_amount_u64(amount, bindings, project)
+        })?;
+        return Some(named_variant_stack(
+            "gtPlusPlus.core.item.ModItems.itemStandarParticleBase",
+            variant,
+            amount,
+        ));
+    }
+
+    if method_id == "gtPlusPlus.xmod.forestry.bees.handler.GTPPCombType#getStackForType(int)"
+        && arguments.len() == 1
+    {
+        let variant = qualified_reference_name(receiver?, bindings)?;
+        if !variant.starts_with("gtPlusPlus.xmod.forestry.bees.handler.GTPPCombType.") {
+            return None;
+        }
+        return Some(named_variant_stack(
+            "gtPlusPlus.xmod.forestry.bees.registry.GTPP_Bees.combs",
+            variant,
+            scalar_amount_u64(arguments.first()?, bindings, project)?,
+        ));
+    }
+
+    if method_id
+        == "kekztech.common.items.MetaItemCraftingComponent#getStackOfAmountFromDamage(int,int)"
+        && arguments.len() == 2
+    {
+        let JavaExpression::Call {
+            receiver: Some(item),
+            method,
+            arguments: meta_arguments,
+        } = arguments.first()?
+        else {
+            return None;
+        };
+        if method != "getMetaID" || !meta_arguments.is_empty() {
+            return None;
+        }
+        let variant = qualified_reference_name(item, bindings)?;
+        if !variant.starts_with("kekztech.Items.") {
+            return None;
+        }
+        return Some(named_variant_stack(
+            "kekztech.common.items.MetaItemCraftingComponent",
+            variant,
+            scalar_amount_u64(arguments.get(1)?, bindings, project)?,
+        ));
+    }
+
+    None
+}
+
+fn named_variant_stack(
+    id: impl Into<String>,
+    variant: impl Into<String>,
+    amount: u64,
+) -> ItemStackSpec {
+    ItemStackSpec {
+        selector: ItemSelector::NamedVariant {
+            id: ContentId::new(id),
+            variant: ContentId::new(variant),
+        },
+        amount,
+    }
+}
+
 fn lower_transparent_linked_item_helper(
     method_id: &str,
     arguments: &[JavaExpression],
@@ -784,6 +882,12 @@ fn lower_linked_item_method(
 
     if let Some(stack) =
         lower_transparent_linked_item_helper(method_id, arguments, bindings, project)
+    {
+        return Some(stack);
+    }
+
+    if let Some(stack) =
+        lower_named_subtype_item_helper(method_id, receiver, arguments, bindings, project)
     {
         return Some(stack);
     }
@@ -1039,9 +1143,12 @@ mod tests {
     use minecraft_redox_core::content::{
         FluidSelector, ItemInputSpec, ItemSelector, Probability, RecipeRequirement,
     };
-    use minecraft_redox_java::{JavaProjectIndex, analyze_source};
+    use minecraft_redox_java::{JavaExpression, JavaProjectIndex, analyze_source};
 
-    use super::{RecipeLoweringBlockerKind, lower_recipe, lower_recipe_with_project};
+    use super::{
+        RecipeLoweringBlockerKind, lower_named_subtype_item_helper, lower_recipe,
+        lower_recipe_with_project,
+    };
     use crate::{recover, recover_with_project};
 
     #[test]
@@ -1407,6 +1514,98 @@ mod tests {
                 if material.as_str() == "gtPlusPlus.core.material.nuclear.MaterialsFluorides.LITHIUM_FLUORIDE"
                     && form.as_str() == "gregtech.api.enums.OrePrefixes.rawOre"
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn lowers_semantic_named_item_variants_without_legacy_meta_ids() -> anyhow::Result<()> {
+        let analysis = analyze_source(
+            "Variants.java",
+            "gt5",
+            None,
+            r"
+                package demo;
+                import gregtech.common.items.CombType;
+                import gregtech.common.items.GTBees;
+                import gtPlusPlus.core.material.Particle;
+                import kekztech.Items;
+                class Variants {}
+            ",
+        )?;
+        let bindings = &analysis.bindings;
+        let field = |owner: &str, name: &str| JavaExpression::FieldAccess {
+            receiver: Box::new(JavaExpression::Reference(owner.to_owned())),
+            field: name.to_owned(),
+        };
+
+        let comb = lower_named_subtype_item_helper(
+            "gregtech.common.items.ItemComb#getStackForType(CombType,int)",
+            Some(&field("GTBees", "combs")),
+            &[
+                field("CombType", "MANASTEEL"),
+                JavaExpression::Literal("4".into()),
+            ],
+            bindings,
+            None,
+        )
+        .ok_or_else(|| anyhow::anyhow!("comb subtype did not lower"))?;
+        assert_eq!(comb.amount, 4);
+        assert!(matches!(
+            comb.selector,
+            ItemSelector::NamedVariant { id, variant }
+                if id.as_str() == "gregtech.common.items.GTBees.combs"
+                    && variant.as_str() == "gregtech.common.items.CombType.MANASTEEL"
+        ));
+
+        let particle = lower_named_subtype_item_helper(
+            "gtPlusPlus.core.material.Particle#getBaseParticle(Particle)",
+            Some(&JavaExpression::Reference("Particle".into())),
+            &[field("Particle", "PROTON")],
+            bindings,
+            None,
+        )
+        .ok_or_else(|| anyhow::anyhow!("particle subtype did not lower"))?;
+        assert!(matches!(
+            particle.selector,
+            ItemSelector::NamedVariant { id, variant }
+                if id.as_str() == "gtPlusPlus.core.item.ModItems.itemStandarParticleBase"
+                    && variant.as_str() == "gtPlusPlus.core.material.Particle.PROTON"
+        ));
+
+        let kekz_variant = JavaExpression::Call {
+            receiver: Some(Box::new(field("Items", "YSZCeramicDust"))),
+            method: "getMetaID".into(),
+            arguments: Vec::new(),
+        };
+        let kekz = lower_named_subtype_item_helper(
+            "kekztech.common.items.MetaItemCraftingComponent#getStackOfAmountFromDamage(int,int)",
+            None,
+            &[kekz_variant, JavaExpression::Literal("6".into())],
+            bindings,
+            None,
+        )
+        .ok_or_else(|| anyhow::anyhow!("Kekz subtype did not lower"))?;
+        assert_eq!(kekz.amount, 6);
+        assert!(matches!(
+            kekz.selector,
+            ItemSelector::NamedVariant { id, variant }
+                if id.as_str() == "kekztech.common.items.MetaItemCraftingComponent"
+                    && variant.as_str() == "kekztech.Items.YSZCeramicDust"
+        ));
+
+        assert!(
+            lower_named_subtype_item_helper(
+                "gregtech.common.items.ItemComb#getStackForType(CombType,int)",
+                Some(&JavaExpression::Reference("dynamicComb".into())),
+                &[
+                    field("CombType", "MANASTEEL"),
+                    JavaExpression::Literal("1".into())
+                ],
+                bindings,
+                None,
+            )
+            .is_none()
+        );
         Ok(())
     }
 
