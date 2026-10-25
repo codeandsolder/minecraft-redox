@@ -666,6 +666,10 @@ fn material_accessor_form(accessor: &str) -> Option<&'static str> {
         "getCrushed" => Some("crushed"),
         "getCrushedPurified" => Some("crushedPurified"),
         "getCrushedCentrifuged" => Some("crushedCentrifuged"),
+        "getDustPurified" => Some("dustPure"),
+        "getDustImpure" => Some("dustImpure"),
+        "getMilled" => Some("milled"),
+        "getRawOre" => Some("rawOre"),
         "getPlasmaCell" => Some("cellPlasma"),
         _ => None,
     }
@@ -718,6 +722,23 @@ fn lower_linked_item_method(
         });
     }
 
+    if let Some(accessor) = method_id
+        .strip_prefix("gtPlusPlus.core.material.Material#")
+        .and_then(|signature| signature.split_once('(').map(|(accessor, _)| accessor))
+        .filter(|accessor| material_accessor_form(accessor).is_some())
+        && arguments.len() == 1
+    {
+        let material = concrete_gtpp_material_receiver(receiver?, bindings)?;
+        let form = material_accessor_form(accessor)?;
+        return Some(ItemStackSpec {
+            selector: ItemSelector::MaterialForm {
+                material: ContentId::new(material),
+                form: ContentId::new(format!("gregtech.api.enums.OrePrefixes.{form}")),
+            },
+            amount: scalar_amount_u64(arguments.first()?, bindings, project)?,
+        });
+    }
+
     if method_id == "goodgenerator.util.ItemRefer#get(int)" && arguments.len() == 1 {
         let item = qualified_reference_name(receiver?, bindings)?;
         if !item.contains("ItemRefer.") {
@@ -747,6 +768,32 @@ fn lower_linked_item_method(
     }
 
     None
+}
+
+fn concrete_gtpp_material_receiver(
+    receiver: &JavaExpression,
+    bindings: &JavaBindings,
+) -> Option<String> {
+    if let Some(name) = qualified_reference_name(receiver, bindings) {
+        return Some(name);
+    }
+
+    let JavaExpression::FieldAccess { receiver, field } = receiver else {
+        return None;
+    };
+    let JavaExpression::Call {
+        receiver: Some(owner),
+        method,
+        arguments,
+    } = receiver.as_ref()
+    else {
+        return None;
+    };
+    if method != "getInstance" || !arguments.is_empty() {
+        return None;
+    }
+    let owner = qualified_reference_name(owner, bindings)?;
+    (owner == "gtPlusPlus.core.material.MaterialsElements").then(|| format!("{owner}.{field}"))
 }
 
 fn qualified_reference_name(
@@ -1236,6 +1283,80 @@ mod tests {
             ItemSelector::MaterialForm { material, form }
                 if material.as_str() == "bartworks.system.material.WerkstoffLoader.CalciumChloride"
                     && form.as_str() == "gregtech.api.enums.OrePrefixes.plate"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn lowers_concrete_gtpp_material_receivers_to_material_forms() -> anyhow::Result<()> {
+        let material = r"
+            package gtPlusPlus.core.material;
+            import net.minecraft.item.ItemStack;
+            class Material {
+                ItemStack getDust(int amount) { return null; }
+                ItemStack getRawOre(int amount) { return null; }
+            }
+        ";
+        let elements = r"
+            package gtPlusPlus.core.material;
+            class MaterialsElements {
+                private static final MaterialsElements INSTANCE = new MaterialsElements();
+                final Material THORIUM232 = new Material();
+                static MaterialsElements getInstance() { return INSTANCE; }
+            }
+        ";
+        let fluorides = r"
+            package gtPlusPlus.core.material.nuclear;
+            import gtPlusPlus.core.material.Material;
+            class MaterialsFluorides {
+                static final Material LITHIUM_FLUORIDE = new Material();
+            }
+        ";
+        let recipe_source = r"
+            package demo;
+            import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+            import gregtech.api.enums.GTValues;
+            import gtPlusPlus.core.material.MaterialsElements;
+            import gtPlusPlus.core.material.nuclear.MaterialsFluorides;
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .itemInputs(MaterialsElements.getInstance().THORIUM232.getDust(2))
+                    .itemOutputs(MaterialsFluorides.LITHIUM_FLUORIDE.getRawOre(3))
+                    .duration(20).eut(2).addTo(compressorRecipes);
+            }}
+        ";
+        let material = analyze_source("Material.java", "gt5", None, material)?;
+        let elements = analyze_source("MaterialsElements.java", "gt5", None, elements)?;
+        let fluorides = analyze_source("MaterialsFluorides.java", "gt5", None, fluorides)?;
+        let recipe = analyze_source("Recipes.java", "gt5", None, recipe_source)?;
+        let mut project = JavaProjectIndex::default();
+        for analysis in [&material, &elements, &fluorides, &recipe] {
+            project.add_analysis(analysis);
+        }
+        let recovery = crate::recover_with_project(&recipe, &project);
+        let recovered = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let lowered = super::lower_recipe_with_project(recovered, &recipe.bindings, &project)
+            .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
+
+        let ItemInputSpec::Stack(input) = &lowered.item_inputs[0] else {
+            return Err(anyhow::anyhow!("GT++ material input was not a stack"));
+        };
+        assert_eq!(input.amount, 2);
+        assert!(matches!(
+            &input.selector,
+            ItemSelector::MaterialForm { material, form }
+                if material.as_str() == "gtPlusPlus.core.material.MaterialsElements.THORIUM232"
+                    && form.as_str() == "gregtech.api.enums.OrePrefixes.dust"
+        ));
+        assert_eq!(lowered.item_outputs[0].stack.amount, 3);
+        assert!(matches!(
+            &lowered.item_outputs[0].stack.selector,
+            ItemSelector::MaterialForm { material, form }
+                if material.as_str() == "gtPlusPlus.core.material.nuclear.MaterialsFluorides.LITHIUM_FLUORIDE"
+                    && form.as_str() == "gregtech.api.enums.OrePrefixes.rawOre"
         ));
         Ok(())
     }

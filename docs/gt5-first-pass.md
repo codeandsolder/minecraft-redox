@@ -389,3 +389,23 @@ Full GT5 result after this pass:
 - chance blockers: **50**.
 
 This adds 132 fully lowered recipes from a small source-backed adapter. The same pattern should be considered for other project-linked material helper types only when their concrete receiver expression is preserved and their helper implementation is a transparent material/form wrapper.
+
+
+### Concrete GT++ Material linked receivers
+
+Project-linked `gtPlusPlus.core.material.Material` accessors now lower when their receiver is a provably concrete material. Ordinary qualified static fields are accepted directly. One additional receiver pattern is canonicalized only because its source implementation was verified: `MaterialsElements.getInstance().FIELD`, where `getInstance()` returns a `private static final INSTANCE`, becomes the stable material identity `gtPlusPlus.core.material.MaterialsElements.FIELD`.
+
+This is deliberately not a general rule for arbitrary `getInstance()` calls. Dynamic `Material` parameters and locals remain unresolved. Source-backed accessor mappings were extended only for transparent `OrePrefixes` wrappers present in `Material.java`, including `dustPure`, `dustImpure`, `milled`, and `rawOre` in addition to the existing dust/ingot/plate/rod/wire/cell/etc. forms.
+
+Full GT5 result after this pass:
+
+- target recipes lowered: **3,418 / 5,791 (59.02%)**, up from 3,367 / 5,791 (58.14%);
+- item-input blockers: **1,275**, down from 1,304;
+- item-output blockers: **981**, down from 1,021;
+- metadata blockers: **872**;
+- fluid blockers: **457**;
+- non-constant EU/t blockers: **417**;
+- modifier blockers: **178**;
+- chance blockers: **50**.
+
+This adds 51 fully lowered recipes while preserving the rule that type information is not content identity.
