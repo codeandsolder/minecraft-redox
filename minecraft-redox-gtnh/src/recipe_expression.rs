@@ -720,7 +720,7 @@ fn classify_new_item(
     None
 }
 
-fn fluid_semantic(expression: &JavaExpression, bindings: &JavaBindings) -> Option<FluidSemantic> {
+pub(crate) fn fluid_semantic(expression: &JavaExpression, bindings: &JavaBindings) -> Option<FluidSemantic> {
     match expression {
         JavaExpression::Call {
             receiver: Some(receiver),

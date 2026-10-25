@@ -3091,9 +3091,7 @@ fn lower_fluid_semantic(
             amount: scalar_amount_u64(amount, bindings, project)?,
         }),
         FluidSemantic::FluidStack { fluid, amount } => Some(FluidStackSpec {
-            selector: FluidSelector::Named {
-                id: ContentId::new(resolved_reference_name(fluid, bindings)?),
-            },
+            selector: lower_fluid_selector_expression(fluid, bindings, project)?,
             amount: scalar_amount_u64(amount, bindings, project)?,
         }),
         FluidSemantic::RegistryFluid {
@@ -3119,6 +3117,73 @@ fn lower_fluid_semantic(
     }
 }
 
+fn lower_fluid_selector_expression(
+    expression: &JavaExpression,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+) -> Option<FluidSelector> {
+    if let Some(reference) = resolved_reference_name(expression, bindings) {
+        return Some(FluidSelector::Named {
+            id: ContentId::new(reference),
+        });
+    }
+    if let JavaExpression::Call {
+        receiver: Some(receiver),
+        method,
+        arguments,
+    } = expression
+    {
+        let provider = resolved_reference_name(receiver, bindings)?;
+        if provider == "net.minecraftforge.fluids.FluidRegistry"
+            && method == "getFluid"
+            && arguments.len() == 1
+        {
+            return Some(FluidSelector::Named {
+                id: ContentId::new(simple_string_literal(arguments.first()?)?),
+            });
+        }
+        if provider == "gregtech.api.util.GTModHandler"
+            && method == "getDistilledWater"
+            && arguments.len() == 1
+        {
+            return Some(distilled_water_selector());
+        }
+    }
+    if let JavaExpression::Call {
+        receiver: None,
+        method,
+        arguments,
+    } = expression
+        && method == "getFluid"
+        && arguments.len() == 1
+        && bindings
+            .static_imports
+            .get(method)
+            .is_some_and(|provider| provider == "net.minecraftforge.fluids.FluidRegistry.getFluid")
+    {
+        return Some(FluidSelector::Named {
+            id: ContentId::new(simple_string_literal(arguments.first()?)?),
+        });
+    }
+    crate::recipe_expression::fluid_semantic(expression, bindings)
+        .and_then(|semantic| lower_fluid_semantic(&semantic, bindings, project))
+        .map(|stack| stack.selector)
+}
+
+fn distilled_water_selector() -> FluidSelector {
+    FluidSelector::FirstAvailable {
+        choices: vec![
+            FluidSelector::Named {
+                id: ContentId::new("ic2distilledwater"),
+            },
+            FluidSelector::MaterialForm {
+                material: ContentId::new("gregtech.api.enums.Materials.Water"),
+                form: ContentId::new("fluid"),
+            },
+        ],
+    }
+}
+
 fn lower_transparent_linked_fluid_helper(
     method_id: &str,
     arguments: &[JavaExpression],
@@ -3128,17 +3193,7 @@ fn lower_transparent_linked_fluid_helper(
     let amount = scalar_amount_u64(arguments.first()?, bindings, project)?;
     if method_id == "gregtech.api.util.GTModHandler#getDistilledWater(long)" {
         return Some(FluidStackSpec {
-            selector: FluidSelector::FirstAvailable {
-                choices: vec![
-                    FluidSelector::Named {
-                        id: ContentId::new("ic2distilledwater"),
-                    },
-                    FluidSelector::MaterialForm {
-                        material: ContentId::new("gregtech.api.enums.Materials.Water"),
-                        form: ContentId::new("fluid"),
-                    },
-                ],
-            },
+            selector: distilled_water_selector(),
             amount,
         });
     }
@@ -5637,6 +5692,69 @@ mod tests {
             lowered.item_outputs[1].production_probability,
             Probability::ONE
         );
+        Ok(())
+    }
+
+    #[test]
+    fn lowers_nested_and_literal_fluid_stack_identities() -> anyhow::Result<()> {
+        let source = r#"
+            import static gregtech.api.recipe.RecipeMaps.chemicalReactorRecipes;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            import gregtech.api.util.GTModHandler;
+            import net.minecraftforge.fluids.FluidRegistry;
+            import net.minecraftforge.fluids.FluidStack;
+            class Recipes {
+                void staticFluids() {
+                    GTValues.RA.stdBuilder()
+                        .itemInputs(Materials.Iron.getDust(1))
+                        .itemOutputs(Materials.Steel.getDust(1))
+                        .fluidInputs(new FluidStack(GTModHandler.getDistilledWater(1), 750))
+                        .fluidOutputs(new FluidStack(FluidRegistry.getFluid("molten.dragonblood"), 288))
+                        .duration(20).eut(2).addTo(chemicalReactorRecipes);
+                }
+                void dynamicFluid(String name) {
+                    GTValues.RA.stdBuilder()
+                        .itemInputs(Materials.Iron.getDust(1))
+                        .itemOutputs(Materials.Steel.getDust(1))
+                        .fluidInputs(new FluidStack(FluidRegistry.getFluid(name), 1000))
+                        .duration(20).eut(2).addTo(chemicalReactorRecipes);
+                }
+            }
+        "#;
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let mut project = JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let recovery = crate::recover_with_project(&analysis, &project);
+        assert_eq!(recovery.recipes.len(), 2);
+        let lowered = super::lower_recipe_with_project(
+            &recovery.recipes[0],
+            &analysis.bindings,
+            &project,
+        )
+        .map_err(|failure| anyhow::anyhow!("nested fluid lowering failed: {failure:?}"))?;
+        let FluidInputSpec::Stack(input) = &lowered.fluid_inputs[0] else {
+            return Err(anyhow::anyhow!("distilled-water copy became alternatives"));
+        };
+        assert_eq!(input.amount, 750);
+        assert_distilled_water_selector(&input.selector)?;
+        assert_eq!(lowered.fluid_outputs[0].amount, 288);
+        assert!(matches!(
+            &lowered.fluid_outputs[0].selector,
+            FluidSelector::Named { id } if id.as_str() == "molten.dragonblood"
+        ));
+
+        let failure = super::lower_recipe_with_project(
+            &recovery.recipes[1],
+            &analysis.bindings,
+            &project,
+        )
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("dynamic registry fluid unexpectedly lowered"))?;
+        assert!(failure
+            .blockers
+            .iter()
+            .any(|blocker| blocker.kind == RecipeLoweringBlockerKind::Fluids));
         Ok(())
     }
 

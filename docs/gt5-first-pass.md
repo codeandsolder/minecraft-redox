@@ -1162,3 +1162,32 @@ Full pinned-corpus result:
 - missing-EU/t blockers: **24**;
 - post-add blockers: **7**;
 - modifier blockers: **6**.
+
+
+### Nested and literal fluid-stack identities
+
+`new FluidStack(identity, amount)` is now lowered from the semantic identity of its first argument instead of assuming that argument is a simple field reference. The outer constructor amount remains authoritative, matching Forge's copy/wrapper constructors.
+
+Supported source-backed identities include:
+
+- literal `FluidRegistry.getFluid("name")` calls, normalized directly to the registry fluid ID;
+- statically imported literal `getFluid("name")` calls;
+- nested fluid-stack/material semantics that are already lowerable;
+- `GTModHandler.getDistilledWater(...)` wrapped in a new `FluidStack`, preserving the ordered `ic2distilledwater` -> Water identity fallback while replacing only the amount.
+
+Dynamic registry names remain fail-closed. The direct GTModHandler fallback representation was also factored through one shared selector constructor so wrapped and unwrapped distilled water cannot drift semantically.
+
+Full pinned-corpus result:
+
+- target recipes lowered: **4,186 / 5,791 (72.28%)**, up from 4,138 / 5,791 (71.46%);
+- fluid blockers: **254**, down from 306;
+- item-input blockers: **1,086**;
+- item-output blockers: **945**;
+- metadata blockers: **331**;
+- non-constant EU/t blockers: **417**;
+- missing-duration blockers: **332**;
+- chance blockers: **50**;
+- special blockers: **31**;
+- missing-EU/t blockers: **24**;
+- post-add blockers: **7**;
+- modifier blockers: **6**.
