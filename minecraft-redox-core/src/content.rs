@@ -55,6 +55,13 @@ pub enum FluidSelector {
         material: ContentId,
         form: ContentId,
     },
+    /// Resolve to the first identity that exists in the loaded content registry.
+    ///
+    /// This is an ordered identity fallback, not a recipe-input alternative: once the
+    /// preferred identity exists, later choices are not accepted as substitutes.
+    FirstAvailable {
+        choices: Vec<FluidSelector>,
+    },
 }
 
 /// Exact probability used by normalized content semantics.

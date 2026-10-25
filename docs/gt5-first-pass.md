@@ -1018,3 +1018,36 @@ Full pinned-corpus result:
 - missing-EU/t blockers: **24**;
 - post-add blockers: **7**;
 - modifier blockers: **6**.
+
+
+### Ordered fluid identity fallback for distilled water
+
+`FluidSelector` now supports ordered registry fallback:
+
+```rust
+FluidSelector::FirstAvailable { choices: Vec<FluidSelector> }
+```
+
+This is deliberately different from `FluidInputSpec::Alternatives`. Alternatives mean a machine may satisfy one recipe slot with any listed choice. `FirstAvailable` resolves one content identity globally in order: once an earlier identity exists, later choices are not substitutes for that recipe.
+
+GT5's `GTModHandler.getDistilledWater(amount)` is the first adapter. Source behavior is exactly: request registered `ic2distilledwater`; if that fluid does not exist, use `Materials.Water.getFluid(amount)`. The target therefore lowers the helper, for both recipe inputs and outputs, to:
+
+1. named fluid `ic2distilledwater`;
+2. `Materials.Water` / `fluid` as the fallback.
+
+The amount must still reduce to a static non-negative scalar. `getIC2Coolant` and `getLiquidDNA` intentionally remain unresolved: those helpers branch on **mod presence**, not preferred-fluid availability, so mapping them to the same ordered registry fallback would change behavior when a mod is loaded but its fluid is absent.
+
+Full pinned-corpus result:
+
+- target recipes lowered: **4,017 / 5,791 (69.37%)**, up from 3,971 / 5,791 (68.57%);
+- fluid blockers: **323**, down from 388;
+- metadata blockers: **336**;
+- item-input blockers: **1,218**;
+- item-output blockers: **961**;
+- non-constant EU/t blockers: **417**;
+- missing-duration blockers: **332**;
+- chance blockers: **50**;
+- special blockers: **31**;
+- missing-EU/t blockers: **24**;
+- post-add blockers: **7**;
+- modifier blockers: **6**.
