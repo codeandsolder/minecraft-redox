@@ -409,3 +409,26 @@ Full GT5 result after this pass:
 - chance blockers: **50**.
 
 This adds 51 fully lowered recipes while preserving the rule that type information is not content identity.
+
+
+### Transparent registry and ore-prefix helpers
+
+Two additional linked helper families are lowered only after source inspection proved they are transparent identity/amount adapters:
+
+- `tectech.loader.recipe.BaseRecipeLoader.getNHCoreModItem(name, count)` reflectively resolves the named `com.dreammaster.item.NHItemList` enum constant and invokes its ordinary `get(count)`, so literal names lower to named target items with scalar amounts;
+- `gtPlusPlus.core.util.minecraft.ItemUtils.getOrePrefixStack(prefix, material, amount)` delegates to `GTOreDictUnificator.get(...)` after one explicit normalization, `OrePrefixes.rod -> OrePrefixes.stick`, so it lowers to `MaterialForm` with that normalization preserved.
+
+The superficially similar `ItemUtils.getItemStackOfAmountFromOreDict*` helpers remain blocked: their source sanitizes names, rewrites rods, special-cases clay, and in the `NoBroken` path performs material-dependent dust fallback logic. They are not transparent ore-key lookups and should not be approximated merely to increase coverage.
+
+Full GT5 result after this pass:
+
+- target recipes lowered: **3,434 / 5,791 (59.30%)**, up from 3,418 / 5,791 (59.02%);
+- item-input blockers: **1,255**, down from 1,275;
+- item-output blockers: **977**, down from 981;
+- metadata blockers: **872**;
+- fluid blockers: **457**;
+- non-constant EU/t blockers: **417**;
+- modifier blockers: **178**;
+- chance blockers: **50**.
+
+This adds 16 fully lowered recipes while keeping non-transparent convenience helpers fail-closed.

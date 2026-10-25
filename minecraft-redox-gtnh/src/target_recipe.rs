@@ -675,6 +675,49 @@ fn material_accessor_form(accessor: &str) -> Option<&'static str> {
     }
 }
 
+fn lower_transparent_linked_item_helper(
+    method_id: &str,
+    arguments: &[JavaExpression],
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+) -> Option<ItemStackSpec> {
+    if method_id == "tectech.loader.recipe.BaseRecipeLoader#getNHCoreModItem(String,int)"
+        && arguments.len() == 2
+    {
+        let item = simple_string_literal(arguments.first()?)?;
+        return Some(ItemStackSpec {
+            selector: ItemSelector::Named {
+                id: ContentId::new(format!("com.dreammaster.item.NHItemList.{item}")),
+                variant: None,
+            },
+            amount: scalar_amount_u64(arguments.get(1)?, bindings, project)?,
+        });
+    }
+
+    if method_id
+        == "gtPlusPlus.core.util.minecraft.ItemUtils#getOrePrefixStack(gregtech.api.enums.OrePrefixes,gregtech.api.enums.Materials,int)"
+        && arguments.len() == 3
+    {
+        let mut form = qualified_reference_name(arguments.first()?, bindings)?;
+        if form == "gregtech.api.enums.OrePrefixes.rod" {
+            form = String::from("gregtech.api.enums.OrePrefixes.stick");
+        }
+        if !form.contains("OrePrefixes.") {
+            return None;
+        }
+        let material = qualified_reference_name(arguments.get(1)?, bindings)?;
+        return Some(ItemStackSpec {
+            selector: ItemSelector::MaterialForm {
+                material: ContentId::new(material),
+                form: ContentId::new(form),
+            },
+            amount: scalar_amount_u64(arguments.get(2)?, bindings, project)?,
+        });
+    }
+
+    None
+}
+
 fn lower_linked_item_method(
     method_id: &str,
     receiver: Option<&JavaExpression>,
@@ -737,6 +780,12 @@ fn lower_linked_item_method(
             },
             amount: scalar_amount_u64(arguments.first()?, bindings, project)?,
         });
+    }
+
+    if let Some(stack) =
+        lower_transparent_linked_item_helper(method_id, arguments, bindings, project)
+    {
+        return Some(stack);
     }
 
     if method_id == "goodgenerator.util.ItemRefer#get(int)" && arguments.len() == 1 {
@@ -1357,6 +1406,87 @@ mod tests {
             ItemSelector::MaterialForm { material, form }
                 if material.as_str() == "gtPlusPlus.core.material.nuclear.MaterialsFluorides.LITHIUM_FLUORIDE"
                     && form.as_str() == "gregtech.api.enums.OrePrefixes.rawOre"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn lowers_transparent_registry_and_ore_helpers() -> anyhow::Result<()> {
+        let base_loader = analyze_source(
+            "BaseRecipeLoader.java",
+            "gt5",
+            None,
+            r"
+                package tectech.loader.recipe;
+                import net.minecraft.item.ItemStack;
+                class BaseRecipeLoader {
+                    static ItemStack getNHCoreModItem(String name, int count) { return null; }
+                }
+            ",
+        )?;
+        let item_utils = analyze_source(
+            "ItemUtils.java",
+            "gt5",
+            None,
+            r"
+                package gtPlusPlus.core.util.minecraft;
+                import gregtech.api.enums.Materials;
+                import gregtech.api.enums.OrePrefixes;
+                import net.minecraft.item.ItemStack;
+                class ItemUtils {
+                    static ItemStack getOrePrefixStack(OrePrefixes prefix, Materials material, int amount) {
+                        return null;
+                    }
+                }
+            ",
+        )?;
+        let recipe = analyze_source(
+            "Recipes.java",
+            "gt5",
+            None,
+            r#"
+                package demo;
+                import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+                import gregtech.api.enums.GTValues;
+                import gregtech.api.enums.Materials;
+                import gregtech.api.enums.OrePrefixes;
+                import gtPlusPlus.core.util.minecraft.ItemUtils;
+                import tectech.loader.recipe.BaseRecipeLoader;
+                class Recipes { void run() {
+                    GTValues.RA.stdBuilder()
+                        .itemInputs(BaseRecipeLoader.getNHCoreModItem("Display", 4))
+                        .itemOutputs(ItemUtils.getOrePrefixStack(OrePrefixes.rod, Materials.Iron, 3))
+                        .duration(20).eut(2).addTo(compressorRecipes);
+                }}
+            "#,
+        )?;
+        let mut project = JavaProjectIndex::default();
+        for analysis in [&base_loader, &item_utils, &recipe] {
+            project.add_analysis(analysis);
+        }
+        let recovery = crate::recover_with_project(&recipe, &project);
+        let recovered = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let lowered = super::lower_recipe_with_project(recovered, &recipe.bindings, &project)
+            .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
+
+        let ItemInputSpec::Stack(input) = &lowered.item_inputs[0] else {
+            return Err(anyhow::anyhow!("NHCore item was not a stack"));
+        };
+        assert_eq!(input.amount, 4);
+        assert!(matches!(
+            &input.selector,
+            ItemSelector::Named { id, variant: None }
+                if id.as_str() == "com.dreammaster.item.NHItemList.Display"
+        ));
+        assert_eq!(lowered.item_outputs[0].stack.amount, 3);
+        assert!(matches!(
+            &lowered.item_outputs[0].stack.selector,
+            ItemSelector::MaterialForm { material, form }
+                if material.as_str() == "gregtech.api.enums.Materials.Iron"
+                    && form.as_str() == "gregtech.api.enums.OrePrefixes.stick"
         ));
         Ok(())
     }
