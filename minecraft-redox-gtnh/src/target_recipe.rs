@@ -394,23 +394,28 @@ struct LoweredMetadata {
     synthetic_transform: Option<SyntheticRecipeTransform>,
 }
 
+#[derive(Default)]
+struct MetadataAccumulator<'a> {
+    minimum_heat_kelvin: Option<u64>,
+    minimum_capabilities: BTreeMap<ContentId, u64>,
+    exact_capabilities: BTreeMap<ContentId, u64>,
+    startup_energy_eu: u64,
+    fuel_value: Option<(&'a crate::BuilderCall, &'a JavaExpression)>,
+    fuel_type: Option<(&'a crate::BuilderCall, &'a JavaExpression)>,
+    research_item: Option<(&'a crate::BuilderCall, &'a JavaExpression)>,
+    scanning: Option<&'a JavaExpression>,
+    recycle: Option<(&'a crate::BuilderCall, &'a JavaExpression)>,
+    arc_additive_amount: Option<(&'a crate::BuilderCall, &'a JavaExpression)>,
+    environment_metadata: Vec<(&'a crate::BuilderCall, ContentId, &'a JavaExpression)>,
+}
+
 fn lower_metadata(
     recipe: &RecipeDefinition,
     bindings: &JavaBindings,
     project: Option<&JavaProjectIndex>,
     blockers: &mut Vec<RecipeLoweringBlocker>,
 ) -> LoweredMetadata {
-    let mut minimum_heat_kelvin = None;
-    let mut minimum_capabilities = BTreeMap::new();
-    let mut exact_capabilities = BTreeMap::new();
-    let mut startup_energy_eu = 0;
-    let mut fuel_value = None;
-    let mut fuel_type = None;
-    let mut research_item = None;
-    let mut scanning = None;
-    let mut recycle = None;
-    let mut arc_additive_amount = None;
-    let mut environment_metadata = Vec::new();
+    let mut state = MetadataAccumulator::default();
 
     for call in &recipe.metadata {
         let Some((key, value)) = lower_metadata_call(recipe, call, bindings, project, blockers)
@@ -418,86 +423,126 @@ fn lower_metadata(
             continue;
         };
 
-        if let Some(environment) = environment_metadata_key(&key) {
-            environment_metadata.push((call, environment, value));
-        } else if key == "gregtech.api.util.GTRecipeConstants.COIL_HEAT" {
-            if let Some(kelvin) = lower_coil_heat(call, value, bindings, project, blockers) {
-                minimum_heat_kelvin = Some(kelvin);
-            }
-        } else if let Some(capability) = minimum_capability_metadata(&key) {
-            if let Some(level) =
-                lower_capability_requirement(recipe, call, &key, value, bindings, project, blockers)
-            {
-                minimum_capabilities.insert(capability, level);
-            }
-        } else if key == "gregtech.api.util.GTRecipeConstants.ALGAE_POND_TIER" {
-            if let Some(level) =
-                lower_exact_algae_tier(recipe, call, value, bindings, project, blockers)
-            {
-                exact_capabilities
-                    .insert(ContentId::new("machine_capability.algae_pond_tier"), level);
-            }
-        } else if key == "gregtech.api.util.GTRecipeConstants.FUSION_THRESHOLD" {
-            if let Some(value) =
-                lower_fusion_startup_energy(recipe, call, value, bindings, project, blockers)
-            {
-                startup_energy_eu = value;
-            }
-        } else if key == "gregtech.api.util.GTRecipeConstants.FUEL_VALUE" {
-            fuel_value = Some((call, value));
-        } else if key == "gregtech.api.util.GTRecipeConstants.FUEL_TYPE" {
-            fuel_type = Some((call, value));
-        } else if key == "gregtech.api.util.GTRecipeConstants.RECYCLE" {
-            recycle = Some((call, value));
-        } else if key == "gregtech.api.util.GTRecipeConstants.ADDITIVE_AMOUNT"
-            && recipe.recipe_map == "gregtech.api.util.GTRecipeConstants.UniversalArcFurnace"
-        {
-            arc_additive_amount = Some((call, value));
-        } else if matches!(
-            key.as_str(),
-            "gregtech.api.util.GTRecipeConstants.RESEARCH_ITEM"
-                | "gregtech.api.util.GTRecipeConstants.SCANNING"
-        ) {
-            capture_assembly_line_research(
-                recipe,
-                call,
-                &key,
-                value,
-                &mut research_item,
-                &mut scanning,
-                blockers,
-            );
-        } else {
-            push_blocker(
-                blockers,
-                RecipeLoweringBlockerKind::Metadata,
-                format!("unsupported recipe metadata key: {key}"),
-            );
-        }
+        collect_metadata_entry(
+            recipe,
+            (call, &key, value),
+            bindings,
+            project,
+            &mut state,
+            blockers,
+        );
     }
 
     let required_environments =
-        lower_environment_requirements(recipe, environment_metadata, bindings, blockers);
+        lower_environment_requirements(recipe, state.environment_metadata, bindings, blockers);
     let requirements = lower_recipe_requirements(
-        minimum_heat_kelvin,
-        minimum_capabilities,
-        exact_capabilities,
+        state.minimum_heat_kelvin,
+        state.minimum_capabilities,
+        state.exact_capabilities,
         required_environments,
     );
-    let unlock =
-        lower_assembly_line_unlock(recipe, research_item, scanning, bindings, project, blockers);
-    let (fuel_energy_eu_per_liter, fuel_map_override) =
-        lower_fuel_metadata(recipe, fuel_value, fuel_type, bindings, project, blockers);
+    let unlock = lower_assembly_line_unlock(
+        recipe,
+        state.research_item,
+        state.scanning,
+        bindings,
+        project,
+        blockers,
+    );
+    let (fuel_energy_eu_per_liter, fuel_map_override) = lower_fuel_metadata(
+        recipe,
+        state.fuel_value,
+        state.fuel_type,
+        bindings,
+        project,
+        blockers,
+    );
     let (synthetic_transform, synthetic_map_override) =
-        lower_universal_arc_furnace(recipe, recycle, arc_additive_amount, blockers);
+        lower_universal_arc_furnace(recipe, state.recycle, state.arc_additive_amount, blockers);
     let recipe_map_override = synthetic_map_override.or(fuel_map_override);
     LoweredMetadata {
         requirements,
         unlock,
-        startup_energy_eu,
+        startup_energy_eu: state.startup_energy_eu,
         fuel_energy_eu_per_liter,
         recipe_map_override,
         synthetic_transform,
+    }
+}
+
+fn collect_metadata_entry<'a>(
+    recipe: &RecipeDefinition,
+    (call, key, value): (&'a crate::BuilderCall, &str, &'a JavaExpression),
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+    state: &mut MetadataAccumulator<'a>,
+    blockers: &mut Vec<RecipeLoweringBlocker>,
+) {
+    if let Some(environment) = environment_metadata_key(key) {
+        state.environment_metadata.push((call, environment, value));
+    } else if key == "gregtech.api.util.GTRecipeConstants.COIL_HEAT" {
+        if let Some(kelvin) = lower_coil_heat(call, value, bindings, project, blockers) {
+            state.minimum_heat_kelvin = Some(kelvin);
+        }
+    } else if let Some(capability) = minimum_capability_metadata(key) {
+        if let Some(level) =
+            lower_capability_requirement(recipe, call, key, value, bindings, project, blockers)
+        {
+            state.minimum_capabilities.insert(capability, level);
+        }
+    } else if key == "gregtech.api.util.GTRecipeConstants.ALGAE_POND_TIER" {
+        if let Some(level) =
+            lower_exact_algae_tier(recipe, call, value, bindings, project, blockers)
+        {
+            state
+                .exact_capabilities
+                .insert(ContentId::new("machine_capability.algae_pond_tier"), level);
+        }
+    } else if key == "gregtech.api.recipe.metadata.PCBFactoryUpgradeKey.INSTANCE" {
+        lower_pcb_factory_upgrade(
+            recipe,
+            call,
+            value,
+            bindings,
+            &mut state.minimum_capabilities,
+            blockers,
+        );
+    } else if key == "gregtech.api.util.GTRecipeConstants.FUSION_THRESHOLD" {
+        if let Some(value) =
+            lower_fusion_startup_energy(recipe, call, value, bindings, project, blockers)
+        {
+            state.startup_energy_eu = value;
+        }
+    } else if key == "gregtech.api.util.GTRecipeConstants.FUEL_VALUE" {
+        state.fuel_value = Some((call, value));
+    } else if key == "gregtech.api.util.GTRecipeConstants.FUEL_TYPE" {
+        state.fuel_type = Some((call, value));
+    } else if key == "gregtech.api.util.GTRecipeConstants.RECYCLE" {
+        state.recycle = Some((call, value));
+    } else if key == "gregtech.api.util.GTRecipeConstants.ADDITIVE_AMOUNT"
+        && recipe.recipe_map == "gregtech.api.util.GTRecipeConstants.UniversalArcFurnace"
+    {
+        state.arc_additive_amount = Some((call, value));
+    } else if matches!(
+        key,
+        "gregtech.api.util.GTRecipeConstants.RESEARCH_ITEM"
+            | "gregtech.api.util.GTRecipeConstants.SCANNING"
+    ) {
+        capture_assembly_line_research(
+            recipe,
+            call,
+            key,
+            value,
+            &mut state.research_item,
+            &mut state.scanning,
+            blockers,
+        );
+    } else {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            format!("unsupported recipe metadata key: {key}"),
+        );
     }
 }
 
@@ -766,6 +811,54 @@ fn capture_assembly_line_research<'a>(
         *research_item = Some((call, value));
     } else {
         *scanning = Some(value);
+    }
+}
+
+fn lower_pcb_factory_upgrade(
+    recipe: &RecipeDefinition,
+    call: &crate::BuilderCall,
+    value: &JavaExpression,
+    bindings: &JavaBindings,
+    minimum_capabilities: &mut BTreeMap<ContentId, u64>,
+    blockers: &mut Vec<RecipeLoweringBlocker>,
+) {
+    if recipe.recipe_map != "gregtech.api.recipe.RecipeMaps.pcbFactoryRecipes" {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            format!(
+                "PCB factory upgrade used on unsupported recipe map {}",
+                recipe.recipe_map
+            ),
+        );
+        return;
+    }
+    let Some(upgrade) = resolved_reference_name(value, bindings) else {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            format!(
+                "PCB factory upgrade is not statically identifiable: {}",
+                call.arguments.join(", ")
+            ),
+        );
+        return;
+    };
+    match upgrade.as_str() {
+        "gregtech.api.recipe.metadata.PCBFactoryUpgrade.BIO" => {
+            minimum_capabilities.insert(
+                ContentId::new("machine_capability.pcb_factory_bio_chamber"),
+                1,
+            );
+        }
+        "gregtech.api.recipe.metadata.PCBFactoryUpgrade.NONE" => {}
+        _ => {
+            push_blocker(
+                blockers,
+                RecipeLoweringBlockerKind::Metadata,
+                format!("unsupported PCB factory upgrade: {upgrade}"),
+            );
+        }
     }
 }
 
@@ -3328,6 +3421,47 @@ mod tests {
                 }]
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn lowers_pcb_bio_upgrade_alias_as_machine_capability() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.recipe.metadata.PCBFactoryUpgrade.BIO;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            import gregtech.api.recipe.RecipeMaps;
+            import gregtech.api.recipe.metadata.PCBFactoryUpgradeKey;
+            class Recipes {
+                private static final PCBFactoryUpgradeKey UPGRADE = PCBFactoryUpgradeKey.INSTANCE;
+                void run() {
+                    GTValues.RA.stdBuilder()
+                        .itemInputs(Materials.Iron.getDust(1))
+                        .itemOutputs(Materials.Steel.getDust(1))
+                        .metadata(UPGRADE, BIO)
+                        .duration(20).eut(2).addTo(RecipeMaps.pcbFactoryRecipes);
+                }
+            }
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let mut project = JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let recovery = recover_with_project(&analysis, &project);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let lowered = lower_recipe_with_project(recipe, &analysis.bindings, &project)
+            .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
+        assert_eq!(
+            lowered.requirements,
+            [RecipeRequirement::MinimumCapability {
+                capability: minecraft_redox_core::content::ContentId::new(
+                    "machine_capability.pcb_factory_bio_chamber"
+                ),
+                level: 1,
+            }]
+        );
         Ok(())
     }
 

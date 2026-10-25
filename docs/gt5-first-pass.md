@@ -740,3 +740,26 @@ Full GT5 result after this pass:
 - chance blockers: **50**.
 
 All 16 algae-pond recipes in the pinned corpus become fully lowerable.
+
+### PCB Factory BIO upgrade as a binary machine capability
+
+The PCB Factory `UPGRADE` metadata is now lowered through its final static alias to a normal machine capability. Source inspection shows only two upgrade values: `NONE` and `BIO`. `MTEPCBFactory` rejects a `BIO` recipe unless the bio chamber exists and is allowed to work, while `NONE` adds no recipe-side requirement. The target therefore represents `BIO` as `RecipeRequirement::MinimumCapability { capability: machine_capability.pcb_factory_bio_chamber, level: 1 }` rather than preserving the source enum or inventing a PCB-specific metadata bag.
+
+This pass also split metadata collection from metadata finalization. A `MetadataAccumulator` holds typed intermediate facts while `collect_metadata_entry` performs one-key dispatch, keeping the main lowerer small enough for the strict lint policy and making additional source-backed metadata families composable without growing another monolithic switch.
+
+The importer accepts the BIO upgrade only on `RecipeMaps.pcbFactoryRecipes`; unknown upgrade variants, dynamic values, and use on another map remain fail-closed.
+
+Full GT5 result after this pass:
+
+- target recipes lowered: **3,862 / 5,791 (66.69%)**, unchanged because BIO recipes still overlap PCB nanite-material semantics;
+- metadata blockers: **389**, down from 391;
+- modifier blockers: **6**;
+- item-input blockers: **1,218**;
+- item-output blockers: **961**;
+- fluid blockers: **457**;
+- non-constant EU/t blockers: **417**;
+- missing-duration blockers: **332**;
+- missing-EU/t blockers: **24**;
+- chance blockers: **50**.
+
+The remaining PCB-specific blocker is intentionally not flattened into a boolean requirement: tier-2/3 recipes name a required nanite material, and the count of matching nanites controls maximum parallelism. That belongs in an explicit machine-resource/capability primitive or runtime policy, not in the BIO flag.
