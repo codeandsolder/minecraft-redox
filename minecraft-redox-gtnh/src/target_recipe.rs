@@ -5,8 +5,8 @@ use minecraft_redox_core::{
     content::{
         ContentId, ContentRecipe, FluidInputSpec, FluidSelector, FluidStackSpec, ItemInputSpec,
         ItemInputStackSpec, ItemOutputSpec, ItemSelector, ItemStackSpec, Probability,
-        ProgressResourceSpec, RecipeAvailabilityRequirement, RecipeExecutionMode, RecipeProgress,
-        RecipeRequirement, RecipeUnlock,
+        ProgressResourceSpec, RecipeAvailabilityRequirement, RecipeExecutionMode,
+        RecipeInputConstraint, RecipeProgress, RecipeRequirement, RecipeUnlock,
     },
 };
 use minecraft_redox_java::{JavaBindings, JavaExpression, JavaProjectIndex};
@@ -154,16 +154,11 @@ fn lower_recipe_internal(
     };
 
     let (mut item_inputs, item_outputs) = lower_item_io(recipe, bindings, project, &mut blockers);
-    let fluid_inputs = lower_fluid_inputs(
-        &recipe.fluid_input_semantics,
+    let (fluid_inputs, fluid_outputs) = lower_fluid_io(
+        recipe,
         bindings,
         project,
-        &mut blockers,
-    );
-    let fluid_outputs = lower_fluid_outputs(
-        &recipe.fluid_output_semantics,
-        bindings,
-        project,
+        &lowered_metadata.input_constraints,
         &mut blockers,
     );
     apply_synthetic_recipe_transform(
@@ -189,6 +184,7 @@ fn lower_recipe_internal(
             item_outputs,
             fluid_inputs,
             fluid_outputs,
+            input_constraints: lowered_metadata.input_constraints,
             requirements: lowered_metadata.requirements,
             unlock: lowered_metadata.unlock,
             startup_energy_eu: lowered_metadata.startup_energy_eu,
@@ -400,6 +396,7 @@ struct LoweredMetadata {
     recipe_map_override: Option<ContentId>,
     synthetic_transform: Option<SyntheticRecipeTransform>,
     progress_override: Option<RecipeProgress>,
+    input_constraints: Vec<RecipeInputConstraint>,
 }
 
 #[derive(Default)]
@@ -416,6 +413,7 @@ struct MetadataAccumulator<'a> {
     arc_additive_amount: Option<(&'a crate::BuilderCall, &'a JavaExpression)>,
     environment_metadata: Vec<(&'a crate::BuilderCall, ContentId, &'a JavaExpression)>,
     progress_override: Option<RecipeProgress>,
+    input_constraints: Vec<RecipeInputConstraint>,
 }
 
 fn lower_metadata(
@@ -477,6 +475,7 @@ fn lower_metadata(
         recipe_map_override,
         synthetic_transform,
         progress_override: state.progress_override,
+        input_constraints: state.input_constraints,
     }
 }
 
@@ -527,6 +526,12 @@ fn collect_metadata_entry<'a>(
         }
     } else if key == "gregtech.api.util.GTRecipeConstants.FOUNDRY_MODULE" {
         lower_foundry_reference_metadata(recipe, call, value, bindings, blockers);
+    } else if key == "gregtech.api.util.GTRecipeConstants.DISSOLUTION_TANK_RATIO" {
+        if let Some(constraint) =
+            lower_dissolution_tank_ratio(recipe, call, value, bindings, project, blockers)
+        {
+            state.input_constraints.push(constraint);
+        }
     } else if key == "gregtech.api.util.GTRecipeConstants.FUSION_THRESHOLD" {
         if let Some(value) =
             lower_fusion_startup_energy(recipe, call, value, bindings, project, blockers)
@@ -565,6 +570,83 @@ fn collect_metadata_entry<'a>(
             RecipeLoweringBlockerKind::Metadata,
             format!("unsupported recipe metadata key: {key}"),
         );
+    }
+}
+
+fn lower_dissolution_tank_ratio(
+    recipe: &RecipeDefinition,
+    call: &crate::BuilderCall,
+    value: &JavaExpression,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+    blockers: &mut Vec<RecipeLoweringBlocker>,
+) -> Option<RecipeInputConstraint> {
+    const DISSOLUTION_MAP: &str =
+        "gtnhlanth.api.recipe.LanthanidesRecipeMaps.dissolutionTankRecipes";
+    if recipe.recipe_map != DISSOLUTION_MAP {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            format!(
+                "DISSOLUTION_TANK_RATIO used on unsupported recipe map {}",
+                recipe.recipe_map
+            ),
+        );
+        return None;
+    }
+    let Some(ratio) = positive_scalar(value, bindings, project) else {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            format!(
+                "DISSOLUTION_TANK_RATIO is not a positive static integer: {}",
+                call.arguments.join(", ")
+            ),
+        );
+        return None;
+    };
+    Some(RecipeInputConstraint::ExactFluidInventoryRatio {
+        left_input: 0,
+        right_input: 1,
+        left_units: ratio,
+        right_units: 1,
+    })
+}
+
+fn validate_input_constraints(
+    constraints: &[RecipeInputConstraint],
+    fluid_inputs: &[FluidInputSpec],
+    blockers: &mut Vec<RecipeLoweringBlocker>,
+) {
+    for constraint in constraints {
+        let RecipeInputConstraint::ExactFluidInventoryRatio {
+            left_input,
+            right_input,
+            ..
+        } = constraint;
+        let Some(left) = fluid_inputs.get(*left_input) else {
+            push_blocker(
+                blockers,
+                RecipeLoweringBlockerKind::Metadata,
+                "fluid inventory ratio refers to a missing left input",
+            );
+            continue;
+        };
+        let Some(right) = fluid_inputs.get(*right_input) else {
+            push_blocker(
+                blockers,
+                RecipeLoweringBlockerKind::Metadata,
+                "fluid inventory ratio refers to a missing right input",
+            );
+            continue;
+        };
+        if !matches!(left, FluidInputSpec::Stack(_)) || !matches!(right, FluidInputSpec::Stack(_)) {
+            push_blocker(
+                blockers,
+                RecipeLoweringBlockerKind::Metadata,
+                "fluid inventory ratio over alternative input selectors is not yet representable",
+            );
+        }
     }
 }
 
@@ -2464,6 +2546,21 @@ fn scalar_i64_optional(
     )
 }
 
+fn lower_fluid_io(
+    recipe: &RecipeDefinition,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+    constraints: &[RecipeInputConstraint],
+    blockers: &mut Vec<RecipeLoweringBlocker>,
+) -> (Vec<FluidInputSpec>, Vec<FluidStackSpec>) {
+    let fluid_inputs =
+        lower_fluid_inputs(&recipe.fluid_input_semantics, bindings, project, blockers);
+    let fluid_outputs =
+        lower_fluid_outputs(&recipe.fluid_output_semantics, bindings, project, blockers);
+    validate_input_constraints(constraints, &fluid_inputs, blockers);
+    (fluid_inputs, fluid_outputs)
+}
+
 fn lower_fluid_inputs(
     recovered: &[RecoveredExpression<FluidSemantic>],
     bindings: &JavaBindings,
@@ -2659,8 +2756,8 @@ fn push_blocker(
 mod tests {
     use minecraft_redox_core::content::{
         FluidInputSpec, FluidSelector, ItemInputSpec, ItemSelector, Probability,
-        RecipeAvailabilityRequirement, RecipeExecutionMode, RecipeProgress, RecipeRequirement,
-        RecipeUnlock,
+        RecipeAvailabilityRequirement, RecipeExecutionMode, RecipeInputConstraint, RecipeProgress,
+        RecipeRequirement, RecipeUnlock,
     };
     use minecraft_redox_java::{JavaExpression, JavaProjectIndex, analyze_source};
 
@@ -4510,6 +4607,89 @@ mod tests {
         let lowered = lower_recipe(recipe, &analysis.bindings)
             .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
         assert_eq!(lowered.execution_mode, RecipeExecutionMode::ReferenceOnly);
+        Ok(())
+    }
+
+    #[test]
+    fn lowers_dissolution_ratio_as_exact_fluid_inventory_constraint() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.util.GTRecipeConstants.DISSOLUTION_TANK_RATIO;
+            import static gtnhlanth.api.recipe.LanthanidesRecipeMaps.dissolutionTankRecipes;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .fluidInputs(Materials.Water.getFluid(10_000), Materials.NitricAcid.getFluid(1_000))
+                    .fluidOutputs(Materials.DilutedSulfuricAcid.getFluid(11_000))
+                    .metadata(DISSOLUTION_TANK_RATIO, 10)
+                    .duration(20).eut(32).addTo(dissolutionTankRecipes);
+            }}
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let mut project = JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let recovery = crate::recover_with_project(&analysis, &project);
+        let lowered = super::lower_recipe_with_project(
+            recovery
+                .recipes
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("recipe missing"))?,
+            &analysis.bindings,
+            &project,
+        )
+        .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
+        assert_eq!(lowered.input_constraints.len(), 1);
+        assert!(matches!(
+            lowered.input_constraints[0],
+            RecipeInputConstraint::ExactFluidInventoryRatio {
+                left_input: 0,
+                right_input: 1,
+                left_units: 10,
+                right_units: 1,
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn dissolution_ratio_wrong_map_or_dynamic_value_stays_blocked() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.util.GTRecipeConstants.DISSOLUTION_TANK_RATIO;
+            import static gtnhlanth.api.recipe.LanthanidesRecipeMaps.dissolutionTankRecipes;
+            import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            class Recipes {
+                void wrongMap() {
+                    GTValues.RA.stdBuilder()
+                        .fluidInputs(Materials.Water.getFluid(10), Materials.NitricAcid.getFluid(1))
+                        .metadata(DISSOLUTION_TANK_RATIO, 10)
+                        .duration(20).eut(2).addTo(compressorRecipes);
+                }
+                void dynamic(int ratio) {
+                    GTValues.RA.stdBuilder()
+                        .fluidInputs(Materials.Water.getFluid(10), Materials.NitricAcid.getFluid(1))
+                        .metadata(DISSOLUTION_TANK_RATIO, ratio)
+                        .duration(20).eut(2).addTo(dissolutionTankRecipes);
+                }
+            }
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let mut project = JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let recovery = crate::recover_with_project(&analysis, &project);
+        assert_eq!(recovery.recipes.len(), 2);
+        for recipe in &recovery.recipes {
+            let failure = super::lower_recipe_with_project(recipe, &analysis.bindings, &project)
+                .err()
+                .ok_or_else(|| anyhow::anyhow!("invalid dissolution ratio unexpectedly lowered"))?;
+            assert!(
+                failure
+                    .blockers
+                    .iter()
+                    .any(|blocker| blocker.kind == RecipeLoweringBlockerKind::Metadata)
+            );
+        }
         Ok(())
     }
 

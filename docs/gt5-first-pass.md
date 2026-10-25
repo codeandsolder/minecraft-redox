@@ -950,3 +950,38 @@ Full pinned-corpus result:
 - missing-EU/t blockers: **24**;
 - post-add blockers: **7**;
 - modifier blockers: **6**.
+
+
+### Exact fluid inventory ratios for dissolution recipes
+
+Target recipe IR now has source-independent input-inventory constraints. The first form is an exact relationship between aggregate fluid amounts available to two recipe input identities:
+
+```rust
+RecipeInputConstraint::ExactFluidInventoryRatio {
+    left_input,
+    right_input,
+    left_units,
+    right_units,
+}
+```
+
+The equality is `left_amount * right_units == right_amount * left_units`. This is deliberately about the machine's available input inventory at recipe start, not merely the nominal fluid quantities declared by the recipe.
+
+GTNH's Dissolution Tank is the first adapter. `MTEDissolutionTank.checkRatio` takes recipe fluid inputs 0 and 1, sums all machine fluid stacks whose unlocalized names match each input identity, and requires `majorAmount == minorAmount * mSpecialValue`. `DISSOLUTION_TANK_RATIO = R` therefore lowers to slots 0/1 with `left_units = R` and `right_units = 1`.
+
+The metadata is accepted only on `gtnhlanth.api.recipe.LanthanidesRecipeMaps.dissolutionTankRecipes`, only for a positive static integer ratio, and only while the referenced fluid slots lower to concrete stacks. Wrong maps, dynamic ratios, missing slots, and alternative fluid selectors remain fail-closed.
+
+Full pinned-corpus result:
+
+- target recipes lowered: **3,966 / 5,791 (68.49%)**, up from 3,957 / 5,791 (68.33%);
+- metadata blockers: **341**, down from 350;
+- fluid blockers: **388**;
+- item-input blockers: **1,218**;
+- item-output blockers: **961**;
+- non-constant EU/t blockers: **417**;
+- missing-duration blockers: **332**;
+- chance blockers: **50**;
+- special blockers: **31**;
+- missing-EU/t blockers: **24**;
+- post-add blockers: **7**;
+- modifier blockers: **6**.

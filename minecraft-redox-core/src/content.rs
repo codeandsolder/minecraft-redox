@@ -152,6 +152,21 @@ pub enum ItemInputSpec {
     Alternatives { choices: Vec<ItemInputStackSpec> },
 }
 
+/// A relationship that must hold over the machine input inventory when a recipe starts.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RecipeInputConstraint {
+    /// Aggregate available fluid matching the two recipe input slots must have this exact ratio.
+    ///
+    /// The equality is `left_amount * right_units == right_amount * left_units`.
+    ExactFluidInventoryRatio {
+        left_input: usize,
+        right_input: usize,
+        left_units: u64,
+        right_units: u64,
+    },
+}
+
 /// One source-independent requirement a machine must satisfy for a recipe.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -238,6 +253,7 @@ pub struct ContentRecipe {
     pub item_outputs: Vec<ItemOutputSpec>,
     pub fluid_inputs: Vec<FluidInputSpec>,
     pub fluid_outputs: Vec<FluidStackSpec>,
+    pub input_constraints: Vec<RecipeInputConstraint>,
     pub requirements: Vec<RecipeRequirement>,
     pub unlock: Option<RecipeUnlock>,
     /// One-time energy charged when the recipe starts, in EU.
