@@ -62,6 +62,15 @@ pub enum FluidSelector {
     FirstAvailable {
         choices: Vec<FluidSelector>,
     },
+    /// Select a fluid identity from content-module presence.
+    ///
+    /// Unlike `FirstAvailable`, this preserves source behavior where the branch is chosen by
+    /// module availability even if the preferred registry identity is absent.
+    ContentModuleConditional {
+        module: ContentId,
+        when_present: Box<FluidSelector>,
+        when_absent: Box<FluidSelector>,
+    },
 }
 
 /// Exact probability used by normalized content semantics.

@@ -3239,6 +3239,33 @@ fn lower_transparent_linked_fluid_helper(
             amount,
         });
     }
+    if let Some((module, preferred, fallback_material)) = match method_id {
+        "gregtech.api.util.GTModHandler#getIC2Coolant(long)" => Some((
+            "gregtech.api.enums.Mods.IndustrialCraft2",
+            "ic2coolant",
+            "gregtech.api.enums.Materials.Water",
+        )),
+        "gregtech.api.util.GTModHandler#getLiquidDNA(long)" => Some((
+            "gregtech.api.enums.Mods.Gendustry",
+            "liquiddna",
+            "gregtech.api.enums.Materials.Biomass",
+        )),
+        _ => None,
+    } {
+        return Some(FluidStackSpec {
+            selector: FluidSelector::ContentModuleConditional {
+                module: ContentId::new(module),
+                when_present: Box::new(FluidSelector::Named {
+                    id: ContentId::new(preferred),
+                }),
+                when_absent: Box::new(FluidSelector::MaterialForm {
+                    material: ContentId::new(fallback_material),
+                    form: ContentId::new("fluid"),
+                }),
+            },
+            amount,
+        });
+    }
     let fluid_id = match method_id {
         "gregtech.api.util.GTModHandler#getHotWater(int)" => "ic2hotwater",
         "gregtech.api.util.GTModHandler#getPahoehoeLava(int)" => "ic2pahoehoelava",
@@ -6032,7 +6059,7 @@ mod tests {
     }
 
     #[test]
-    fn mod_presence_gtmodhandler_fluid_fallbacks_stay_unresolved() -> anyhow::Result<()> {
+    fn lowers_mod_presence_gtmodhandler_fluid_fallbacks_conditionally() -> anyhow::Result<()> {
         let helper = analyze_source(
             "GTModHandler.java",
             "gt5",
@@ -6074,16 +6101,27 @@ mod tests {
         project.add_analysis(&analysis);
         let recovery = crate::recover_with_project(&analysis, &project);
         assert_eq!(recovery.recipes.len(), 2);
-        for recipe in &recovery.recipes {
-            let failure = super::lower_recipe_with_project(recipe, &analysis.bindings, &project)
-                .err()
-                .ok_or_else(|| anyhow::anyhow!("mod-presence fallback unexpectedly lowered"))?;
-            assert!(
-                failure
-                    .blockers
-                    .iter()
-                    .any(|blocker| blocker.kind == RecipeLoweringBlockerKind::Fluids)
-            );
+        let expected = [
+            ("gregtech.api.enums.Mods.IndustrialCraft2", "ic2coolant", "gregtech.api.enums.Materials.Water"),
+            ("gregtech.api.enums.Mods.Gendustry", "liquiddna", "gregtech.api.enums.Materials.Biomass"),
+        ];
+        for (recipe, (module_id, preferred_id, fallback_material)) in recovery.recipes.iter().zip(expected) {
+            let lowered = super::lower_recipe_with_project(recipe, &analysis.bindings, &project)
+                .map_err(|failure| anyhow::anyhow!("conditional fluid failed: {failure:?}"))?;
+            let FluidInputSpec::Stack(input) = &lowered.fluid_inputs[0] else {
+                return Err(anyhow::anyhow!("conditional fluid became alternatives"));
+            };
+            assert_eq!(input.amount, 1000);
+            let FluidSelector::ContentModuleConditional { module, when_present, when_absent } = &input.selector else {
+                return Err(anyhow::anyhow!("module fallback did not stay conditional"));
+            };
+            assert_eq!(module.as_str(), module_id);
+            assert!(matches!(when_present.as_ref(), FluidSelector::Named { id } if id.as_str() == preferred_id));
+            assert!(matches!(
+                when_absent.as_ref(),
+                FluidSelector::MaterialForm { material, form }
+                    if material.as_str() == fallback_material && form.as_str() == "fluid"
+            ));
         }
         Ok(())
     }

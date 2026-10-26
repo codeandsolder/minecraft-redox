@@ -1224,3 +1224,30 @@ Full pinned-corpus result:
 - missing-EU/t blockers: **24**;
 - post-add blockers: **7**;
 - modifier blockers: **6**.
+
+
+### Content-module conditional fluid identities
+
+`GTModHandler.getIC2Coolant(long)` and `GTModHandler.getLiquidDNA(long)` choose their returned fluid from source-module presence, not from registry lookup success. The target IR now represents that distinction directly with `FluidSelector::ContentModuleConditional` rather than approximating it as an ordered `FirstAvailable` fallback.
+
+Source-backed mappings:
+
+- IC2 present -> named `ic2coolant`; IC2 absent -> the `Water` fluid material form;
+- Gendustry present -> named `liquiddna`; Gendustry absent -> the `Biomass` fluid material form.
+
+The selector records the content-module identity together with explicit present/absent branches, so a runtime cannot silently substitute the fallback merely because the preferred registry fluid is missing. This differs intentionally from distilled water, whose source implementation really does probe the preferred registry identity and fall back when lookup returns null.
+
+Full pinned-corpus result:
+
+- target recipes lowered: **4,243 / 5,791 (73.27%)**, up from 4,218 / 5,791 (72.84%);
+- fluid blockers: **291**, down from 320;
+- item-input blockers: **1,086**;
+- item-output blockers: **945**;
+- metadata blockers: **331**;
+- non-constant EU/t blockers: **417**;
+- missing-duration blockers: **332**;
+- chance blockers: **50**;
+- special blockers: **31**;
+- missing-EU/t blockers: **24**;
+- post-add blockers: **7**;
+- modifier blockers: **6**.
