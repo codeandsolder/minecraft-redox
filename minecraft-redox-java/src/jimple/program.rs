@@ -210,14 +210,37 @@ impl fmt::Display for PathThrow {
 impl Error for PathThrow {}
 
 #[derive(Clone, Debug)]
+enum ExecutionHalt {
+    Reached(Frame),
+    Returned(Option<AbstractValue>),
+}
+
+#[derive(Clone, Debug)]
 enum PathOutcome {
-    Normal(Option<AbstractValue>),
+    Reached(Frame),
+    Returned(Option<AbstractValue>),
     Thrown(AbstractValue),
 }
 
-fn capture_path_outcome(result: Result<Option<AbstractValue>>) -> Result<PathOutcome> {
+#[derive(Clone, Debug)]
+enum BranchResolution {
+    Continue { frame: Frame, statement_id: usize },
+    Returned(Option<AbstractValue>),
+}
+
+struct BranchExploration<'a> {
+    merge: Option<usize>,
+    original_unresolved: Vec<AbstractArrayWrite>,
+    false_vm: ProgramVm<'a>,
+    false_result: PathOutcome,
+    true_vm: ProgramVm<'a>,
+    true_result: PathOutcome,
+}
+
+fn capture_path_outcome(result: Result<ExecutionHalt>) -> Result<PathOutcome> {
     match result {
-        Ok(value) => Ok(PathOutcome::Normal(value)),
+        Ok(ExecutionHalt::Reached(frame)) => Ok(PathOutcome::Reached(frame)),
+        Ok(ExecutionHalt::Returned(value)) => Ok(PathOutcome::Returned(value)),
         Err(error) => match error.downcast_ref::<PathThrow>() {
             Some(thrown) => Ok(PathOutcome::Thrown(thrown.0.clone())),
             None => Err(error),
@@ -254,7 +277,7 @@ impl<'a> ProgramVm<'a> {
             .statements
             .first()
             .with_context(|| format!("cannot execute empty method {}", method.display_signature))?;
-        self.execute_from(
+        match self.execute_until(
             method,
             Frame {
                 locals: BTreeMap::new(),
@@ -263,17 +286,27 @@ impl<'a> ProgramVm<'a> {
             },
             Some(first.id),
             depth,
-        )
+            None,
+        )? {
+            ExecutionHalt::Returned(value) => Ok(value),
+            ExecutionHalt::Reached(_) => {
+                bail!("method execution unexpectedly stopped at an internal CFG boundary")
+            }
+        }
     }
 
-    fn execute_from(
+    fn execute_until(
         &mut self,
         method: &JimpleMethod,
         mut frame: Frame,
         mut pc: Option<usize>,
         depth: usize,
-    ) -> Result<Option<AbstractValue>> {
+        stop_before: Option<usize>,
+    ) -> Result<ExecutionHalt> {
         while let Some(statement_id) = pc {
+            if stop_before == Some(statement_id) {
+                return Ok(ExecutionHalt::Reached(frame));
+            }
             if self.steps >= self.max_steps {
                 bail!(
                     "interprocedural Jimple execution exceeded {} steps",
@@ -312,15 +345,29 @@ impl<'a> ProgramVm<'a> {
                     if let Some(truth) = abstract_truth(&condition) {
                         pc = Some(if truth { *when_true } else { *when_false });
                     } else {
-                        return self
-                            .execute_unknown_branch(method, &frame, statement, &condition, depth);
+                        match self
+                            .execute_unknown_branch(method, &frame, statement, &condition, depth)?
+                        {
+                            BranchResolution::Continue {
+                                frame: joined_frame,
+                                statement_id,
+                            } => {
+                                frame = joined_frame;
+                                pc = Some(statement_id);
+                            }
+                            BranchResolution::Returned(value) => {
+                                return Ok(ExecutionHalt::Returned(value));
+                            }
+                        }
                     }
                 }
                 JimpleOperation::Goto => pc = Self::jump(statement)?,
                 JimpleOperation::Return { value } => {
-                    return self.evaluate(&mut frame, value, depth).map(Some);
+                    return self
+                        .evaluate(&mut frame, value, depth)
+                        .map(|value| ExecutionHalt::Returned(Some(value)));
                 }
-                JimpleOperation::ReturnVoid => return Ok(None),
+                JimpleOperation::ReturnVoid => return Ok(ExecutionHalt::Returned(None)),
                 JimpleOperation::Throw { value } => {
                     let value = self.evaluate(&mut frame, value, depth)?;
                     return Err(PathThrow(value).into());
@@ -354,7 +401,7 @@ impl<'a> ProgramVm<'a> {
                 }
             }
         }
-        Ok(None)
+        Ok(ExecutionHalt::Returned(None))
     }
 
     fn execute_unknown_branch(
@@ -364,7 +411,7 @@ impl<'a> ProgramVm<'a> {
         statement: &JimpleStatement,
         condition: &AbstractValue,
         depth: usize,
-    ) -> Result<Option<AbstractValue>> {
+    ) -> Result<BranchResolution> {
         let [when_false, when_true] = statement.successors.as_slice() else {
             bail!("if statement {} does not have two targets", statement.id);
         };
@@ -378,15 +425,23 @@ impl<'a> ProgramVm<'a> {
             );
         }
 
+        let merge = immediate_postdominator(method, statement_id);
         let base_steps = self.steps;
         let base_splits = self.path_splits;
         let original_unresolved = self.unresolved_array_writes.clone();
         let (false_vm, false_result) =
-            self.explore_branch(method, frame, *when_false, depth, self.state.next_id)?;
+            self.explore_branch(method, frame, *when_false, depth, self.state.next_id, merge)?;
         // Keep allocations made after the fork distinct across paths. Objects and arrays
-        // that existed before the fork retain their shared IDs.
-        let (true_vm, true_result) =
-            self.explore_branch(method, frame, *when_true, depth, false_vm.state.next_id)?;
+        // that existed before the fork retain their shared IDs. Shared post-dominator work
+        // is deliberately not executed here; it runs once after the branch states are joined.
+        let (true_vm, true_result) = self.explore_branch(
+            method,
+            frame,
+            *when_true,
+            depth,
+            false_vm.state.next_id,
+            merge,
+        )?;
         self.charge_branch_work(
             base_steps,
             base_splits,
@@ -396,28 +451,69 @@ impl<'a> ProgramVm<'a> {
             statement_id,
         )?;
 
-        match (false_result, true_result) {
-            (PathOutcome::Normal(false_return), PathOutcome::Normal(true_return)) => {
-                self.state = join_execution_states(&false_vm.state, &true_vm.state);
-                self.maps = join_maps(&false_vm.maps, &true_vm.maps);
-                self.unresolved_array_writes = original_unresolved;
-                extend_unique(
-                    &mut self.unresolved_array_writes,
-                    false_vm.unresolved_array_writes,
-                );
-                extend_unique(
-                    &mut self.unresolved_array_writes,
-                    true_vm.unresolved_array_writes,
-                );
-                self.exceptional_paths = false_vm.exceptional_paths;
+        self.resolve_branch_outcomes(
+            method,
+            statement_id,
+            BranchExploration {
+                merge,
+                original_unresolved,
+                false_vm,
+                false_result,
+                true_vm,
+                true_result,
+            },
+        )
+    }
+
+    fn resolve_branch_outcomes(
+        &mut self,
+        method: &JimpleMethod,
+        statement_id: usize,
+        exploration: BranchExploration<'a>,
+    ) -> Result<BranchResolution> {
+        let BranchExploration {
+            merge,
+            original_unresolved,
+            false_vm,
+            false_result,
+            true_vm,
+            true_result,
+        } = exploration;
+        match (merge, false_result, true_result) {
+            (Some(merge), PathOutcome::Reached(false_frame), PathOutcome::Reached(true_frame)) => {
+                self.adopt_joined_branches(&false_vm, &true_vm, &original_unresolved);
+                Ok(BranchResolution::Continue {
+                    frame: join_frames(&false_frame, &true_frame),
+                    statement_id: merge,
+                })
+            }
+            (Some(merge), PathOutcome::Reached(frame), PathOutcome::Thrown(thrown)) => {
+                self.adopt_normal_branch(false_vm, original_unresolved);
                 extend_unique(&mut self.exceptional_paths, true_vm.exceptional_paths);
+                extend_unique(&mut self.exceptional_paths, vec![thrown]);
+                Ok(BranchResolution::Continue {
+                    frame,
+                    statement_id: merge,
+                })
+            }
+            (Some(merge), PathOutcome::Thrown(thrown), PathOutcome::Reached(frame)) => {
+                self.adopt_normal_branch(true_vm, original_unresolved);
+                extend_unique(&mut self.exceptional_paths, false_vm.exceptional_paths);
+                extend_unique(&mut self.exceptional_paths, vec![thrown]);
+                Ok(BranchResolution::Continue {
+                    frame,
+                    statement_id: merge,
+                })
+            }
+            (_, PathOutcome::Returned(false_return), PathOutcome::Returned(true_return)) => {
+                self.adopt_joined_branches(&false_vm, &true_vm, &original_unresolved);
                 match (false_return, true_return) {
-                    (None, None) => Ok(None),
-                    (Some(left), Some(right)) => Ok(Some(join_value(
+                    (None, None) => Ok(BranchResolution::Returned(None)),
+                    (Some(left), Some(right)) => Ok(BranchResolution::Returned(Some(join_value(
                         &left,
                         &right,
                         &method.signature.return_type,
-                    ))),
+                    )))),
                     _ => bail!(
                         "unknown branch at {} statement {} has incompatible normal return shapes",
                         method.display_signature,
@@ -425,21 +521,30 @@ impl<'a> ProgramVm<'a> {
                     ),
                 }
             }
-            (PathOutcome::Normal(value), PathOutcome::Thrown(thrown)) => {
+            (_, PathOutcome::Returned(value), PathOutcome::Thrown(thrown)) => {
                 self.adopt_normal_branch(false_vm, original_unresolved);
                 extend_unique(&mut self.exceptional_paths, true_vm.exceptional_paths);
                 extend_unique(&mut self.exceptional_paths, vec![thrown]);
-                Ok(value)
+                Ok(BranchResolution::Returned(value))
             }
-            (PathOutcome::Thrown(thrown), PathOutcome::Normal(value)) => {
+            (_, PathOutcome::Thrown(thrown), PathOutcome::Returned(value)) => {
                 self.adopt_normal_branch(true_vm, original_unresolved);
                 extend_unique(&mut self.exceptional_paths, false_vm.exceptional_paths);
                 extend_unique(&mut self.exceptional_paths, vec![thrown]);
-                Ok(value)
+                Ok(BranchResolution::Returned(value))
             }
-            (PathOutcome::Thrown(left), PathOutcome::Thrown(right)) => {
+            (_, PathOutcome::Thrown(left), PathOutcome::Thrown(right)) => {
                 let thrown = join_value(&left, &right, "java.lang.Throwable");
                 Err(PathThrow(thrown).into())
+            }
+            (Some(_), PathOutcome::Reached(_), PathOutcome::Returned(_))
+            | (Some(_), PathOutcome::Returned(_), PathOutcome::Reached(_)) => bail!(
+                "post-dominator analysis disagreed with return flow at {} statement {}",
+                method.display_signature,
+                statement_id
+            ),
+            (None, PathOutcome::Reached(_), _) | (None, _, PathOutcome::Reached(_)) => {
+                bail!("branch execution reached a stop without a post-dominator")
             }
         }
     }
@@ -451,13 +556,44 @@ impl<'a> ProgramVm<'a> {
         start: usize,
         depth: usize,
         allocation_floor: u64,
+        stop_before: Option<usize>,
     ) -> Result<(ProgramVm<'a>, PathOutcome)> {
         let mut branch = self.clone();
         branch.state.next_id = branch.state.next_id.max(allocation_floor);
         branch.path_splits = branch.path_splits.saturating_add(1);
-        let outcome =
-            capture_path_outcome(branch.execute_from(method, frame.clone(), Some(start), depth))?;
+        let outcome = capture_path_outcome(branch.execute_until(
+            method,
+            frame.clone(),
+            Some(start),
+            depth,
+            stop_before,
+        ))?;
         Ok((branch, outcome))
+    }
+
+    fn adopt_joined_branches(
+        &mut self,
+        false_vm: &ProgramVm<'a>,
+        true_vm: &ProgramVm<'a>,
+        original_unresolved: &[AbstractArrayWrite],
+    ) {
+        self.state = join_execution_states(&false_vm.state, &true_vm.state);
+        self.maps = join_maps(&false_vm.maps, &true_vm.maps);
+        self.unresolved_array_writes = original_unresolved.to_vec();
+        extend_unique(
+            &mut self.unresolved_array_writes,
+            false_vm.unresolved_array_writes.clone(),
+        );
+        extend_unique(
+            &mut self.unresolved_array_writes,
+            true_vm.unresolved_array_writes.clone(),
+        );
+        self.exceptional_paths
+            .clone_from(&false_vm.exceptional_paths);
+        extend_unique(
+            &mut self.exceptional_paths,
+            true_vm.exceptional_paths.clone(),
+        );
     }
 
     fn charge_branch_work(
@@ -1226,6 +1362,131 @@ impl<'a> ProgramVm<'a> {
     }
 }
 
+fn immediate_postdominator(method: &JimpleMethod, statement_id: usize) -> Option<usize> {
+    const EXIT: usize = usize::MAX;
+
+    let ids: BTreeSet<_> = method
+        .statements
+        .iter()
+        .map(|statement| statement.id)
+        .collect();
+    if !ids.contains(&statement_id) {
+        return None;
+    }
+    let mut universe = ids.clone();
+    universe.insert(EXIT);
+    let mut postdominators: BTreeMap<usize, BTreeSet<usize>> = ids
+        .iter()
+        .copied()
+        .map(|id| (id, universe.clone()))
+        .collect();
+    postdominators.insert(EXIT, BTreeSet::from([EXIT]));
+
+    loop {
+        let mut changed = false;
+        for statement in method.statements.iter().rev() {
+            let successors: Vec<_> = if statement.successors.is_empty() {
+                vec![EXIT]
+            } else {
+                statement.successors.clone()
+            };
+            let mut intersection = universe.clone();
+            for successor in successors {
+                let successors_postdominators = postdominators.get(&successor)?;
+                intersection.retain(|candidate| successors_postdominators.contains(candidate));
+            }
+            intersection.insert(statement.id);
+            let previous = postdominators.get(&statement.id)?;
+            if previous != &intersection {
+                postdominators.insert(statement.id, intersection);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let strict: BTreeSet<_> = postdominators
+        .get(&statement_id)?
+        .iter()
+        .copied()
+        .filter(|candidate| *candidate != statement_id && *candidate != EXIT)
+        .collect();
+    strict.iter().copied().find(|candidate| {
+        strict.iter().all(|other| {
+            other == candidate
+                || !postdominators
+                    .get(other)
+                    .is_some_and(|other_set| other_set.contains(candidate))
+        })
+    })
+}
+
+fn join_frames(left: &Frame, right: &Frame) -> Frame {
+    let local_names: BTreeSet<_> = left
+        .locals
+        .keys()
+        .chain(right.locals.keys())
+        .cloned()
+        .collect();
+    let locals = local_names
+        .into_iter()
+        .map(|name| {
+            let value = join_optional_branch_value(
+                left.locals.get(&name),
+                right.locals.get(&name),
+                &format!("local {name}"),
+            )
+            .unwrap_or(AbstractValue::Unknown {
+                type_name: String::from("java.lang.Object"),
+                text: format!("branch-dependent local {name}"),
+            });
+            (name, value)
+        })
+        .collect();
+
+    let argument_count = left.arguments.len().max(right.arguments.len());
+    let arguments = (0..argument_count)
+        .map(|index| {
+            join_optional_branch_value(
+                left.arguments.get(index),
+                right.arguments.get(index),
+                &format!("argument {index}"),
+            )
+            .unwrap_or(AbstractValue::Unknown {
+                type_name: String::from("java.lang.Object"),
+                text: format!("branch-dependent argument {index}"),
+            })
+        })
+        .collect();
+
+    Frame {
+        locals,
+        this_value: join_optional_branch_value(
+            left.this_value.as_ref(),
+            right.this_value.as_ref(),
+            "this",
+        ),
+        arguments,
+    }
+}
+
+fn join_optional_branch_value(
+    left: Option<&AbstractValue>,
+    right: Option<&AbstractValue>,
+    description: &str,
+) -> Option<AbstractValue> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(join_value(left, right, &value_type_hint(left))),
+        (Some(value), None) | (None, Some(value)) => Some(AbstractValue::Unknown {
+            type_name: value_type_hint(value),
+            text: format!("{description} exists on only one branch"),
+        }),
+        (None, None) => None,
+    }
+}
+
 fn join_execution_states(left: &ExecutionState, right: &ExecutionState) -> ExecutionState {
     let next_id = left.next_id.max(right.next_id);
     ExecutionState {
@@ -1836,6 +2097,61 @@ mod tests {
             joined_box_value(&execution)?,
             &AbstractValue::Integer { value: 7 }
         );
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_branch_reconverges_before_shared_allocation() -> Result<()> {
+        let flag_field = field("demo.Config", "FLAG", "boolean");
+        let array_field = field("demo.Registry", "ARRAY", "int[]");
+        let array = local("array", "int[]");
+        let branch_condition = binary("!=", static_field(&flag_field), integer(0));
+        let run = method(
+            "demo.Registry",
+            "run",
+            vec![
+                statement(
+                    0,
+                    vec![1, 2],
+                    JimpleOperation::If {
+                        condition: branch_condition,
+                    },
+                ),
+                statement(1, vec![2], JimpleOperation::Goto),
+                statement(
+                    2,
+                    vec![3],
+                    JimpleOperation::Assign {
+                        left: array.clone(),
+                        right: value(
+                            JimpleValueKind::NewArray {
+                                element_type: String::from("int"),
+                                size: Box::new(integer(1)),
+                            },
+                            "int[]",
+                            "new int[1]",
+                        ),
+                    },
+                ),
+                statement(
+                    3,
+                    vec![4],
+                    JimpleOperation::Assign {
+                        left: static_field(&array_field),
+                        right: array,
+                    },
+                ),
+                statement(4, Vec::new(), JimpleOperation::ReturnVoid),
+            ],
+        );
+
+        let execution = JimpleProgram::new(vec![run])
+            .execute_named_sequence(&[("demo.Registry", "run")], 100)?;
+        assert!(matches!(
+            execution.static_field_value("demo.Registry", "ARRAY"),
+            Some(AbstractValue::ArrayRef { element_type, .. }) if element_type == "int"
+        ));
+        assert_eq!(execution.arrays.len(), 1);
         Ok(())
     }
 
