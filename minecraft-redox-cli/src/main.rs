@@ -7,7 +7,8 @@ use std::{
 use anyhow::{Context, Result, bail};
 use minecraft_redox_gtnh::{GtnhSummary, lower_recipe_with_project, recover_with_project};
 use minecraft_redox_java::{
-    JavaProjectIndex, analyze_source, inventory_source, jimple::parse_methods,
+    JavaProjectIndex, analyze_source, inventory_source,
+    jimple::{JimpleProgram, parse_methods},
 };
 use rayon::prelude::*;
 use serde::Serialize;
@@ -52,10 +53,30 @@ fn main() -> Result<()> {
         [_, command, path, method, owner, field] if command == "jimple-execute-array" => {
             print_jimple_execute_array(path, method, owner, field)
         }
+        [_, command, path, sequence] if command == "jimple-program" => {
+            print_jimple_program(path, sequence)
+        }
         _ => bail!(
-            "usage: minecraft-redox [inventory|chains] <java-file> | gtnh [--summary|--blockers] <file-or-dir> | jimple-slice <json> <method-substring> <sink-substring> | jimple-execute-array <json> <method-substring> <field-owner> <field-name>"
+            "usage: minecraft-redox [inventory|chains] <java-file> | gtnh [--summary|--blockers] <file-or-dir> | jimple-slice <json> <method-substring> <sink-substring> | jimple-execute-array <json> <method-substring> <field-owner> <field-name> | jimple-program <json> <owner::method,...>"
         ),
     }
+}
+
+fn print_jimple_program(path: &str, sequence: &str) -> Result<()> {
+    let json = fs::read_to_string(path).with_context(|| format!("failed to read {path}"))?;
+    let methods = parse_methods(&json)?;
+    let program = JimpleProgram::new(methods);
+    let parsed: Vec<_> = sequence
+        .split(',')
+        .map(|entry| {
+            entry
+                .rsplit_once("::")
+                .with_context(|| format!("invalid method entry {entry:?}; expected owner::method"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let execution = program.execute_named_sequence(&parsed, 100_000)?;
+    println!("{}", serde_json::to_string_pretty(&execution)?);
+    Ok(())
 }
 
 fn print_jimple_execute_array(

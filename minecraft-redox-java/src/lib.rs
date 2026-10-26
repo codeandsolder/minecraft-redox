@@ -528,8 +528,10 @@ impl JavaProjectIndex {
                 when_false,
                 ..
             } => {
-                let true_type = self.expression_type_at(path, byte_position, when_true, bindings)?;
-                let false_type = self.expression_type_at(path, byte_position, when_false, bindings)?;
+                let true_type =
+                    self.expression_type_at(path, byte_position, when_true, bindings)?;
+                let false_type =
+                    self.expression_type_at(path, byte_position, when_false, bindings)?;
                 (true_type == false_type).then_some(true_type)
             }
             JavaExpression::Parenthesized(inner) => {
@@ -2492,22 +2494,26 @@ mod tests {
             .collect();
         assert_eq!(calls.len(), 2);
         assert_eq!(
-            index.qualified_field_reference_at(
-                "Recipe.java",
-                calls[0].byte_start,
-                "Lubricant",
-                &analysis.bindings,
-            ).as_deref(),
+            index
+                .qualified_field_reference_at(
+                    "Recipe.java",
+                    calls[0].byte_start,
+                    "Lubricant",
+                    &analysis.bindings,
+                )
+                .as_deref(),
             Some("demo.Registry.Lubricant")
         );
-        assert!(index
-            .qualified_field_reference_at(
-                "Recipe.java",
-                calls[1].byte_start,
-                "Lubricant",
-                &analysis.bindings,
-            )
-            .is_none());
+        assert!(
+            index
+                .qualified_field_reference_at(
+                    "Recipe.java",
+                    calls[1].byte_start,
+                    "Lubricant",
+                    &analysis.bindings,
+                )
+                .is_none()
+        );
         Ok(())
     }
 
@@ -2643,9 +2649,11 @@ mod tests {
             .stable_enhanced_for_elements_at("Recipe.java", calls[0].byte_start, "item")
             .ok_or_else(|| anyhow::anyhow!("stable enhanced-for values missing"))?;
         assert_eq!(values.len(), 2);
-        assert!(index
-            .stable_enhanced_for_elements_at("Recipe.java", calls[1].byte_start, "item")
-            .is_none());
+        assert!(
+            index
+                .stable_enhanced_for_elements_at("Recipe.java", calls[1].byte_start, "item")
+                .is_none()
+        );
         Ok(())
     }
 

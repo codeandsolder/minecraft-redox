@@ -43,11 +43,15 @@ The prototype has been exercised against compiled `GT5-Unofficial` bytecode and 
 - the bounded loop that constructs every `Loaders.NeutronAccelerators[i]`, and
 - the Transcendent Plasma Mixer dataflow from opaque recipe metadata plus recipe fields to stored energy, followed by the wireless balance mutation and explicit zeroing of calculated EU/t.
 
-The Rust side now consumes this structure directly. It has two generic analysis modes:
+The Rust side now consumes this structure directly. It has three generic analysis modes:
 
-- backward provenance slicing plus symbolic expression reconstruction, and
-- bounded finite execution over concrete integer control flow, allocations, object constructors, arrays, field writes and opaque symbolic calls.
+- backward provenance slicing plus symbolic expression reconstruction,
+- bounded finite execution over concrete integer control flow, allocations, object constructors, arrays, field writes and opaque symbolic calls, and
+- interprocedural execution over multiple Jimple classes in one shared abstract JVM state, including modeled JDK map operations and reference-preserving casts.
 
-As a real-corpus acceptance test, the finite executor runs `Loaders.GTMetaTileRegister()` without GoodGenerator-specific rules and materializes exactly 13 writes to `Loaders.NeutronAccelerators[0..12]`. Each entry retains its distinct `MTENeutronAccelerator` allocation, constructor tier argument `0..12`, and `getStackForm(1)` result.
+Real-corpus acceptance tests currently include:
 
-The next frontier is interprocedural execution and generic models for common JDK collection behavior so registry maps such as `LanthItemList.maskMap` can be materialized in the same way.
+- `Loaders.GTMetaTileRegister()` materializes exactly 13 writes to `Loaders.NeutronAccelerators[0..12]` without GoodGenerator-specific rules. Each entry retains its distinct `MTENeutronAccelerator` allocation, constructor tier argument `0..12`, and `getStackForm(1)` result.
+- `MaskList.<clinit>()` + `LanthItemList.<clinit>()` + `LanthItemList.registerTypical()` executes 3,316 statements and materializes all 34 `maskMap` entries without Lanthanides-specific rules. Every key retains identity with its `MaskList` static enum field; e.g. `BLANK1` maps to a distinct `ItemPhotolithographicMask("blank1", "VISIBLE")` allocation.
+
+The next frontier is executing recipe-builder implementations themselves, so recipe registration can be recovered from object state and call effects rather than source-level builder vocabulary.

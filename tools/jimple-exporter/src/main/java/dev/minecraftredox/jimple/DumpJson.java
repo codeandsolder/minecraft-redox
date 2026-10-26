@@ -12,10 +12,13 @@ import sootup.core.graph.ControlFlowGraph;
 import sootup.core.inputlocation.AnalysisInputLocation;
 import sootup.core.jimple.common.Local;
 import sootup.core.jimple.common.Value;
+import sootup.core.jimple.common.constant.ClassConstant;
 import sootup.core.jimple.common.constant.DoubleConstant;
 import sootup.core.jimple.common.constant.FloatConstant;
 import sootup.core.jimple.common.constant.IntConstant;
 import sootup.core.jimple.common.constant.LongConstant;
+import sootup.core.jimple.common.constant.MethodHandle;
+import sootup.core.jimple.common.constant.MethodType;
 import sootup.core.jimple.common.constant.NullConstant;
 import sootup.core.jimple.common.constant.StringConstant;
 import sootup.core.jimple.common.expr.AbstractBinopExpr;
@@ -42,7 +45,9 @@ import sootup.core.jimple.common.stmt.JIfStmt;
 import sootup.core.jimple.common.stmt.JInvokeStmt;
 import sootup.core.jimple.common.stmt.JReturnStmt;
 import sootup.core.jimple.common.stmt.JReturnVoidStmt;
+import sootup.core.jimple.common.stmt.JThrowStmt;
 import sootup.core.jimple.common.stmt.Stmt;
+import sootup.core.jimple.javabytecode.stmt.JSwitchStmt;
 import sootup.core.model.Body;
 import sootup.core.model.SootClass;
 import sootup.core.model.SootMethod;
@@ -93,7 +98,7 @@ public final class DumpJson {
             row.put("def", statement.getDef().map(Object::toString).orElse(null));
             row.put("uses", statement.getUses().stream().map(DumpJson::valueSummary).toList());
             row.put("successors", cfg.successors(statement).stream().map(ids::get).toList());
-            row.put("operation", statement(statement));
+            row.put("operation", statement(statement, body, ids));
             encoded.add(row);
         }
         Map<String, Object> result = new LinkedHashMap<>();
@@ -103,7 +108,7 @@ public final class DumpJson {
         return result;
     }
 
-    private static Object statement(Stmt statement) {
+    private static Object statement(Stmt statement, Body body, Map<Stmt, Integer> ids) {
         Map<String, Object> result = new LinkedHashMap<>();
         if (statement instanceof JAssignStmt assign) {
             result.put("kind", "assign");
@@ -124,6 +129,23 @@ public final class DumpJson {
             result.put("value", value(returned.getOp()));
         } else if (statement instanceof JReturnVoidStmt) {
             result.put("kind", "return_void");
+        } else if (statement instanceof JThrowStmt thrown) {
+            result.put("kind", "throw");
+            result.put("value", value(thrown.getOp()));
+        } else if (statement instanceof JSwitchStmt switched) {
+            result.put("kind", "switch");
+            result.put("key", value(switched.getKey()));
+            List<Stmt> targets = switched.getTargetStmts(body);
+            List<Object> cases = new ArrayList<>();
+            List<IntConstant> values = switched.getValues();
+            for (int index = 0; index < values.size(); index++) {
+                Map<String, Object> branch = new LinkedHashMap<>();
+                branch.put("value", values.get(index).getValue());
+                branch.put("target", ids.get(targets.get(index)));
+                cases.add(branch);
+            }
+            result.put("cases", cases);
+            result.put("default_target", switched.getDefaultTarget(body).map(ids::get).orElse(null));
         } else if (statement instanceof JGotoStmt) {
             result.put("kind", "goto");
         } else {
@@ -164,6 +186,21 @@ public final class DumpJson {
         } else if (value instanceof StringConstant constant) {
             result.put("kind", "string_constant");
             result.put("value", constant.getValue());
+        } else if (value instanceof ClassConstant constant) {
+            result.put("kind", "class_constant");
+            result.put("class_type", decodeClassConstant(constant.getValue()));
+        } else if (value instanceof MethodHandle handle
+                && handle.isMethodRef()
+                && handle.getReferenceSignature() instanceof MethodSignature signature) {
+            result.put("kind", "method_handle");
+            result.put("handle_kind", handle.getKind().toString());
+            result.put("method", methodSignature(signature));
+        } else if (value instanceof MethodType methodType) {
+            result.put("kind", "method_type");
+            result.put("return_type", methodType.getReturnType().toString());
+            result.put(
+                    "parameter_types",
+                    methodType.getParameterTypes().stream().map(Object::toString).toList());
         } else if (value instanceof NullConstant) {
             result.put("kind", "null_constant");
         } else if (value instanceof JParameterRef parameter) {
@@ -240,6 +277,27 @@ public final class DumpJson {
         result.put("name", signature.getName());
         result.put("type", signature.getType().toString());
         return result;
+    }
+
+    private static String decodeClassConstant(String descriptor) {
+        if (descriptor.startsWith("[")) {
+            return switch (descriptor.charAt(1)) {
+                case 'L' -> decodeClassConstant(descriptor.substring(1)) + "[]";
+                case 'Z' -> "boolean[]";
+                case 'B' -> "byte[]";
+                case 'C' -> "char[]";
+                case 'S' -> "short[]";
+                case 'I' -> "int[]";
+                case 'J' -> "long[]";
+                case 'F' -> "float[]";
+                case 'D' -> "double[]";
+                default -> descriptor;
+            };
+        }
+        if (descriptor.startsWith("L") && descriptor.endsWith(";")) {
+            return descriptor.substring(1, descriptor.length() - 1).replace('/', '.');
+        }
+        return descriptor.replace('/', '.');
     }
 
     private static Object methodSignature(MethodSignature signature) {

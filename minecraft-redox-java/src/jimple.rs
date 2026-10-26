@@ -9,6 +9,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+mod program;
+pub use program::{
+    AbstractMapEntry, AbstractMapSnapshot, AbstractStaticFieldValue, JimpleProgram,
+    ProgramExecution,
+};
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
 pub struct JimpleFieldSignature {
     pub owner: String,
@@ -76,6 +82,17 @@ pub enum JimpleValueKind {
     StringConstant {
         value: String,
     },
+    ClassConstant {
+        class_type: String,
+    },
+    MethodHandle {
+        handle_kind: String,
+        method: JimpleMethodSignature,
+    },
+    MethodType {
+        return_type: String,
+        parameter_types: Vec<String>,
+    },
     NullConstant,
     Parameter {
         index: usize,
@@ -135,6 +152,12 @@ pub enum JimpleValueKind {
     Opaque,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct JimpleSwitchCase {
+    pub value: i64,
+    pub target: usize,
+}
+
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum JimpleOperation {
@@ -156,6 +179,14 @@ pub enum JimpleOperation {
         value: JimpleValue,
     },
     ReturnVoid,
+    Throw {
+        value: JimpleValue,
+    },
+    Switch {
+        key: JimpleValue,
+        cases: Vec<JimpleSwitchCase>,
+        default_target: usize,
+    },
     Goto,
     Opaque,
 }
@@ -451,7 +482,10 @@ fn operation_inputs_before<'a>(
         JimpleOperation::Invoke {
             expression: Some(expression),
         } => pending.push((before_id, expression)),
-        JimpleOperation::Return { value } => pending.push((before_id, value)),
+        JimpleOperation::Return { value } | JimpleOperation::Throw { value } => {
+            pending.push((before_id, value));
+        }
+        JimpleOperation::Switch { key, .. } => pending.push((before_id, key)),
         JimpleOperation::Invoke { expression: None }
         | JimpleOperation::ReturnVoid
         | JimpleOperation::Goto
@@ -512,6 +546,9 @@ fn value_children(value: &JimpleValue) -> Vec<&JimpleValue> {
         | JimpleValueKind::IntegerConstant { .. }
         | JimpleValueKind::FloatConstant { .. }
         | JimpleValueKind::StringConstant { .. }
+        | JimpleValueKind::ClassConstant { .. }
+        | JimpleValueKind::MethodHandle { .. }
+        | JimpleValueKind::MethodType { .. }
         | JimpleValueKind::NullConstant
         | JimpleValueKind::Parameter { .. }
         | JimpleValueKind::This
@@ -567,6 +604,25 @@ pub enum AbstractValue {
     },
     String {
         value: String,
+    },
+    Class {
+        class_type: String,
+    },
+    BigInteger {
+        decimal: String,
+    },
+    MethodHandle {
+        handle_kind: String,
+        method: JimpleMethodSignature,
+    },
+    Lambda {
+        handle_kind: String,
+        target: JimpleMethodSignature,
+        captures: Vec<AbstractValue>,
+    },
+    Sequence {
+        element_type: String,
+        values: Vec<AbstractValue>,
     },
     Null,
     Parameter {
@@ -659,6 +715,7 @@ pub struct AbstractObjectSnapshot {
     pub id: u64,
     pub class_type: String,
     pub constructor: Option<AbstractInvocation>,
+    pub fields_may_be_opaque: bool,
     pub fields: Vec<AbstractFieldValue>,
 }
 
@@ -697,6 +754,7 @@ struct MutableArray {
 struct MutableObject {
     class_type: String,
     constructor: Option<AbstractInvocation>,
+    fields_may_be_opaque: bool,
     fields: BTreeMap<JimpleFieldSignature, AbstractValue>,
 }
 
@@ -764,6 +822,25 @@ impl ExecutionState {
                 Ok(None)
             }
             JimpleOperation::ReturnVoid => Ok(None),
+            JimpleOperation::Throw { value } => {
+                let value = self.evaluate(value);
+                bail!("finite Jimple execution threw {value:?}")
+            }
+            JimpleOperation::Switch {
+                key,
+                cases,
+                default_target,
+            } => {
+                let AbstractValue::Integer { value } = self.evaluate(key) else {
+                    bail!("finite Jimple switch key is not concrete")
+                };
+                Ok(Some(
+                    cases
+                        .iter()
+                        .find(|case| case.value == value)
+                        .map_or(*default_target, |case| case.target),
+                ))
+            }
             JimpleOperation::Opaque => {
                 bail!(
                     "cannot finitely execute opaque Jimple statement {}",
@@ -861,6 +938,16 @@ impl ExecutionState {
             JimpleValueKind::StringConstant { value } => AbstractValue::String {
                 value: value.clone(),
             },
+            JimpleValueKind::ClassConstant { class_type } => AbstractValue::Class {
+                class_type: class_type.clone(),
+            },
+            JimpleValueKind::MethodHandle {
+                handle_kind,
+                method,
+            } => AbstractValue::MethodHandle {
+                handle_kind: handle_kind.clone(),
+                method: method.clone(),
+            },
             JimpleValueKind::NullConstant => AbstractValue::Null,
             JimpleValueKind::Parameter { index } => AbstractValue::Parameter {
                 index: *index,
@@ -901,12 +988,6 @@ impl ExecutionState {
             JimpleValueKind::NewArray { element_type, size } => {
                 self.allocate_array(element_type, size)
             }
-            JimpleValueKind::NewMultiArray { .. } | JimpleValueKind::Phi { .. } => {
-                AbstractValue::Unknown {
-                    type_name: value.type_name.clone(),
-                    text: value.text.clone(),
-                }
-            }
             JimpleValueKind::Invoke {
                 invoke_kind,
                 method,
@@ -914,7 +995,10 @@ impl ExecutionState {
                 arguments,
                 ..
             } => self.evaluate_invoke(invoke_kind, method, base.as_deref(), arguments),
-            JimpleValueKind::Opaque => AbstractValue::Unknown {
+            JimpleValueKind::NewMultiArray { .. }
+            | JimpleValueKind::Phi { .. }
+            | JimpleValueKind::MethodType { .. }
+            | JimpleValueKind::Opaque => AbstractValue::Unknown {
                 type_name: value.type_name.clone(),
                 text: value.text.clone(),
             },
@@ -928,12 +1012,14 @@ impl ExecutionState {
     ) -> AbstractValue {
         let base = self.evaluate(base);
         if let AbstractValue::ObjectRef { id, .. } = &base
-            && let Some(value) = self
-                .objects
-                .get(id)
-                .and_then(|object| object.fields.get(field))
+            && let Some(object) = self.objects.get(id)
         {
-            return value.clone();
+            if let Some(value) = object.fields.get(field) {
+                return value.clone();
+            }
+            if !object.fields_may_be_opaque {
+                return abstract_default_value(&field.type_name);
+            }
         }
         AbstractValue::InstanceField {
             base: Box::new(base),
@@ -946,12 +1032,21 @@ impl ExecutionState {
         let index = self.evaluate(index);
         if let AbstractValue::Integer { value: integer } = index
             && let Some(identity) = abstract_array_identity(&base)
-            && let Some(value) = self
-                .arrays
-                .get(&identity)
-                .and_then(|array| array.entries.get(&integer))
+            && let Some(array) = self.arrays.get(&identity)
         {
-            return value.clone();
+            if let Some(value) = array.entries.get(&integer) {
+                return value.clone();
+            }
+            if let (
+                AbstractArrayIdentity::Allocated { .. },
+                AbstractValue::ArrayRef { element_type, .. },
+                Some(length),
+                Ok(index),
+            ) = (&identity, &base, array.length, usize::try_from(integer))
+                && index < length
+            {
+                return abstract_default_value(element_type);
+            }
         }
         AbstractValue::ArrayElement {
             base: Box::new(base),
@@ -992,6 +1087,7 @@ impl ExecutionState {
             MutableObject {
                 class_type: class_type.to_owned(),
                 constructor: None,
+                fields_may_be_opaque: false,
                 fields: BTreeMap::new(),
             },
         );
@@ -1038,10 +1134,15 @@ impl ExecutionState {
             if let Some(AbstractValue::ObjectRef { id, .. }) = &base
                 && let Some(object) = self.objects.get_mut(id)
             {
-                object.constructor = Some(AbstractInvocation {
-                    method: method.clone(),
-                    arguments,
-                });
+                if object.constructor.is_none() {
+                    object.constructor = Some(AbstractInvocation {
+                        method: method.clone(),
+                        arguments,
+                    });
+                }
+                if method.owner != "java.lang.Object" {
+                    object.fields_may_be_opaque = true;
+                }
             }
             return base.unwrap_or(AbstractValue::Null);
         }
@@ -1073,6 +1174,7 @@ impl ExecutionState {
                 id,
                 class_type: object.class_type,
                 constructor: object.constructor,
+                fields_may_be_opaque: object.fields_may_be_opaque,
                 fields: object
                     .fields
                     .into_iter()
@@ -1085,6 +1187,16 @@ impl ExecutionState {
             arrays,
             objects,
         }
+    }
+}
+
+fn abstract_default_value(type_name: &str) -> AbstractValue {
+    match type_name {
+        "boolean" | "byte" | "char" | "short" | "int" | "long" => {
+            AbstractValue::Integer { value: 0 }
+        }
+        "float" | "double" => AbstractValue::Float { value: 0.0 },
+        _ => AbstractValue::Null,
     }
 }
 
@@ -1111,6 +1223,10 @@ fn abstract_cast(type_name: &str, value: AbstractValue) -> AbstractValue {
             value: java_integer_cast(type_name, value),
         },
         AbstractValue::Float { value } => AbstractValue::Float { value },
+        value @ (AbstractValue::ObjectRef { .. }
+        | AbstractValue::ArrayRef { .. }
+        | AbstractValue::String { .. }
+        | AbstractValue::Null) => value,
         other => AbstractValue::Cast {
             type_name: type_name.to_owned(),
             value: Box::new(other),
@@ -1177,11 +1293,55 @@ fn abstract_binary(
     {
         return AbstractValue::Integer { value };
     }
+    if matches!(operator, "==" | "!=")
+        && let Some(equal) = abstract_reference_equal(&left, &right)
+    {
+        return AbstractValue::Integer {
+            value: i64::from(if operator == "==" { equal } else { !equal }),
+        };
+    }
     AbstractValue::Binary {
         operator: operator.to_owned(),
         left: Box::new(left),
         right: Box::new(right),
     }
+}
+
+fn abstract_reference_equal(left: &AbstractValue, right: &AbstractValue) -> Option<bool> {
+    if matches!(left, AbstractValue::Null) {
+        return Some(matches!(right, AbstractValue::Null));
+    }
+    if matches!(right, AbstractValue::Null) {
+        return abstract_definitely_non_null(left).then_some(false);
+    }
+    match (left, right) {
+        (AbstractValue::ObjectRef { id: left, .. }, AbstractValue::ObjectRef { id: right, .. })
+        | (AbstractValue::ArrayRef { id: left, .. }, AbstractValue::ArrayRef { id: right, .. }) => {
+            Some(left == right)
+        }
+        (AbstractValue::ObjectRef { .. }, AbstractValue::ArrayRef { .. })
+        | (AbstractValue::ArrayRef { .. }, AbstractValue::ObjectRef { .. }) => Some(false),
+        (AbstractValue::String { value: left }, AbstractValue::String { value: right })
+        | (AbstractValue::Class { class_type: left }, AbstractValue::Class { class_type: right }) => {
+            Some(left == right)
+        }
+        _ => None,
+    }
+}
+
+fn abstract_definitely_non_null(value: &AbstractValue) -> bool {
+    matches!(
+        value,
+        AbstractValue::ObjectRef { .. }
+            | AbstractValue::ArrayRef { .. }
+            | AbstractValue::String { .. }
+            | AbstractValue::Class { .. }
+            | AbstractValue::BigInteger { .. }
+            | AbstractValue::MethodHandle { .. }
+            | AbstractValue::Lambda { .. }
+            | AbstractValue::Sequence { .. }
+            | AbstractValue::This { .. }
+    )
 }
 
 fn integer_binary(operator: &str, left: i64, right: i64, type_name: &str) -> Option<i64> {
@@ -1443,6 +1603,65 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    #[test]
+    fn models_jvm_zero_and_null_defaults() {
+        assert_eq!(
+            super::abstract_default_value("boolean"),
+            super::AbstractValue::Integer { value: 0 }
+        );
+        assert_eq!(
+            super::abstract_default_value("long"),
+            super::AbstractValue::Integer { value: 0 }
+        );
+        assert_eq!(
+            super::abstract_default_value("double"),
+            super::AbstractValue::Float { value: 0.0 }
+        );
+        assert_eq!(
+            super::abstract_default_value("demo.Reference"),
+            super::AbstractValue::Null
+        );
+    }
+
+    #[test]
+    fn compares_concrete_reference_identity_and_nulls() {
+        let first = super::AbstractValue::ObjectRef {
+            id: 7,
+            class_type: String::from("demo.Value"),
+        };
+        let same = first.clone();
+        let other = super::AbstractValue::ObjectRef {
+            id: 8,
+            class_type: String::from("demo.Value"),
+        };
+        assert_eq!(
+            super::abstract_binary("==", first.clone(), same, "boolean"),
+            super::AbstractValue::Integer { value: 1 }
+        );
+        assert_eq!(
+            super::abstract_binary("==", first.clone(), other, "boolean"),
+            super::AbstractValue::Integer { value: 0 }
+        );
+        assert_eq!(
+            super::abstract_binary("!=", first, super::AbstractValue::Null, "boolean"),
+            super::AbstractValue::Integer { value: 1 }
+        );
+    }
+
+    #[test]
+    fn reference_cast_preserves_array_identity() {
+        let value = super::AbstractValue::ArrayRef {
+            id: 7,
+            element_type: String::from("demo.Value"),
+        };
+        let cast = super::abstract_cast("demo.Value[]", value.clone());
+        assert_eq!(cast, value);
+        assert_eq!(
+            super::abstract_array_identity(&cast),
+            Some(super::AbstractArrayIdentity::Allocated { id: 7 })
+        );
     }
 
     #[test]
