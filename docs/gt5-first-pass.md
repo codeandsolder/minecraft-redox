@@ -1439,3 +1439,15 @@ Full pinned-corpus result:
 - target recipes lowered: **4,422 / 5,791 (76.36%)**, up from 4,420 / 5,791 (76.33%);
 - metadata blockers: **219**, down from 221;
 - all other blocker-category recipe counts are unchanged.
+
+### Centrifuge heavy-mode requirement
+
+`CentrifugeRecipeKey.INSTANCE` is a boolean machine-mode gate on `centrifugeNonCellRecipes`: ordinary Industrial Centrifuges explicitly reject marked recipes, while the Spinmatron accepts them only in heavy mode (`mode == 2`).
+
+The target now represents `true` as `ExactCapability { capability: machine_capability.centrifuge_heavy_mode, level: 1 }`. `false` clears the requirement to preserve metadata last-write-wins behavior. The key is accepted only on the shared non-cell centrifuge map and only for static booleans; dynamic values and wrong-map uses remain fail-closed.
+
+Full pinned-corpus result:
+
+- target recipes lowered: **4,424 / 5,791 (76.40%)**, up from 4,422 / 5,791 (76.36%);
+- metadata blockers: **217**, down from 219;
+- all other blocker-category recipe counts are unchanged.

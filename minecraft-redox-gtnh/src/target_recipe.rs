@@ -646,6 +646,8 @@ fn collect_metadata_entry<'a>(
             &mut state.minimum_capabilities,
             blockers,
         );
+    } else if key == "gregtech.api.recipe.metadata.CentrifugeRecipeKey.INSTANCE" {
+        lower_centrifuge_heavy_mode(recipe, call, value, &mut state.exact_capabilities, blockers);
     } else if key == "gregtech.api.recipe.RecipeMaps.BEAMCRAFTER_METADATA" {
         if let Some(progress) =
             lower_beamcrafter_progress(recipe, call, value, bindings, project, blockers)
@@ -2147,6 +2149,44 @@ fn special_value_alias_overrides_environment(
                 | "gregtech.api.util.GTRecipeConstants.RESEARCH_STATION_DATA"
         )
     })
+}
+
+fn lower_centrifuge_heavy_mode(
+    recipe: &RecipeDefinition,
+    call: &crate::BuilderCall,
+    value: &JavaExpression,
+    exact_capabilities: &mut BTreeMap<ContentId, u64>,
+    blockers: &mut Vec<RecipeLoweringBlocker>,
+) {
+    const MAP: &str = "gregtech.api.recipe.RecipeMaps.centrifugeNonCellRecipes";
+    const CAPABILITY: &str = "machine_capability.centrifuge_heavy_mode";
+    if recipe.recipe_map != MAP {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            format!(
+                "centrifuge heavy-mode requirement used on unsupported recipe map {}",
+                recipe.recipe_map
+            ),
+        );
+        return;
+    }
+    match literal_boolean(value) {
+        Some(true) => {
+            exact_capabilities.insert(ContentId::new(CAPABILITY), 1);
+        }
+        Some(false) => {
+            exact_capabilities.remove(&ContentId::new(CAPABILITY));
+        }
+        None => push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            format!(
+                "centrifuge heavy-mode requirement is not a static boolean: {}",
+                call.arguments.join(", ")
+            ),
+        ),
+    }
 }
 
 fn lower_recipe_requirements(
@@ -7292,6 +7332,81 @@ mod tests {
                 .iter()
                 .any(|blocker| blocker.kind == RecipeLoweringBlockerKind::ItemInput)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn lowers_centrifuge_heavy_mode_as_exact_machine_capability() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.recipe.RecipeMaps.centrifugeNonCellRecipes;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            import gregtech.api.recipe.metadata.CentrifugeRecipeKey;
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .itemInputs(Materials.Iron.getDust(1))
+                    .itemOutputs(Materials.Steel.getDust(1))
+                    .metadata(CentrifugeRecipeKey.INSTANCE, true)
+                    .duration(20).eut(2).addTo(centrifugeNonCellRecipes);
+            }}
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let recovery = recover(&analysis);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let lowered = lower_recipe(recipe, &analysis.bindings)
+            .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
+        assert_eq!(
+            lowered.requirements,
+            [RecipeRequirement::ExactCapability {
+                capability: minecraft_redox_core::content::ContentId::new(
+                    "machine_capability.centrifuge_heavy_mode",
+                ),
+                level: 1,
+            }]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn centrifuge_heavy_mode_metadata_is_scoped_and_boolean() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.recipe.RecipeMaps.centrifugeNonCellRecipes;
+            import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            import gregtech.api.recipe.metadata.CentrifugeRecipeKey;
+            class Recipes {
+                void wrongMap() {
+                    GTValues.RA.stdBuilder()
+                        .itemInputs(Materials.Iron.getDust(1)).itemOutputs(Materials.Steel.getDust(1))
+                        .metadata(CentrifugeRecipeKey.INSTANCE, true)
+                        .duration(20).eut(2).addTo(compressorRecipes);
+                }
+                void dynamic(boolean heavy) {
+                    GTValues.RA.stdBuilder()
+                        .itemInputs(Materials.Iron.getDust(1)).itemOutputs(Materials.Steel.getDust(1))
+                        .metadata(CentrifugeRecipeKey.INSTANCE, heavy)
+                        .duration(20).eut(2).addTo(centrifugeNonCellRecipes);
+                }
+            }
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let recovery = recover(&analysis);
+        assert_eq!(recovery.recipes.len(), 2);
+        for recipe in &recovery.recipes {
+            let failure = lower_recipe(recipe, &analysis.bindings)
+                .err()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("invalid heavy-mode metadata unexpectedly lowered")
+                })?;
+            assert!(failure.blockers.iter().any(|blocker| {
+                blocker.kind == RecipeLoweringBlockerKind::Metadata
+                    && blocker.detail.contains("heavy-mode")
+            }));
+        }
         Ok(())
     }
 
