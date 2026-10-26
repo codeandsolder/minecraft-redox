@@ -40,6 +40,13 @@ pub struct AbstractMapSnapshot {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct AbstractOpaqueCallShape {
+    pub method: JimpleMethodSignature,
+    pub base: Option<AbstractValue>,
+    pub arguments: Vec<AbstractValue>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct AbstractArrayWrite {
     pub base: AbstractValue,
     pub index: AbstractValue,
@@ -53,6 +60,7 @@ pub struct ProgramExecution {
     pub arrays: Vec<AbstractArraySnapshot>,
     pub objects: Vec<AbstractObjectSnapshot>,
     pub maps: Vec<AbstractMapSnapshot>,
+    pub opaque_call_shapes: Vec<AbstractOpaqueCallShape>,
     pub unresolved_array_writes: Vec<AbstractArrayWrite>,
     pub exceptional_paths: Vec<AbstractValue>,
 }
@@ -190,6 +198,7 @@ struct ProgramVm<'a> {
     program: &'a JimpleProgram,
     state: ExecutionState,
     maps: BTreeMap<u64, Vec<(AbstractValue, AbstractValue)>>,
+    opaque_call_shapes: Vec<AbstractOpaqueCallShape>,
     unresolved_array_writes: Vec<AbstractArrayWrite>,
     exceptional_paths: Vec<AbstractValue>,
     steps: usize,
@@ -254,6 +263,7 @@ impl<'a> ProgramVm<'a> {
             program,
             state: ExecutionState::default(),
             maps: BTreeMap::new(),
+            opaque_call_shapes: Vec::new(),
             unresolved_array_writes: Vec::new(),
             exceptional_paths: Vec::new(),
             steps: 0,
@@ -579,6 +589,12 @@ impl<'a> ProgramVm<'a> {
     ) {
         self.state = join_execution_states(&false_vm.state, &true_vm.state);
         self.maps = join_maps(&false_vm.maps, &true_vm.maps);
+        self.opaque_call_shapes
+            .clone_from(&false_vm.opaque_call_shapes);
+        extend_unique(
+            &mut self.opaque_call_shapes,
+            true_vm.opaque_call_shapes.clone(),
+        );
         self.unresolved_array_writes = original_unresolved.to_vec();
         extend_unique(
             &mut self.unresolved_array_writes,
@@ -640,6 +656,7 @@ impl<'a> ProgramVm<'a> {
     ) {
         self.state = branch.state;
         self.maps = branch.maps;
+        self.opaque_call_shapes = branch.opaque_call_shapes;
         self.unresolved_array_writes = original_unresolved;
         extend_unique(
             &mut self.unresolved_array_writes,
@@ -1045,6 +1062,14 @@ impl<'a> ProgramVm<'a> {
                 .unwrap_or(AbstractValue::Null));
         }
 
+        let shape = AbstractOpaqueCallShape {
+            method: method.clone(),
+            base: base.clone(),
+            arguments: arguments.clone(),
+        };
+        if !self.opaque_call_shapes.contains(&shape) {
+            self.opaque_call_shapes.push(shape);
+        }
         Ok(AbstractValue::Invoke {
             method: method.clone(),
             base: base.map(Box::new),
@@ -1356,6 +1381,7 @@ impl<'a> ProgramVm<'a> {
                         .collect(),
                 })
                 .collect(),
+            opaque_call_shapes: self.opaque_call_shapes,
             unresolved_array_writes: self.unresolved_array_writes,
             exceptional_paths: self.exceptional_paths,
         }
@@ -2315,6 +2341,48 @@ mod tests {
             result,
             AbstractValue::ObjectRef { class_type, .. } if class_type == "demo.Value"
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn records_unresolved_call_shapes_with_receiver_provenance() -> Result<()> {
+        let target_field = field("demo.Registry", "TARGET", "demo.Api");
+        let call = invoke(
+            static_field(&target_field),
+            "demo.Api",
+            "submit",
+            vec!["int"],
+            vec![integer(7)],
+        );
+        let run = method(
+            "demo.Registry",
+            "run",
+            vec![
+                statement(
+                    0,
+                    vec![1],
+                    JimpleOperation::Invoke {
+                        expression: Some(call),
+                    },
+                ),
+                statement(1, Vec::new(), JimpleOperation::ReturnVoid),
+            ],
+        );
+
+        let execution = JimpleProgram::new(vec![run])
+            .execute_named_sequence(&[("demo.Registry", "run")], 100)?;
+        let [shape] = execution.opaque_call_shapes.as_slice() else {
+            bail!("expected exactly one opaque call shape")
+        };
+        assert_eq!(shape.method.owner, "demo.Api");
+        assert_eq!(shape.method.name, "submit");
+        assert_eq!(
+            shape.base,
+            Some(AbstractValue::StaticField {
+                field: target_field
+            })
+        );
+        assert_eq!(shape.arguments, vec![AbstractValue::Integer { value: 7 }]);
         Ok(())
     }
 

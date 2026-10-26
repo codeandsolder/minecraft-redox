@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 
 mod program;
 pub use program::{
-    AbstractMapEntry, AbstractMapSnapshot, AbstractStaticFieldValue, JimpleProgram,
-    ProgramExecution,
+    AbstractMapEntry, AbstractMapSnapshot, AbstractOpaqueCallShape, AbstractStaticFieldValue,
+    JimpleProgram, ProgramExecution,
 };
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
