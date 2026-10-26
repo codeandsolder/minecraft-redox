@@ -411,15 +411,37 @@ fn project_item_semantic(
         } => {
             if let Some((resolved, receiver_type)) =
                 project.resolve_call_at(source_path, byte_position, expression, bindings)
-                && let Some(semantic) = linked_method_semantic(
+            {
+                let qualified_receiver = receiver.as_deref().map(|receiver| {
+                    qualify_project_item_reference(
+                        receiver,
+                        bindings,
+                        project,
+                        source_path,
+                        byte_position,
+                    )
+                });
+                let qualified_arguments = arguments
+                    .iter()
+                    .map(|argument| {
+                        qualify_project_item_reference(
+                            argument,
+                            bindings,
+                            project,
+                            source_path,
+                            byte_position,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                if let Some(semantic) = linked_method_semantic(
                     resolved,
-                    receiver.as_deref(),
-                    arguments,
+                    qualified_receiver.as_ref(),
+                    &qualified_arguments,
                     bindings,
                     receiver_type,
-                )
-            {
-                return Some(semantic);
+                ) {
+                    return Some(semantic);
+                }
             }
             typed_item_expression(expression, bindings, project, source_path, byte_position)
         }
@@ -428,6 +450,21 @@ fn project_item_semantic(
         }
         _ => typed_item_expression(expression, bindings, project, source_path, byte_position),
     }
+}
+
+fn qualify_project_item_reference(
+    receiver: &JavaExpression,
+    bindings: &JavaBindings,
+    project: &JavaProjectIndex,
+    source_path: &str,
+    byte_position: usize,
+) -> JavaExpression {
+    let JavaExpression::Reference(reference) = receiver else {
+        return receiver.clone();
+    };
+    project
+        .qualified_field_reference_at(source_path, byte_position, reference, bindings)
+        .map_or_else(|| receiver.clone(), JavaExpression::Reference)
 }
 
 fn enrich_item_semantic_with_project(

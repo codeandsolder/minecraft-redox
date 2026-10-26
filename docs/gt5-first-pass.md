@@ -1280,3 +1280,27 @@ Full pinned-corpus result:
 - missing-EU/t blockers: **24**;
 - post-add blockers: **7**;
 - modifier blockers: **6**.
+
+
+### Qualified linked item field provenance
+
+Project-linked item calls now preserve fully-qualified identities for simple receivers and arguments when the Java project index proves they refer to same-class or static-imported fields. Local variables and method parameters continue to shadow those names and remain dynamic.
+
+This closes an important gap for source such as wildcard-static `ItemList`, `Werkstoff`, `GGMaterial`, and `OrePrefixes` members. For example, `Phosgene.get(cell, 1)` is recovered as a concrete Werkstoff material/form pair rather than two bare Java identifiers, while `werkstoff.get(crushedPurified, 9)` on a method parameter still fails closed.
+
+The same mechanism removes large families of intermediate blockers in Component Assembly Line recipes (`Electric_Motor_*`, pistons, stars, and similar imported fields) without adding target-specific name heuristics.
+
+Full pinned-corpus result:
+
+- target recipes lowered: **4,277 / 5,791 (73.86%)**, up from 4,272 / 5,791 (73.76%);
+- item-input blockers: **1,029**, down from 1,059;
+- item-output blockers: **833**, down from 943;
+- fluid blockers: **291**;
+- metadata blockers: **331**;
+- non-constant EU/t blockers: **417**;
+- missing-duration blockers: **332**;
+- chance blockers: **50**;
+- special blockers: **31**;
+- missing-EU/t blockers: **24**;
+- post-add blockers: **7**;
+- modifier blockers: **6**.

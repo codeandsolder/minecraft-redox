@@ -3765,6 +3765,91 @@ mod tests {
     }
 
     #[test]
+    fn qualifies_static_wildcard_linked_item_receivers() -> anyhow::Result<()> {
+        let ore_prefixes = analyze_source(
+            "OrePrefixes.java",
+            "gt5",
+            None,
+            r"
+                package gregtech.api.enums;
+                enum OrePrefixes { cell; }
+            ",
+        )?;
+        let werkstoff = analyze_source(
+            "Werkstoff.java",
+            "gt5",
+            None,
+            r"
+                package bartworks.system.material;
+                import gregtech.api.enums.OrePrefixes;
+                import net.minecraft.item.ItemStack;
+                class Werkstoff { ItemStack get(OrePrefixes prefix, int amount) { return null; } }
+            ",
+        )?;
+        let pool = analyze_source(
+            "Pool.java",
+            "gt5",
+            None,
+            r"
+                package demo;
+                import bartworks.system.material.Werkstoff;
+                class Pool { static final Werkstoff Phosgene = new Werkstoff(); }
+            ",
+        )?;
+        let recipe = analyze_source(
+            "Recipes.java",
+            "gt5",
+            None,
+            r"
+                package demo;
+                import static demo.Pool.*;
+                import static gregtech.api.enums.OrePrefixes.*;
+                import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+                import gregtech.api.enums.GTValues;
+                import gregtech.api.enums.Materials;
+                import gregtech.api.enums.OrePrefixes;
+                import bartworks.system.material.Werkstoff;
+                class Recipes {
+                    void concrete() {
+                        GTValues.RA.stdBuilder()
+                            .itemInputs(Phosgene.get(cell, 1))
+                            .itemOutputs(Materials.Iron.getDust(1))
+                            .duration(20).eut(2).addTo(compressorRecipes);
+                    }
+                    void dynamic(Werkstoff material) {
+                        GTValues.RA.stdBuilder()
+                            .itemInputs(material.get(OrePrefixes.cell, 1))
+                            .itemOutputs(Materials.Iron.getDust(1))
+                            .duration(20).eut(2).addTo(compressorRecipes);
+                    }
+                }
+            ",
+        )?;
+        let mut project = JavaProjectIndex::default();
+        for analysis in [&ore_prefixes, &werkstoff, &pool, &recipe] {
+            project.add_analysis(analysis);
+        }
+        let recovery = crate::recover_with_project(&recipe, &project);
+        assert_eq!(recovery.recipes.len(), 2);
+        let lowered = super::lower_recipe_with_project(&recovery.recipes[0], &recipe.bindings, &project)
+            .map_err(|failure| anyhow::anyhow!("qualified linked item failed: {failure:?}"))?;
+        let ItemInputSpec::Stack(input) = &lowered.item_inputs[0] else {
+            return Err(anyhow::anyhow!("linked item became alternatives"));
+        };
+        assert!(matches!(
+            &input.selector,
+            ItemSelector::MaterialForm { material, form }
+                if material.as_str() == "demo.Pool.Phosgene"
+                    && form.as_str() == "gregtech.api.enums.OrePrefixes.cell"
+        ));
+        let failure = super::lower_recipe_with_project(&recovery.recipes[1], &recipe.bindings, &project)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("dynamic linked receiver unexpectedly lowered"))?;
+        assert!(failure.blockers.iter().any(|blocker| blocker.kind == RecipeLoweringBlockerKind::ItemInput));
+        Ok(())
+    }
+
+    #[test]
     fn lowers_semantic_named_item_variants_without_legacy_meta_ids() -> anyhow::Result<()> {
         let analysis = analyze_source(
             "Variants.java",
