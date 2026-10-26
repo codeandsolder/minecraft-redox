@@ -1375,3 +1375,29 @@ Full pinned-corpus result:
 - missing-EU/t blockers: **24**;
 - post-add blockers: **7**;
 - modifier blockers: **6**.
+
+### Source-position-aware recipe scalars
+
+Recipe-level scalar recovery now uses the exact Java call site for both `.eut(...)` and synthesized integrated-circuit inputs. Simple static fields are qualified only when the project index proves that the name denotes a field at that source position; local variables and parameters retain Java shadowing and therefore stay dynamic.
+
+This also hardens metadata scalar lowering: the same call-site evaluator can no longer accidentally resolve a shadowing method parameter as a same-class `static final` field.
+
+The immediate corpus wins are two independent families:
+
+- Component Assembly Line `.circuit(MOTOR_CIRCUIT)` / piston / pump / robot-arm / conveyor / emitter / sensor / field-generator constants now lower to concrete non-consumed integrated-circuit selectors;
+- same-class static EU/t constants in the Transcendent Plasma Mixer lower through their field initializers rather than remaining `non_constant_eut`.
+
+Full pinned-corpus result:
+
+- target recipes lowered: **4,376 / 5,791 (75.56%)**, up from 4,312 / 5,791 (74.46%);
+- item-input blockers: **957**, down from 1,029;
+- non-constant EU/t blockers: **410**, down from 417;
+- item-output blockers: **823**;
+- fluid blockers: **291**;
+- metadata blockers: **221**;
+- missing-duration blockers: **332**;
+- chance blockers: **50**;
+- special blockers: **31**;
+- missing-EU/t blockers: **24**;
+- post-add blockers: **7**;
+- modifier blockers: **6**.

@@ -22,9 +22,85 @@ pub(crate) fn scalar_i64_at(
     source_path: &str,
     byte_position: usize,
 ) -> Option<i64> {
+    let expression =
+        qualify_use_site_static_fields(expression, bindings, project, source_path, byte_position);
     let mut seen = BTreeSet::new();
-    let current_owner = project.enclosing_owner_at(source_path, byte_position);
-    eval_i64(expression, bindings, project, current_owner, 0, &mut seen)
+    eval_i64(&expression, bindings, project, None, 0, &mut seen)
+}
+
+fn qualify_use_site_static_fields(
+    expression: &JavaExpression,
+    bindings: &JavaBindings,
+    project: &JavaProjectIndex,
+    source_path: &str,
+    byte_position: usize,
+) -> JavaExpression {
+    match expression {
+        JavaExpression::Reference(reference) => project
+            .qualified_field_reference_at(source_path, byte_position, reference, bindings)
+            .map_or_else(|| expression.clone(), JavaExpression::Reference),
+        JavaExpression::FieldAccess { receiver, field } => JavaExpression::FieldAccess {
+            receiver: Box::new(qualify_use_site_static_fields(
+                receiver,
+                bindings,
+                project,
+                source_path,
+                byte_position,
+            )),
+            field: field.clone(),
+        },
+        JavaExpression::ArrayAccess { array, index } => JavaExpression::ArrayAccess {
+            array: Box::new(qualify_use_site_static_fields(
+                array,
+                bindings,
+                project,
+                source_path,
+                byte_position,
+            )),
+            index: Box::new(qualify_use_site_static_fields(
+                index,
+                bindings,
+                project,
+                source_path,
+                byte_position,
+            )),
+        },
+        JavaExpression::Cast { type_name, value } => JavaExpression::Cast {
+            type_name: type_name.clone(),
+            value: Box::new(qualify_use_site_static_fields(
+                value,
+                bindings,
+                project,
+                source_path,
+                byte_position,
+            )),
+        },
+        JavaExpression::Binary {
+            left,
+            operator,
+            right,
+        } => JavaExpression::Binary {
+            left: Box::new(qualify_use_site_static_fields(
+                left,
+                bindings,
+                project,
+                source_path,
+                byte_position,
+            )),
+            operator: operator.clone(),
+            right: Box::new(qualify_use_site_static_fields(
+                right,
+                bindings,
+                project,
+                source_path,
+                byte_position,
+            )),
+        },
+        JavaExpression::Parenthesized(inner) => JavaExpression::Parenthesized(Box::new(
+            qualify_use_site_static_fields(inner, bindings, project, source_path, byte_position),
+        )),
+        _ => expression.clone(),
+    }
 }
 
 fn eval_i64(

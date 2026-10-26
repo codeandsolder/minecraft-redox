@@ -18,7 +18,7 @@ use recipe_expression::{
     duration_ticks, literal_i64, recover_fluids, recover_fluids_with_project, recover_item_inputs,
     recover_item_inputs_with_project, recover_items, recover_items_with_project,
 };
-use scalar_expression::scalar_i64;
+use scalar_expression::scalar_i64_at;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -471,13 +471,15 @@ fn recognize_recipe(
                     .extend(chance_expressions(call));
             }
             "duration" => set_duration(&mut recipe, call, bindings),
-            "eut" => set_eut(&mut recipe, call, bindings, project),
+            "eut" => set_eut(&mut recipe, call, bindings, project, &chain.origin.path),
             "specialValue" => recipe.special_value = one_argument(call),
             "special" => recipe.special = one_argument(call),
             "metadata" => recipe.metadata.push(call.into()),
             "recipeCategory" => recipe.recipe_category = Some(call.into()),
             "circuit" => {
-                if let Some(input) = integrated_circuit_input(call) {
+                if let Some(input) =
+                    integrated_circuit_input(call, bindings, project, &chain.origin.path)
+                {
                     integrated_circuit_inputs.push(input);
                 } else {
                     recipe.modifiers.push(call.into());
@@ -512,9 +514,19 @@ fn chance_expressions(call: &JavaCall) -> Vec<JavaExpression> {
     call.argument_expressions.clone()
 }
 
-fn integrated_circuit_input(call: &JavaCall) -> Option<RecoveredExpression<ItemSemantic>> {
+fn integrated_circuit_input(
+    call: &JavaCall,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+    source_path: &str,
+) -> Option<RecoveredExpression<ItemSemantic>> {
     let source_config = call.arguments.first()?;
-    let config = call.argument_expressions.first()?.clone();
+    let source_expression = call.argument_expressions.first()?;
+    let config = scalar_i64_at_call(source_expression, call, bindings, project, source_path)
+        .map_or_else(
+            || source_expression.clone(),
+            |value| JavaExpression::Literal(value.to_string()),
+        );
     let item = String::from("gregtech.api.enums.ItemList.Circuit_Integrated");
     let accessor = String::from("getWithDamage");
     let arguments = vec![JavaExpression::Literal(String::from("0")), config];
@@ -545,15 +557,26 @@ fn set_eut(
     call: &JavaCall,
     bindings: &JavaBindings,
     project: Option<&JavaProjectIndex>,
+    source_path: &str,
 ) {
     recipe.eut = one_argument(call);
     recipe.eut_expression = one_expression(call).cloned();
     recipe.eut_value = one_expression(call).and_then(|expression| {
-        project.map_or_else(
-            || literal_i64(expression),
-            |project| scalar_i64(expression, bindings, project),
-        )
+        scalar_i64_at_call(expression, call, bindings, project, source_path)
     });
+}
+
+fn scalar_i64_at_call(
+    expression: &JavaExpression,
+    call: &JavaCall,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+    source_path: &str,
+) -> Option<i64> {
+    project.map_or_else(
+        || literal_i64(expression),
+        |project| scalar_i64_at(expression, bindings, project, source_path, call.byte_start),
+    )
 }
 
 fn recognize_material(chain: &JavaCallChain) -> Option<MaterialDefinition> {
@@ -792,6 +815,76 @@ mod tests {
         summary.absorb(&analysis, &recovery);
         assert_eq!(summary.recipes_lowered, 1);
         assert!(summary.recipe_lowering_blockers.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_use_site_scalars_for_eut_and_circuit_without_breaking_shadowing()
+    -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            class Recipes {
+                static final int POWER = 123;
+                static final int CONFIG = 7;
+                void concrete() {
+                    GTValues.RA.stdBuilder()
+                        .itemInputs(Materials.Iron.getDust(1))
+                        .itemOutputs(Materials.Steel.getDust(1))
+                        .circuit(CONFIG)
+                        .duration(20)
+                        .eut(POWER)
+                        .addTo(compressorRecipes);
+                }
+                void shadowed(int POWER, int CONFIG) {
+                    GTValues.RA.stdBuilder()
+                        .itemInputs(Materials.Iron.getDust(1))
+                        .itemOutputs(Materials.Steel.getDust(1))
+                        .circuit(CONFIG)
+                        .duration(20)
+                        .eut(POWER)
+                        .addTo(compressorRecipes);
+                }
+            }
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let mut project = JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let recovery = recover_with_project(&analysis, &project);
+        assert_eq!(recovery.recipes.len(), 2);
+
+        let concrete = &recovery.recipes[0];
+        assert_eq!(concrete.eut_value, Some(123));
+        assert!(matches!(
+            concrete.item_input_semantics.last().and_then(|value| value.semantic.as_ref()),
+            Some(ItemSemantic::ItemList { arguments, .. })
+                if matches!(arguments.as_slice(), [
+                    JavaExpression::Literal(amount),
+                    JavaExpression::Literal(config),
+                ] if amount == "0" && config == "7")
+        ));
+        super::lower_recipe_with_project(concrete, &analysis.bindings, &project)
+            .map_err(|failure| anyhow::anyhow!("concrete recipe failed: {failure:?}"))?;
+
+        let shadowed = &recovery.recipes[1];
+        assert_eq!(shadowed.eut_value, None);
+        assert!(matches!(
+            shadowed.item_input_semantics.last().and_then(|value| value.semantic.as_ref()),
+            Some(ItemSemantic::ItemList { arguments, .. })
+                if matches!(arguments.as_slice(), [
+                    JavaExpression::Literal(amount),
+                    JavaExpression::Reference(config),
+                ] if amount == "0" && config == "CONFIG")
+        ));
+        let failure = super::lower_recipe_with_project(shadowed, &analysis.bindings, &project)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("shadowed recipe unexpectedly lowered"))?;
+        assert!(
+            failure.blockers.iter().any(|blocker| {
+                blocker.kind == super::RecipeLoweringBlockerKind::NonConstantEut
+            })
+        );
         Ok(())
     }
 
