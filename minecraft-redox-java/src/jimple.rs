@@ -286,6 +286,40 @@ pub struct SymbolicAssignment {
     pub value: SymbolicValue,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct JimpleCounterUpdate {
+    pub statement_id: usize,
+    pub field: JimpleFieldSignature,
+    pub receiver: Option<SymbolicValue>,
+    pub delta: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct JimpleFieldConstantWrite {
+    pub statement_id: usize,
+    pub field: JimpleFieldSignature,
+    pub receiver: Option<SymbolicValue>,
+    pub value: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct JimpleFieldComparison {
+    pub statement_id: usize,
+    pub field: JimpleFieldSignature,
+    pub receiver: Option<SymbolicValue>,
+    pub operator: String,
+    pub constant: i64,
+    pub field_on_left: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct JimpleTemporalSummary {
+    pub method: JimpleMethodSignature,
+    pub counter_updates: Vec<JimpleCounterUpdate>,
+    pub constant_writes: Vec<JimpleFieldConstantWrite>,
+    pub comparisons: Vec<JimpleFieldComparison>,
+}
+
 /// Decode methods produced by the structured Jimple exporter.
 ///
 /// # Errors
@@ -321,6 +355,87 @@ impl JimpleMethod {
         included.into_iter().collect()
     }
 
+    /// Recover source-independent temporal counter structure from this method.
+    ///
+    /// The detector follows local definitions before matching, so it recognizes JVM/Jimple
+    /// shapes such as `tmp = this.counter; tmp2 = tmp - 1; this.counter = tmp2` without
+    /// knowing the source field or class name.
+    #[must_use]
+    pub fn temporal_summary(&self) -> JimpleTemporalSummary {
+        let mut counter_updates = Vec::new();
+        let mut constant_writes = Vec::new();
+        let mut comparisons = Vec::new();
+
+        for statement in &self.statements {
+            match &statement.operation {
+                JimpleOperation::Assign { left, right } => {
+                    let Some((field, receiver)) = self.field_target(statement.id, left) else {
+                        continue;
+                    };
+                    let mut visiting = BTreeSet::new();
+                    let resolved = self.resolve_locals_only(statement.id, right, &mut visiting);
+                    if let Some(value) = symbolic_integer(&resolved) {
+                        constant_writes.push(JimpleFieldConstantWrite {
+                            statement_id: statement.id,
+                            field,
+                            receiver,
+                            value,
+                        });
+                        continue;
+                    }
+                    if let Some(delta) = counter_delta(&field, receiver.as_ref(), &resolved) {
+                        counter_updates.push(JimpleCounterUpdate {
+                            statement_id: statement.id,
+                            field,
+                            receiver,
+                            delta,
+                        });
+                    }
+                }
+                JimpleOperation::If { condition } => {
+                    let mut visiting = BTreeSet::new();
+                    let resolved = self.resolve_locals_only(statement.id, condition, &mut visiting);
+                    if let Some(comparison) = field_comparison(statement.id, &resolved) {
+                        comparisons.push(comparison);
+                    }
+                }
+                JimpleOperation::Identity { .. }
+                | JimpleOperation::Invoke { .. }
+                | JimpleOperation::Return { .. }
+                | JimpleOperation::ReturnVoid
+                | JimpleOperation::Throw { .. }
+                | JimpleOperation::Switch { .. }
+                | JimpleOperation::Goto
+                | JimpleOperation::Opaque => {}
+            }
+        }
+
+        JimpleTemporalSummary {
+            method: self.signature.clone(),
+            counter_updates,
+            constant_writes,
+            comparisons,
+        }
+    }
+
+    fn field_target(
+        &self,
+        before_id: usize,
+        value: &JimpleValue,
+    ) -> Option<(JimpleFieldSignature, Option<SymbolicValue>)> {
+        match &value.kind {
+            JimpleValueKind::InstanceField { base, field } => {
+                let mut visiting = BTreeSet::new();
+                Some((
+                    field.clone(),
+                    Some(self.resolve_locals_only(before_id, base, &mut visiting)),
+                ))
+            }
+            JimpleValueKind::StaticField { field } => Some((field.clone(), None)),
+            _ => None,
+        }
+    }
+
     /// Resolve an assignment RHS through preceding structured definitions.
     ///
     /// # Errors
@@ -341,6 +456,106 @@ impl JimpleMethod {
             target: self.resolve_value(statement_id, left, &mut visiting),
             value: self.resolve_value(statement_id, right, &mut visiting),
         })
+    }
+
+    fn resolve_locals_only(
+        &self,
+        before_id: usize,
+        value: &JimpleValue,
+        visiting: &mut BTreeSet<(usize, String)>,
+    ) -> SymbolicValue {
+        if let JimpleValueKind::Local { name } = &value.kind
+            && let Some(definition) =
+                self.latest_definition_before(before_id, &StorageLocation::Local(name.clone()))
+        {
+            let visit = (definition.id, name.clone());
+            if visiting.insert(visit.clone()) {
+                let resolved = match &definition.operation {
+                    JimpleOperation::Assign { right, .. }
+                    | JimpleOperation::Identity { right, .. } => {
+                        self.resolve_locals_only(definition.id, right, visiting)
+                    }
+                    _ => symbolic_leaf(value),
+                };
+                visiting.remove(&visit);
+                return resolved;
+            }
+        }
+        match &value.kind {
+            JimpleValueKind::ArrayRef { base, index } => SymbolicValue::ArrayElement {
+                base: Box::new(self.resolve_locals_only(before_id, base, visiting)),
+                index: Box::new(self.resolve_locals_only(before_id, index, visiting)),
+            },
+            JimpleValueKind::InstanceField { base, field } => SymbolicValue::InstanceField {
+                base: Box::new(self.resolve_locals_only(before_id, base, visiting)),
+                field: field.clone(),
+            },
+            JimpleValueKind::Binary {
+                operator,
+                left,
+                right,
+            } => SymbolicValue::Binary {
+                operator: operator.trim().to_owned(),
+                left: Box::new(self.resolve_locals_only(before_id, left, visiting)),
+                right: Box::new(self.resolve_locals_only(before_id, right, visiting)),
+            },
+            JimpleValueKind::Cast { cast_type, value } => SymbolicValue::Cast {
+                type_name: cast_type.clone(),
+                value: Box::new(self.resolve_locals_only(before_id, value, visiting)),
+            },
+            JimpleValueKind::Unary { operator, value } => SymbolicValue::Unary {
+                operator: operator.clone(),
+                value: Box::new(self.resolve_locals_only(before_id, value, visiting)),
+            },
+            JimpleValueKind::ArrayLength { value } => SymbolicValue::ArrayLength {
+                value: Box::new(self.resolve_locals_only(before_id, value, visiting)),
+            },
+            JimpleValueKind::NewArray { element_type, size } => SymbolicValue::NewArray {
+                element_type: element_type.clone(),
+                size: Box::new(self.resolve_locals_only(before_id, size, visiting)),
+            },
+            JimpleValueKind::NewMultiArray { array_type, sizes } => SymbolicValue::NewMultiArray {
+                array_type: array_type.clone(),
+                sizes: sizes
+                    .iter()
+                    .map(|size| self.resolve_locals_only(before_id, size, visiting))
+                    .collect(),
+            },
+            JimpleValueKind::Phi { values } => SymbolicValue::Phi {
+                values: values
+                    .iter()
+                    .map(|item| self.resolve_locals_only(before_id, item, visiting))
+                    .collect(),
+            },
+            JimpleValueKind::Invoke {
+                method,
+                base,
+                arguments,
+                ..
+            } => SymbolicValue::Invoke {
+                method: method.clone(),
+                base: base
+                    .as_deref()
+                    .map(|item| Box::new(self.resolve_locals_only(before_id, item, visiting))),
+                arguments: arguments
+                    .iter()
+                    .map(|item| self.resolve_locals_only(before_id, item, visiting))
+                    .collect(),
+            },
+            JimpleValueKind::Local { .. }
+            | JimpleValueKind::IntegerConstant { .. }
+            | JimpleValueKind::FloatConstant { .. }
+            | JimpleValueKind::StringConstant { .. }
+            | JimpleValueKind::ClassConstant { .. }
+            | JimpleValueKind::MethodHandle { .. }
+            | JimpleValueKind::MethodType { .. }
+            | JimpleValueKind::NullConstant
+            | JimpleValueKind::Parameter { .. }
+            | JimpleValueKind::This
+            | JimpleValueKind::StaticField { .. }
+            | JimpleValueKind::New { .. }
+            | JimpleValueKind::Opaque => symbolic_leaf(value),
+        }
     }
 
     fn add_value_dependencies<'a>(
@@ -460,6 +675,99 @@ impl JimpleMethod {
             _ => symbolic_leaf(value),
         }
     }
+}
+
+fn symbolic_integer(value: &SymbolicValue) -> Option<i64> {
+    match value {
+        SymbolicValue::Integer { value, .. } => Some(*value),
+        SymbolicValue::Cast { value, .. } => symbolic_integer(value),
+        _ => None,
+    }
+}
+
+fn symbolic_field(
+    value: &SymbolicValue,
+) -> Option<(&JimpleFieldSignature, Option<&SymbolicValue>)> {
+    match value {
+        SymbolicValue::InstanceField { base, field } => Some((field, Some(base))),
+        SymbolicValue::StaticField { field } => Some((field, None)),
+        SymbolicValue::Cast { value, .. } => symbolic_field(value),
+        _ => None,
+    }
+}
+
+fn same_field(
+    expected_field: &JimpleFieldSignature,
+    expected_receiver: Option<&SymbolicValue>,
+    value: &SymbolicValue,
+) -> bool {
+    let Some((field, receiver)) = symbolic_field(value) else {
+        return false;
+    };
+    field == expected_field && receiver == expected_receiver
+}
+
+fn counter_delta(
+    field: &JimpleFieldSignature,
+    receiver: Option<&SymbolicValue>,
+    value: &SymbolicValue,
+) -> Option<i64> {
+    let SymbolicValue::Binary {
+        operator,
+        left,
+        right,
+    } = value
+    else {
+        return None;
+    };
+    if same_field(field, receiver, left) {
+        let constant = symbolic_integer(right)?;
+        return match operator.as_str() {
+            "+" => Some(constant),
+            "-" => constant.checked_neg(),
+            _ => None,
+        };
+    }
+    if operator == "+" && same_field(field, receiver, right) {
+        return symbolic_integer(left);
+    }
+    None
+}
+
+fn field_comparison(statement_id: usize, value: &SymbolicValue) -> Option<JimpleFieldComparison> {
+    let SymbolicValue::Binary {
+        operator,
+        left,
+        right,
+    } = value
+    else {
+        return None;
+    };
+    if let Some((field, receiver)) = symbolic_field(left)
+        && let Some(constant) = symbolic_integer(right)
+    {
+        return Some(JimpleFieldComparison {
+            statement_id,
+            field: field.clone(),
+            receiver: receiver.cloned(),
+            operator: operator.clone(),
+            constant,
+            field_on_left: true,
+        });
+    }
+    if let Some((field, receiver)) = symbolic_field(right)
+        && let Some(constant) = symbolic_integer(left)
+    {
+        return Some(JimpleFieldComparison {
+            statement_id,
+            field: field.clone(),
+            receiver: receiver.cloned(),
+            operator: operator.clone(),
+            constant,
+            field_on_left: false,
+        });
+    }
+    None
 }
 
 fn operation_definition(operation: &JimpleOperation) -> Option<&JimpleValue> {
@@ -1466,6 +1774,31 @@ mod tests {
         }
     }
 
+    fn this_value(type_name: &str) -> super::JimpleValue {
+        super::JimpleValue {
+            jimple_kind: String::from("JThisRef"),
+            type_name: type_name.to_owned(),
+            text: String::from("@this"),
+            kind: super::JimpleValueKind::This,
+        }
+    }
+
+    fn instance_field(base: super::JimpleValue, owner: &str, name: &str) -> super::JimpleValue {
+        super::JimpleValue {
+            jimple_kind: String::from("JInstanceFieldRef"),
+            type_name: String::from("int"),
+            text: format!("{name} field"),
+            kind: super::JimpleValueKind::InstanceField {
+                base: Box::new(base),
+                field: super::JimpleFieldSignature {
+                    owner: owner.to_owned(),
+                    name: name.to_owned(),
+                    type_name: String::from("int"),
+                },
+            },
+        }
+    }
+
     fn integer(value: i64) -> super::JimpleValue {
         super::JimpleValue {
             jimple_kind: String::from("IntConstant"),
@@ -1506,6 +1839,91 @@ mod tests {
             successors,
             operation,
         }
+    }
+
+    #[test]
+    fn recovers_temporal_counter_shape_through_jimple_locals() {
+        let this_local = local("this", "demo.Timer");
+        let counter = instance_field(this_local.clone(), "demo.Timer", "counter");
+        let loaded = local("loaded", "int");
+        let decremented = local("decremented", "int");
+        let checked = local("checked", "int");
+        let method = super::JimpleMethod {
+            signature: super::JimpleMethodSignature {
+                owner: String::from("demo.Timer"),
+                name: String::from("tick"),
+                return_type: String::from("void"),
+                parameter_types: Vec::new(),
+            },
+            display_signature: String::from("<demo.Timer: void tick()>"),
+            statements: vec![
+                statement(
+                    0,
+                    vec![1],
+                    super::JimpleOperation::Identity {
+                        left: this_local.clone(),
+                        right: this_value("demo.Timer"),
+                    },
+                ),
+                statement(
+                    1,
+                    vec![2],
+                    super::JimpleOperation::Assign {
+                        left: loaded.clone(),
+                        right: counter.clone(),
+                    },
+                ),
+                statement(
+                    2,
+                    vec![3],
+                    super::JimpleOperation::Assign {
+                        left: decremented.clone(),
+                        right: binary("-", loaded, integer(1)),
+                    },
+                ),
+                statement(
+                    3,
+                    vec![4],
+                    super::JimpleOperation::Assign {
+                        left: counter.clone(),
+                        right: decremented,
+                    },
+                ),
+                statement(
+                    4,
+                    vec![5],
+                    super::JimpleOperation::Assign {
+                        left: checked.clone(),
+                        right: counter.clone(),
+                    },
+                ),
+                statement(
+                    5,
+                    vec![6],
+                    super::JimpleOperation::If {
+                        condition: binary("<=", checked, integer(0)),
+                    },
+                ),
+                statement(
+                    6,
+                    Vec::new(),
+                    super::JimpleOperation::Assign {
+                        left: counter,
+                        right: integer(400),
+                    },
+                ),
+            ],
+        };
+
+        let summary = method.temporal_summary();
+        assert_eq!(summary.counter_updates.len(), 1);
+        assert_eq!(summary.counter_updates[0].field.name, "counter");
+        assert_eq!(summary.counter_updates[0].delta, -1);
+        assert_eq!(summary.comparisons.len(), 1);
+        assert_eq!(summary.comparisons[0].operator, "<=");
+        assert_eq!(summary.comparisons[0].constant, 0);
+        assert_eq!(summary.constant_writes.len(), 1);
+        assert_eq!(summary.constant_writes[0].value, 400);
     }
 
     #[test]

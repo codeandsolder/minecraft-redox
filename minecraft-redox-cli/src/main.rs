@@ -75,11 +75,28 @@ fn main() -> Result<()> {
         [_, command, path, sequence, request] if command == "jimple-program-call" => {
             print_jimple_program_call(path, sequence, request)
         }
+        [_, command, path] if command == "jimple-temporal" => print_jimple_temporal(path),
         [_, command, path, request] if command == "jimple-call" => print_jimple_call(path, request),
         _ => bail!(
-            "usage: minecraft-redox [inventory|chains] <java-file> | gtnh [--summary|--blockers] <file-or-dir> | jimple-slice <json> <method-substring> <sink-substring> | jimple-execute-array <json> <method-substring> <field-owner> <field-name> | jimple-program <json> <owner::method,...> | jimple-program-call <json> <owner::method,...> <request-json> | jimple-call <json> <request-json>"
+            "usage: minecraft-redox [inventory|chains] <java-file> | gtnh [--summary|--blockers] <file-or-dir> | jimple-slice <json> <method-substring> <sink-substring> | jimple-execute-array <json> <method-substring> <field-owner> <field-name> | jimple-program <json> <owner::method,...> | jimple-program-call <json> <owner::method,...> <request-json> | jimple-call <json> <request-json> | jimple-temporal <json>"
         ),
     }
+}
+
+fn print_jimple_temporal(path: &str) -> Result<()> {
+    let json = fs::read_to_string(path).with_context(|| format!("failed to read {path}"))?;
+    let methods = parse_methods(&json)?;
+    let summaries: Vec<_> = methods
+        .iter()
+        .map(minecraft_redox_java::jimple::JimpleMethod::temporal_summary)
+        .filter(|summary| {
+            !summary.counter_updates.is_empty()
+                || !summary.constant_writes.is_empty()
+                || !summary.comparisons.is_empty()
+        })
+        .collect();
+    println!("{}", serde_json::to_string_pretty(&summaries)?);
+    Ok(())
 }
 
 fn print_jimple_call(path: &str, request_path: &str) -> Result<()> {
