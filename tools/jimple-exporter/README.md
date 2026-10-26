@@ -43,15 +43,22 @@ The prototype has been exercised against compiled `GT5-Unofficial` bytecode and 
 - the bounded loop that constructs every `Loaders.NeutronAccelerators[i]`, and
 - the Transcendent Plasma Mixer dataflow from opaque recipe metadata plus recipe fields to stored energy, followed by the wireless balance mutation and explicit zeroing of calculated EU/t.
 
-The Rust side now consumes this structure directly. It has three generic analysis modes:
+The Rust side now consumes this structure directly. It has four generic analysis modes:
 
 - backward provenance slicing plus symbolic expression reconstruction,
-- bounded finite execution over concrete integer control flow, allocations, object constructors, arrays, field writes and opaque symbolic calls, and
-- interprocedural execution over multiple Jimple classes in one shared abstract JVM state, including modeled JDK map operations and reference-preserving casts.
+- bounded finite execution over concrete integer control flow, allocations, object constructors, arrays, field writes and opaque symbolic calls,
+- interprocedural execution over multiple Jimple classes in one shared abstract JVM state, including modeled JDK map operations, runtime-class interface dispatch, reference-preserving casts, throws, and branch-state joins, and
+- exact helper-call execution with caller-supplied abstract values, so branchy utility methods can be evaluated without embedding them in a source recipe.
+
+Unknown conditionals are joined at their immediate normal post-dominator when one exists. This is important for bytecode such as optional diagnostics: the two diagnostic paths are evaluated separately, their state is joined, and the shared semantic tail executes only once. Allocations after a diamond therefore retain one identity instead of becoming a false `A | B` uncertainty.
+
+Calls whose implementation is not present remain explicit `opaque_call_shapes` containing the method signature, receiver provenance and argument values. They are evidence about reached call edges, not a claim that the opaque callee was executed.
 
 Real-corpus acceptance tests currently include:
 
 - `Loaders.GTMetaTileRegister()` materializes exactly 13 writes to `Loaders.NeutronAccelerators[0..12]` without GoodGenerator-specific rules. Each entry retains its distinct `MTENeutronAccelerator` allocation, constructor tier argument `0..12`, and `getStackForm(1)` result.
 - `MaskList.<clinit>()` + `LanthItemList.<clinit>()` + `LanthItemList.registerTypical()` executes 3,316 statements and materializes all 34 `maskMap` entries without Lanthanides-specific rules. Every key retains identity with its `MaskList` static enum field; e.g. `BLANK1` maps to a distinct `ItemPhotolithographicMask("blank1", "VISIBLE")` allocation.
+- A real `bartworks.common.loaders.recipes.FluidHeater.run()` recipe executes through `GTValues.RA -> RecipeAdder.stdBuilder() -> GTRecipeBuilder` in 1,598 abstract statements. The resulting builder has concrete `duration = 90`, `eut = 120`, one concrete fluid-input array and one concrete fluid-output array. Their `FluidStack` elements preserve constructor provenance `FluidLoader.fulvicAcid, 1000` and `FluidLoader.heatedfulvicAcid, 1000`. The unresolved registration edge is retained as `RecipeMaps.fluidHeaterRecipes -> IRecipeMap.doAdd(builder)`.
+- Exact execution of the real `GTOreDictUnificator.getDust(Materials, long)` with `Electrum` and `2*M` mechanically derives the preferred `get(dust, Electrum, 2)` lookup and its source fallbacks `dustSmall x8` and `dustTiny x18`. The final result deliberately remains conditional while the ore registry is absent; this demonstrates why registry-state recovery is preferable to assuming the preferred representation always exists.
 
-The next frontier is executing recipe-builder implementations themselves, so recipe registration can be recovered from object state and call effects rather than source-level builder vocabulary.
+The next frontier is startup/registry-state execution. GregTech's unificator keeps a canonical `sName2StackMap` populated by registration code before falling back to Forge's ore dictionary, so a sufficiently complete initialization heap should make many helper results concrete without teaching the Rust interpreter helper names.

@@ -1467,3 +1467,21 @@ Full pinned-corpus result:
 - item-output blockers: **781**, down from 786;
 - metadata blockers: **210**, down from 217;
 - all other blocker-category recipe counts are unchanged.
+
+
+### JVM/Jimple abstract-execution path
+
+The source-expression lowerer has reached the point where additional named adapters increasingly encode facts that already exist in executable Java. `minecraft-redox` therefore now has a second Java recovery path: compiled GTNH bytecode is lowered by SootUp to structured Jimple JSON, then interpreted by a GregTech-agnostic Rust abstract JVM.
+
+The Jimple boundary preserves method signatures, CFG edges, typed values, allocations, fields, arrays, casts, calls, switches and throws. The Rust side supports bounded interprocedural execution, JVM default field values, constructor state, runtime-class interface dispatch, modeled JDK maps/streams/selected value operations, finite loops, branch-state joins, and immediate-post-dominator reconvergence. Opaque callees remain explicit call shapes with receiver and argument provenance rather than being silently discarded.
+
+Real GTNH checkpoints now prove several formerly source-specific families mechanically:
+
+- `goodgenerator.loader.Loaders.GTMetaTileRegister()` materializes all 13 `NeutronAccelerators[index]` entries and preserves each constructor tier index;
+- `MaskList` plus `LanthItemList` initialization materializes all 34 photolithographic-mask map entries with enum-key identity;
+- `GTMod.<init>` derives `GTValues.RA = new RecipeAdder()`, enabling ordinary interface dispatch into `stdBuilder()` without an `RA` rule;
+- `GTValues.<clinit>` materializes the voltage arrays used by recipe-builder diagnostics;
+- `bartworks.common.loaders.recipes.FluidHeater.run()` reaches a concrete recipe-builder object with duration 90 ticks, EU/t 120, concrete one-element fluid input/output arrays, and the registration edge to `RecipeMaps.fluidHeaterRecipes`; and
+- exact execution of `GTOreDictUnificator.getDust(Materials.Electrum, 2*M)` derives `dust x2` as the first lookup and the real `dustSmall x8` / `dustTiny x18` fallback chain. Because the ore registry has not yet been initialized in that experiment, the interpreter correctly preserves the final identity as conditional rather than assuming the first lookup succeeds.
+
+This work is not yet wired into the full 5,791-recipe corpus lowerer, so the last measured target coverage remains **4,436 / 5,791 (76.60%)**. The purpose of this checkpoint is architectural: replace the growing encyclopedia of helper/machine names with executable producer/consumer and registry evidence, then use the existing hand-derived semantics as regression oracles while special cases are retired.
