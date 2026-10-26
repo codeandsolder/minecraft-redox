@@ -8,10 +8,26 @@ use anyhow::{Context, Result, bail};
 use minecraft_redox_gtnh::{GtnhSummary, lower_recipe_with_project, recover_with_project};
 use minecraft_redox_java::{
     JavaProjectIndex, analyze_source, inventory_source,
-    jimple::{JimpleProgram, parse_methods},
+    jimple::{
+        AbstractValue, JimpleMethodSignature, JimpleProgram, ProgramExecution, parse_methods,
+    },
 };
 use rayon::prelude::*;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+
+#[derive(Deserialize)]
+struct JimpleCallRequest {
+    signature: JimpleMethodSignature,
+    this_value: Option<AbstractValue>,
+    #[serde(default)]
+    arguments: Vec<AbstractValue>,
+}
+
+#[derive(Serialize)]
+struct JimpleCallResult {
+    return_value: Option<AbstractValue>,
+    execution: ProgramExecution,
+}
 
 #[derive(Serialize)]
 struct FileRecovery {
@@ -56,10 +72,35 @@ fn main() -> Result<()> {
         [_, command, path, sequence] if command == "jimple-program" => {
             print_jimple_program(path, sequence)
         }
+        [_, command, path, request] if command == "jimple-call" => print_jimple_call(path, request),
         _ => bail!(
-            "usage: minecraft-redox [inventory|chains] <java-file> | gtnh [--summary|--blockers] <file-or-dir> | jimple-slice <json> <method-substring> <sink-substring> | jimple-execute-array <json> <method-substring> <field-owner> <field-name> | jimple-program <json> <owner::method,...>"
+            "usage: minecraft-redox [inventory|chains] <java-file> | gtnh [--summary|--blockers] <file-or-dir> | jimple-slice <json> <method-substring> <sink-substring> | jimple-execute-array <json> <method-substring> <field-owner> <field-name> | jimple-program <json> <owner::method,...> | jimple-call <json> <request-json>"
         ),
     }
+}
+
+fn print_jimple_call(path: &str, request_path: &str) -> Result<()> {
+    let json = fs::read_to_string(path).with_context(|| format!("failed to read {path}"))?;
+    let methods = parse_methods(&json)?;
+    let request_json = fs::read_to_string(request_path)
+        .with_context(|| format!("failed to read {request_path}"))?;
+    let request: JimpleCallRequest = serde_json::from_str(&request_json)
+        .with_context(|| format!("failed to parse {request_path}"))?;
+    let program = JimpleProgram::new(methods);
+    let (return_value, execution) = program.execute_call(
+        &request.signature,
+        request.this_value,
+        request.arguments,
+        100_000,
+    )?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&JimpleCallResult {
+            return_value,
+            execution,
+        })?
+    );
+    Ok(())
 }
 
 fn print_jimple_program(path: &str, sequence: &str) -> Result<()> {

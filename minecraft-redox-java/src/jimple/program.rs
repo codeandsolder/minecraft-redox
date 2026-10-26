@@ -118,6 +118,26 @@ impl JimpleProgram {
         Ok(vm.finish())
     }
 
+    /// Execute one exact method with caller-supplied abstract JVM values.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the signature is absent or finite abstract execution fails.
+    pub fn execute_call(
+        &self,
+        signature: &JimpleMethodSignature,
+        this_value: Option<AbstractValue>,
+        arguments: Vec<AbstractValue>,
+        max_steps: usize,
+    ) -> Result<(Option<AbstractValue>, ProgramExecution)> {
+        let method = self
+            .method(signature)
+            .with_context(|| format!("Jimple method {signature:?} not found"))?;
+        let mut vm = ProgramVm::new(self, max_steps);
+        let return_value = vm.execute_method(method, this_value, arguments, 0)?;
+        Ok((return_value, vm.finish()))
+    }
+
     fn unique_method(&self, owner: &str, name: &str) -> Result<&JimpleMethod> {
         let mut matching = self
             .methods
@@ -2241,6 +2261,46 @@ mod tests {
             joined_box_value(&execution)?,
             AbstractValue::Unknown { type_name, .. } if type_name == "int"
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn executes_exact_method_with_abstract_arguments() -> Result<()> {
+        let argument = local("argument", "int");
+        let signature = JimpleMethodSignature {
+            owner: String::from("demo.Identity"),
+            name: String::from("apply"),
+            return_type: String::from("int"),
+            parameter_types: vec![String::from("int")],
+        };
+        let method = JimpleMethod {
+            signature: signature.clone(),
+            display_signature: String::from("<demo.Identity: int apply(int)>"),
+            statements: vec![
+                statement(
+                    0,
+                    vec![1],
+                    JimpleOperation::Identity {
+                        left: argument.clone(),
+                        right: value(
+                            JimpleValueKind::Parameter { index: 0 },
+                            "int",
+                            "@parameter0",
+                        ),
+                    },
+                ),
+                statement(1, Vec::new(), JimpleOperation::Return { value: argument }),
+            ],
+        };
+        let program = JimpleProgram::new(vec![method]);
+        let (returned, execution) = program.execute_call(
+            &signature,
+            None,
+            vec![AbstractValue::Integer { value: 7 }],
+            100,
+        )?;
+        assert_eq!(returned, Some(AbstractValue::Integer { value: 7 }));
+        assert_eq!(execution.steps, 2);
         Ok(())
     }
 

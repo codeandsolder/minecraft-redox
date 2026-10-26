@@ -593,7 +593,7 @@ fn symbolic_leaf(value: &JimpleValue) -> SymbolicValue {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AbstractValue {
     Integer {
