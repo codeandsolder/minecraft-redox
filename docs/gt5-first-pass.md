@@ -1413,3 +1413,15 @@ Full pinned-corpus result:
 - target recipes lowered: **4,383 / 5,791 (75.69%)**, up from 4,376 / 5,791 (75.56%);
 - `post_add` blockers: **0**, down from 7;
 - all other blocker-category recipe counts are unchanged.
+
+### Source-backed `GTOreDictUnificator.getDust` material units
+
+The static `GTOreDictUnificator.getDust(Materials,long)` helper chooses a full dust first whenever the requested material amount is an exact multiple of `GTValues.M`; `OrePrefixes.dust.getMaterialAmount()` is exactly `M`. Calls such as `getDust(Materials.Bronze, 4 * OrePrefixes.dust.getMaterialAmount())` therefore normalize exactly to four Bronze dusts rather than remaining opaque helper calls.
+
+Lowering is intentionally restricted to concrete `Materials.*` identities and exact dust-unit expressions. Direct dust/dustSmall/dustTiny prefix overloads are also represented where the source branch is unambiguous. Material amounts derived from unrelated prefixes remain fail-closed until their unit arithmetic is modeled explicitly.
+
+Full pinned-corpus result:
+
+- target recipes lowered: **4,420 / 5,791 (76.33%)**, up from 4,383 / 5,791 (75.69%);
+- item-output blockers: **786**, down from 823;
+- all other blocker-category recipe counts are unchanged.

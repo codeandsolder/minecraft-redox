@@ -2602,6 +2602,9 @@ fn lower_item_semantic(
             selector: lower_ore_dict_key_selector(key, bindings)?,
             amount: scalar_amount_u64(amount, bindings, project)?,
         }),
+        ItemSemantic::OreDictHelper { method, arguments } => {
+            lower_ore_dict_helper(method, arguments, bindings)
+        }
         ItemSemantic::MaterialItem {
             material,
             accessor,
@@ -2680,6 +2683,100 @@ fn lower_item_semantic(
         }),
         _ => None,
     }
+}
+
+fn lower_ore_dict_helper(
+    method: &str,
+    arguments: &[JavaExpression],
+    bindings: &JavaBindings,
+) -> Option<ItemStackSpec> {
+    if method != "getDust" || arguments.len() != 2 {
+        return None;
+    }
+    let material = resolved_reference_name(arguments.first()?, bindings)?;
+    if !material.starts_with("gregtech.api.enums.Materials.") {
+        return None;
+    }
+    let (form, amount) = lower_get_dust_amount(arguments.get(1)?, bindings)?;
+    Some(ItemStackSpec {
+        selector: ItemSelector::MaterialForm {
+            material: ContentId::new(material),
+            form: ContentId::new(form),
+        },
+        amount,
+    })
+}
+
+fn lower_get_dust_amount(
+    expression: &JavaExpression,
+    bindings: &JavaBindings,
+) -> Option<(&'static str, u64)> {
+    if let Some(prefix) = resolved_reference_name(expression, bindings) {
+        return match prefix.as_str() {
+            "gregtech.api.enums.OrePrefixes.dust" => {
+                Some(("gregtech.api.enums.OrePrefixes.dust", 1))
+            }
+            "gregtech.api.enums.OrePrefixes.dustSmall" => {
+                Some(("gregtech.api.enums.OrePrefixes.dustSmall", 1))
+            }
+            "gregtech.api.enums.OrePrefixes.dustTiny" => {
+                Some(("gregtech.api.enums.OrePrefixes.dustTiny", 1))
+            }
+            _ => None,
+        };
+    }
+    if is_ore_prefix_material_amount(expression, bindings, "dust") {
+        return Some(("gregtech.api.enums.OrePrefixes.dust", 1));
+    }
+    if is_ore_prefix_material_amount(expression, bindings, "dustSmall") {
+        return Some(("gregtech.api.enums.OrePrefixes.dustSmall", 1));
+    }
+    if is_ore_prefix_material_amount(expression, bindings, "dustTiny") {
+        return Some(("gregtech.api.enums.OrePrefixes.dustTiny", 1));
+    }
+    let JavaExpression::Binary {
+        left,
+        operator,
+        right,
+    } = expression
+    else {
+        return None;
+    };
+    if operator != "*" {
+        return None;
+    }
+    let factor = if is_ore_prefix_material_amount(left, bindings, "dust") {
+        literal_positive_u64(right)?
+    } else if is_ore_prefix_material_amount(right, bindings, "dust") {
+        literal_positive_u64(left)?
+    } else {
+        return None;
+    };
+    Some(("gregtech.api.enums.OrePrefixes.dust", factor))
+}
+
+fn is_ore_prefix_material_amount(
+    expression: &JavaExpression,
+    bindings: &JavaBindings,
+    prefix: &str,
+) -> bool {
+    let JavaExpression::Call {
+        receiver: Some(receiver),
+        method,
+        arguments,
+    } = expression
+    else {
+        return false;
+    };
+    method == "getMaterialAmount"
+        && arguments.is_empty()
+        && resolved_reference_name(receiver, bindings).as_deref()
+            == Some(&format!("gregtech.api.enums.OrePrefixes.{prefix}"))
+}
+
+fn literal_positive_u64(expression: &JavaExpression) -> Option<u64> {
+    let value = literal_i64(expression)?;
+    (value > 0).then(|| u64::try_from(value).ok()).flatten()
 }
 
 fn lower_material_item(
@@ -3476,8 +3573,8 @@ fn push_blocker(
 mod tests {
     use minecraft_redox_core::content::{
         ContentAvailabilityRequirement, FluidInputSpec, FluidSelector, ItemInputSpec, ItemSelector,
-        Probability, RecipeExecutionMode, RecipeInputConstraint, RecipeProgress, RecipeRequirement,
-        RecipeUnlock,
+        ItemStackSpec, Probability, RecipeExecutionMode, RecipeInputConstraint, RecipeProgress,
+        RecipeRequirement, RecipeUnlock,
     };
     use minecraft_redox_java::{JavaExpression, JavaProjectIndex, analyze_source};
 
@@ -6999,6 +7096,73 @@ mod tests {
                 .blockers
                 .iter()
                 .any(|blocker| blocker.kind == RecipeLoweringBlockerKind::ItemInput)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn lowers_source_backed_get_dust_material_units() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.recipe.RecipeMaps.mixerRecipes;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            import gregtech.api.enums.OrePrefixes;
+            import gregtech.api.util.GTOreDictUnificator;
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .itemInputs(Materials.Copper.getDust(1))
+                    .itemOutputs(GTOreDictUnificator.getDust(
+                        Materials.Bronze,
+                        4L * OrePrefixes.dust.getMaterialAmount()))
+                    .duration(20).eut(2).addTo(mixerRecipes);
+                GTValues.RA.stdBuilder()
+                    .itemInputs(Materials.Copper.getDust(1))
+                    .itemOutputs(GTOreDictUnificator.getDust(Materials.Bronze, OrePrefixes.dustSmall))
+                    .duration(20).eut(2).addTo(mixerRecipes);
+                GTValues.RA.stdBuilder()
+                    .itemInputs(Materials.Copper.getDust(1))
+                    .itemOutputs(GTOreDictUnificator.getDust(
+                        Materials.Bronze,
+                        3L * OrePrefixes.stick.getMaterialAmount()))
+                    .duration(20).eut(2).addTo(mixerRecipes);
+            }}
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let recovery = recover(&analysis);
+        assert_eq!(recovery.recipes.len(), 3);
+
+        let whole = lower_recipe(&recovery.recipes[0], &analysis.bindings)
+            .map_err(|failure| anyhow::anyhow!("whole dust failed: {failure:?}"))?;
+        assert!(matches!(
+            &whole.item_outputs[0].stack,
+            ItemStackSpec {
+                selector: ItemSelector::MaterialForm { material, form },
+                amount: 4,
+            } if material.as_str() == "gregtech.api.enums.Materials.Bronze"
+                && form.as_str() == "gregtech.api.enums.OrePrefixes.dust"
+        ));
+
+        let small = lower_recipe(&recovery.recipes[1], &analysis.bindings)
+            .map_err(|failure| anyhow::anyhow!("small dust failed: {failure:?}"))?;
+        assert!(matches!(
+            &small.item_outputs[0].stack,
+            ItemStackSpec {
+                selector: ItemSelector::MaterialForm { material, form },
+                amount: 1,
+            } if material.as_str() == "gregtech.api.enums.Materials.Bronze"
+                && form.as_str() == "gregtech.api.enums.OrePrefixes.dustSmall"
+        ));
+
+        let unsupported = lower_recipe(&recovery.recipes[2], &analysis.bindings)
+            .err()
+            .ok_or_else(|| {
+                anyhow::anyhow!("non-dust material-unit expression unexpectedly lowered")
+            })?;
+        assert!(
+            unsupported
+                .blockers
+                .iter()
+                .any(|blocker| { blocker.kind == RecipeLoweringBlockerKind::ItemOutput })
         );
         Ok(())
     }
