@@ -72,9 +72,12 @@ fn main() -> Result<()> {
         [_, command, path, sequence] if command == "jimple-program" => {
             print_jimple_program(path, sequence)
         }
+        [_, command, path, sequence, request] if command == "jimple-program-call" => {
+            print_jimple_program_call(path, sequence, request)
+        }
         [_, command, path, request] if command == "jimple-call" => print_jimple_call(path, request),
         _ => bail!(
-            "usage: minecraft-redox [inventory|chains] <java-file> | gtnh [--summary|--blockers] <file-or-dir> | jimple-slice <json> <method-substring> <sink-substring> | jimple-execute-array <json> <method-substring> <field-owner> <field-name> | jimple-program <json> <owner::method,...> | jimple-call <json> <request-json>"
+            "usage: minecraft-redox [inventory|chains] <java-file> | gtnh [--summary|--blockers] <file-or-dir> | jimple-slice <json> <method-substring> <sink-substring> | jimple-execute-array <json> <method-substring> <field-owner> <field-name> | jimple-program <json> <owner::method,...> | jimple-program-call <json> <owner::method,...> <request-json> | jimple-call <json> <request-json>"
         ),
     }
 }
@@ -107,17 +110,47 @@ fn print_jimple_program(path: &str, sequence: &str) -> Result<()> {
     let json = fs::read_to_string(path).with_context(|| format!("failed to read {path}"))?;
     let methods = parse_methods(&json)?;
     let program = JimpleProgram::new(methods);
-    let parsed: Vec<_> = sequence
+    let parsed = parse_jimple_sequence(sequence)?;
+    let execution = program.execute_named_sequence(&parsed, 100_000)?;
+    println!("{}", serde_json::to_string_pretty(&execution)?);
+    Ok(())
+}
+
+fn print_jimple_program_call(path: &str, sequence: &str, request_path: &str) -> Result<()> {
+    let json = fs::read_to_string(path).with_context(|| format!("failed to read {path}"))?;
+    let methods = parse_methods(&json)?;
+    let request_json = fs::read_to_string(request_path)
+        .with_context(|| format!("failed to read {request_path}"))?;
+    let request: JimpleCallRequest = serde_json::from_str(&request_json)
+        .with_context(|| format!("failed to parse {request_path}"))?;
+    let program = JimpleProgram::new(methods);
+    let parsed = parse_jimple_sequence(sequence)?;
+    let (return_value, execution) = program.execute_named_sequence_then_call(
+        &parsed,
+        &request.signature,
+        request.this_value,
+        request.arguments,
+        100_000,
+    )?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&JimpleCallResult {
+            return_value,
+            execution,
+        })?
+    );
+    Ok(())
+}
+
+fn parse_jimple_sequence(sequence: &str) -> Result<Vec<(&str, &str)>> {
+    sequence
         .split(',')
         .map(|entry| {
             entry
                 .rsplit_once("::")
                 .with_context(|| format!("invalid method entry {entry:?}; expected owner::method"))
         })
-        .collect::<Result<Vec<_>>>()?;
-    let execution = program.execute_named_sequence(&parsed, 100_000)?;
-    println!("{}", serde_json::to_string_pretty(&execution)?);
-    Ok(())
+        .collect()
 }
 
 fn print_jimple_execute_array(

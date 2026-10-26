@@ -20,6 +20,16 @@ mvn -q exec:java \
   -Dexec.args="/path/to/classes fully.qualified.ClassName optionalMethodSubstring"
 ```
 
+For interprocedural experiments, `DumpReachable` follows concrete bytecode callees and class initializers from one root method while stopping at runtime-library boundaries already modeled by the Rust VM:
+
+```sh
+mvn -q exec:java \
+  -Dexec.mainClass=dev.minecraftredox.jimple.DumpReachable \
+  -Dexec.args="/path/to/classes fully.qualified.RootClass methodNameSubstring 2000"
+```
+
+The final argument is a hard method-count guard. This is intentionally a bounded analysis export, not an invitation to serialize the entire JVM.
+
 Each concrete method is emitted as JSON with its signature and statements. Every statement currently includes:
 
 - stable per-method statement ID,
@@ -47,8 +57,9 @@ The Rust side now consumes this structure directly. It has four generic analysis
 
 - backward provenance slicing plus symbolic expression reconstruction,
 - bounded finite execution over concrete integer control flow, allocations, object constructors, arrays, field writes and opaque symbolic calls,
-- interprocedural execution over multiple Jimple classes in one shared abstract JVM state, including modeled JDK map operations, runtime-class interface dispatch, reference-preserving casts, throws, and branch-state joins, and
-- exact helper-call execution with caller-supplied abstract values, so branchy utility methods can be evaluated without embedding them in a source recipe.
+- interprocedural execution over multiple Jimple classes in one shared abstract JVM state, including modeled JDK map operations, runtime-class interface dispatch, reference-preserving casts, throws, and branch-state joins,
+- JVM-style one-shot class initialization on reached static use/allocation, with recursion protection for mutually-referential `<clinit>` code, and
+- exact helper-call execution with caller-supplied abstract values, including after an initialization/registration sequence in the same heap, so branchy utility methods can be evaluated against recovered startup state instead of an empty registry.
 
 Unknown conditionals are joined at their immediate normal post-dominator when one exists. This is important for bytecode such as optional diagnostics: the two diagnostic paths are evaluated separately, their state is joined, and the shared semantic tail executes only once. Allocations after a diamond therefore retain one identity instead of becoming a false `A | B` uncertainty.
 
@@ -57,7 +68,7 @@ Calls whose implementation is not present remain explicit `opaque_call_shapes` c
 Real-corpus acceptance tests currently include:
 
 - `Loaders.GTMetaTileRegister()` materializes exactly 13 writes to `Loaders.NeutronAccelerators[0..12]` without GoodGenerator-specific rules. Each entry retains its distinct `MTENeutronAccelerator` allocation, constructor tier argument `0..12`, and `getStackForm(1)` result.
-- `MaskList.<clinit>()` + `LanthItemList.<clinit>()` + `LanthItemList.registerTypical()` executes 3,316 statements and materializes all 34 `maskMap` entries without Lanthanides-specific rules. Every key retains identity with its `MaskList` static enum field; e.g. `BLANK1` maps to a distinct `ItemPhotolithographicMask("blank1", "VISIBLE")` allocation.
+- Calling only `LanthItemList.registerTypical()` now triggers the required class initializers mechanically, executes 3,724 statements, and materializes all 34 `maskMap` entries without Lanthanides-specific rules or an explicit startup sequence. Every key retains identity with its `MaskList` static enum field; e.g. `BLANK1` maps to a distinct `ItemPhotolithographicMask("blank1", "VISIBLE")` allocation.
 - A real `bartworks.common.loaders.recipes.FluidHeater.run()` recipe executes through `GTValues.RA -> RecipeAdder.stdBuilder() -> GTRecipeBuilder` in 1,598 abstract statements. The resulting builder has concrete `duration = 90`, `eut = 120`, one concrete fluid-input array and one concrete fluid-output array. Their `FluidStack` elements preserve constructor provenance `FluidLoader.fulvicAcid, 1000` and `FluidLoader.heatedfulvicAcid, 1000`. The unresolved registration edge is retained as `RecipeMaps.fluidHeaterRecipes -> IRecipeMap.doAdd(builder)`.
 - Exact execution of the real `GTOreDictUnificator.getDust(Materials, long)` with `Electrum` and `2*M` mechanically derives the preferred `get(dust, Electrum, 2)` lookup and its source fallbacks `dustSmall x8` and `dustTiny x18`. The final result deliberately remains conditional while the ore registry is absent; this demonstrates why registry-state recovery is preferable to assuming the preferred representation always exists.
 

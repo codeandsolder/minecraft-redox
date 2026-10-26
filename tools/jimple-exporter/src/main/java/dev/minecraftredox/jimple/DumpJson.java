@@ -80,7 +80,7 @@ public final class DumpJson {
         System.out.println(GSON.toJson(methods));
     }
 
-    private static Object method(SootMethod method) {
+    static Object method(SootMethod method) {
         Body body = method.getBody();
         List<Stmt> statements = body.getStmts();
         Map<Stmt, Integer> ids = new IdentityHashMap<>();

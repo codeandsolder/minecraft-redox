@@ -40,6 +40,24 @@ pub struct AbstractMapSnapshot {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct AbstractListSnapshot {
+    pub object_id: u64,
+    pub values: Vec<AbstractValue>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct AbstractSetSnapshot {
+    pub object_id: u64,
+    pub values: Vec<AbstractValue>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct AbstractNamedRegistryEntry {
+    pub name: AbstractValue,
+    pub values: Vec<AbstractValue>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct AbstractOpaqueCallShape {
     pub method: JimpleMethodSignature,
     pub base: Option<AbstractValue>,
@@ -56,10 +74,14 @@ pub struct AbstractArrayWrite {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ProgramExecution {
     pub steps: usize,
+    pub initialized_classes: Vec<String>,
     pub static_fields: Vec<AbstractStaticFieldValue>,
     pub arrays: Vec<AbstractArraySnapshot>,
     pub objects: Vec<AbstractObjectSnapshot>,
     pub maps: Vec<AbstractMapSnapshot>,
+    pub lists: Vec<AbstractListSnapshot>,
+    pub sets: Vec<AbstractSetSnapshot>,
+    pub named_registry: Vec<AbstractNamedRegistryEntry>,
     pub opaque_call_shapes: Vec<AbstractOpaqueCallShape>,
     pub unresolved_array_writes: Vec<AbstractArrayWrite>,
     pub exceptional_paths: Vec<AbstractValue>,
@@ -80,6 +102,14 @@ impl JimpleProgram {
         self.methods
             .iter()
             .find(|method| method.signature == *signature)
+    }
+
+    fn class_initializer(&self, owner: &str) -> Option<&JimpleMethod> {
+        self.methods.iter().find(|method| {
+            method.signature.owner == owner
+                && method.signature.name == "<clinit>"
+                && method.signature.parameter_types.is_empty()
+        })
     }
 
     fn dispatched_method(
@@ -111,11 +141,51 @@ impl JimpleProgram {
         max_steps: usize,
     ) -> Result<ProgramExecution> {
         let mut vm = ProgramVm::new(self, max_steps);
-        for (owner, name) in sequence {
-            let method = self.unique_method(owner, name)?;
-            vm.execute_method(method, None, Vec::new(), 0)?;
-        }
+        self.execute_named_sequence_on_vm(&mut vm, sequence)?;
         Ok(vm.finish())
+    }
+
+    /// Execute initialization/registration entrypoints, then one exact method in the same JVM state.
+    ///
+    /// This is the bridge between startup-state recovery and helper evaluation: registry mutations
+    /// performed by the named sequence remain visible to the final call.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any entrypoint or the exact call cannot be executed finitely.
+    pub fn execute_named_sequence_then_call(
+        &self,
+        sequence: &[(&str, &str)],
+        signature: &JimpleMethodSignature,
+        this_value: Option<AbstractValue>,
+        arguments: Vec<AbstractValue>,
+        max_steps: usize,
+    ) -> Result<(Option<AbstractValue>, ProgramExecution)> {
+        let method = self
+            .method(signature)
+            .with_context(|| format!("Jimple method {signature:?} not found"))?;
+        let mut vm = ProgramVm::new(self, max_steps);
+        self.execute_named_sequence_on_vm(&mut vm, sequence)?;
+        vm.ensure_class_initialized(&signature.owner, 0)?;
+        let return_value = vm.execute_method(method, this_value, arguments, 0)?;
+        Ok((return_value, vm.finish()))
+    }
+
+    fn execute_named_sequence_on_vm(
+        &self,
+        vm: &mut ProgramVm<'_>,
+        sequence: &[(&str, &str)],
+    ) -> Result<()> {
+        for (owner, name) in sequence {
+            if *name == "<clinit>" {
+                vm.ensure_class_initialized(owner, 0)?;
+            } else {
+                let method = self.unique_method(owner, name)?;
+                vm.ensure_class_initialized(owner, 0)?;
+                vm.execute_method(method, None, Vec::new(), 0)?;
+            }
+        }
+        Ok(())
     }
 
     /// Execute one exact method with caller-supplied abstract JVM values.
@@ -134,6 +204,11 @@ impl JimpleProgram {
             .method(signature)
             .with_context(|| format!("Jimple method {signature:?} not found"))?;
         let mut vm = ProgramVm::new(self, max_steps);
+        if signature.name == "<clinit>" {
+            vm.ensure_class_initialized(&signature.owner, 0)?;
+            return Ok((None, vm.finish()));
+        }
+        vm.ensure_class_initialized(&signature.owner, 0)?;
         let return_value = vm.execute_method(method, this_value, arguments, 0)?;
         Ok((return_value, vm.finish()))
     }
@@ -218,13 +293,27 @@ struct ProgramVm<'a> {
     program: &'a JimpleProgram,
     state: ExecutionState,
     maps: BTreeMap<u64, Vec<(AbstractValue, AbstractValue)>>,
+    lists: BTreeMap<u64, Vec<AbstractValue>>,
+    sets: BTreeMap<u64, Vec<AbstractValue>>,
+    iterators: BTreeMap<u64, AbstractIterator>,
+    named_registry: Vec<(AbstractValue, Vec<AbstractValue>)>,
     opaque_call_shapes: Vec<AbstractOpaqueCallShape>,
     unresolved_array_writes: Vec<AbstractArrayWrite>,
     exceptional_paths: Vec<AbstractValue>,
+    initialized_classes: BTreeSet<String>,
+    initializing_classes: BTreeSet<String>,
     steps: usize,
     max_steps: usize,
     path_splits: usize,
     max_path_splits: usize,
+    branch_depth: usize,
+    max_branch_depth: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct AbstractIterator {
+    values: Vec<AbstractValue>,
+    index: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -283,14 +372,39 @@ impl<'a> ProgramVm<'a> {
             program,
             state: ExecutionState::default(),
             maps: BTreeMap::new(),
+            lists: BTreeMap::new(),
+            sets: BTreeMap::new(),
+            iterators: BTreeMap::new(),
+            named_registry: Vec::new(),
             opaque_call_shapes: Vec::new(),
             unresolved_array_writes: Vec::new(),
             exceptional_paths: Vec::new(),
+            initialized_classes: BTreeSet::new(),
+            initializing_classes: BTreeSet::new(),
             steps: 0,
             max_steps,
             path_splits: 0,
-            max_path_splits: max_steps,
+            max_path_splits: max_steps.min(4_096),
+            branch_depth: 0,
+            max_branch_depth: 16,
         }
+    }
+
+    fn ensure_class_initialized(&mut self, owner: &str, depth: usize) -> Result<()> {
+        if self.initialized_classes.contains(owner) || self.initializing_classes.contains(owner) {
+            return Ok(());
+        }
+        let Some(initializer) = self.program.class_initializer(owner) else {
+            self.initialized_classes.insert(owner.to_owned());
+            return Ok(());
+        };
+
+        self.initializing_classes.insert(owner.to_owned());
+        let result = self.execute_method(initializer, None, Vec::new(), depth + 1);
+        self.initializing_classes.remove(owner);
+        result?;
+        self.initialized_classes.insert(owner.to_owned());
+        Ok(())
     }
 
     fn execute_method(
@@ -454,6 +568,14 @@ impl<'a> ProgramVm<'a> {
                 statement_id
             );
         }
+        if self.branch_depth >= self.max_branch_depth {
+            bail!(
+                "interprocedural Jimple execution exceeded {} nested unknown branches at {} statement {}: {condition:?}",
+                self.max_branch_depth,
+                method.display_signature,
+                statement_id
+            );
+        }
 
         let merge = immediate_postdominator(method, statement_id);
         let base_steps = self.steps;
@@ -591,6 +713,7 @@ impl<'a> ProgramVm<'a> {
         let mut branch = self.clone();
         branch.state.next_id = branch.state.next_id.max(allocation_floor);
         branch.path_splits = branch.path_splits.saturating_add(1);
+        branch.branch_depth = branch.branch_depth.saturating_add(1);
         let outcome = capture_path_outcome(branch.execute_until(
             method,
             frame.clone(),
@@ -609,6 +732,11 @@ impl<'a> ProgramVm<'a> {
     ) {
         self.state = join_execution_states(&false_vm.state, &true_vm.state);
         self.maps = join_maps(&false_vm.maps, &true_vm.maps);
+        self.lists = join_lists(&false_vm.lists, &true_vm.lists);
+        self.sets = join_sets(&false_vm.sets, &true_vm.sets);
+        self.iterators = join_iterators(&false_vm.iterators, &true_vm.iterators);
+        self.named_registry =
+            join_named_registry(&false_vm.named_registry, &true_vm.named_registry);
         self.opaque_call_shapes
             .clone_from(&false_vm.opaque_call_shapes);
         extend_unique(
@@ -624,6 +752,14 @@ impl<'a> ProgramVm<'a> {
             &mut self.unresolved_array_writes,
             true_vm.unresolved_array_writes.clone(),
         );
+        self.initialized_classes
+            .clone_from(&false_vm.initialized_classes);
+        self.initialized_classes
+            .extend(true_vm.initialized_classes.iter().cloned());
+        self.initializing_classes
+            .clone_from(&false_vm.initializing_classes);
+        self.initializing_classes
+            .extend(true_vm.initializing_classes.iter().cloned());
         self.exceptional_paths
             .clone_from(&false_vm.exceptional_paths);
         extend_unique(
@@ -676,7 +812,13 @@ impl<'a> ProgramVm<'a> {
     ) {
         self.state = branch.state;
         self.maps = branch.maps;
+        self.lists = branch.lists;
+        self.sets = branch.sets;
+        self.iterators = branch.iterators;
+        self.named_registry = branch.named_registry;
         self.opaque_call_shapes = branch.opaque_call_shapes;
+        self.initialized_classes = branch.initialized_classes;
+        self.initializing_classes = branch.initializing_classes;
         self.unresolved_array_writes = original_unresolved;
         extend_unique(
             &mut self.unresolved_array_writes,
@@ -716,6 +858,7 @@ impl<'a> ProgramVm<'a> {
                 frame.locals.insert(name.clone(), value);
             }
             JimpleValueKind::StaticField { field } => {
+                self.ensure_class_initialized(&field.owner, depth)?;
                 self.state.static_fields.insert(field.clone(), value);
             }
             JimpleValueKind::InstanceField { base, field } => {
@@ -784,7 +927,10 @@ impl<'a> ProgramVm<'a> {
             JimpleValueKind::ArrayLength { value } => {
                 self.evaluate_array_length(frame, value, depth)?
             }
-            JimpleValueKind::New { class_type } => self.allocate_object(class_type),
+            JimpleValueKind::New { class_type } => {
+                self.ensure_class_initialized(class_type, depth)?;
+                self.allocate_object(class_type)
+            }
             JimpleValueKind::NewArray { element_type, size } => {
                 let size = self.evaluate(frame, size, depth)?;
                 self.allocate_array(element_type, &size)
@@ -796,14 +942,24 @@ impl<'a> ProgramVm<'a> {
                 }
             }
             JimpleValueKind::Invoke { .. } => self.evaluate_invoke_value(frame, value, depth)?,
-            _ => self.evaluate_simple(frame, value).with_context(|| {
+            JimpleValueKind::StaticField { field } => {
+                self.ensure_class_initialized(&field.owner, depth)?;
+                self.state
+                    .static_fields
+                    .get(field)
+                    .cloned()
+                    .unwrap_or_else(|| AbstractValue::StaticField {
+                        field: field.clone(),
+                    })
+            }
+            _ => Self::evaluate_simple(frame, value).with_context(|| {
                 format!("unsupported simple Jimple value kind in {}", value.text)
             })?,
         };
         Ok(result)
     }
 
-    fn evaluate_simple(&self, frame: &Frame, value: &JimpleValue) -> Option<AbstractValue> {
+    fn evaluate_simple(frame: &Frame, value: &JimpleValue) -> Option<AbstractValue> {
         match &value.kind {
             JimpleValueKind::Local { name } => Some(
                 frame
@@ -859,15 +1015,6 @@ impl<'a> ProgramVm<'a> {
                         }),
                 )
             }
-            JimpleValueKind::StaticField { field } => Some(
-                self.state
-                    .static_fields
-                    .get(field)
-                    .cloned()
-                    .unwrap_or_else(|| AbstractValue::StaticField {
-                        field: field.clone(),
-                    }),
-            ),
             _ => None,
         }
     }
@@ -1042,7 +1189,13 @@ impl<'a> ProgramVm<'a> {
         arguments: Vec<AbstractValue>,
         depth: usize,
     ) -> Result<AbstractValue> {
+        if invoke_kind == "JStaticInvokeExpr" {
+            self.ensure_class_initialized(&method.owner, depth)?;
+        }
         if let Some(value) = self.invoke_jdk(method, base.as_ref(), &arguments, depth)? {
+            return Ok(value);
+        }
+        if let Some(value) = self.invoke_runtime_library(method, &arguments) {
             return Ok(value);
         }
 
@@ -1097,6 +1250,109 @@ impl<'a> ProgramVm<'a> {
         })
     }
 
+    fn invoke_runtime_library(
+        &mut self,
+        method: &JimpleMethodSignature,
+        arguments: &[AbstractValue],
+    ) -> Option<AbstractValue> {
+        if method.owner != "net.minecraftforge.oredict.OreDictionary" {
+            return None;
+        }
+        match (method.name.as_str(), arguments) {
+            ("registerOre", [name, stack])
+                if method.parameter_types
+                    == ["java.lang.String", "net.minecraft.item.ItemStack"] =>
+            {
+                self.named_registry_insert(name.clone(), stack.clone());
+                Some(AbstractValue::Null)
+            }
+            ("registerOre", [AbstractValue::Integer { value: id }, stack])
+                if method.parameter_types == ["int", "net.minecraft.item.ItemStack"] =>
+            {
+                if let Some(name) = self.named_registry_name(*id) {
+                    self.named_registry_insert(name, stack.clone());
+                }
+                Some(AbstractValue::Null)
+            }
+            ("getOreID", [name]) if method.parameter_types == ["java.lang.String"] => {
+                let id = self.named_registry_id(name.clone());
+                Some(AbstractValue::Integer { value: id })
+            }
+            ("getOreName", [AbstractValue::Integer { value: id }]) => Some(
+                self.named_registry_name(*id)
+                    .unwrap_or(AbstractValue::String {
+                        value: String::new(),
+                    }),
+            ),
+            ("doesOreNameExist", [name]) => Some(AbstractValue::Integer {
+                value: i64::from(self.named_registry_entry(name).is_some()),
+            }),
+            ("getOres", [name]) if method.parameter_types == ["java.lang.String"] => {
+                let values = self
+                    .named_registry_entry(name)
+                    .map_or_else(Vec::new, |(_, values)| values.clone());
+                Some(self.allocate_list("java.util.ArrayList", values))
+            }
+            ("getOres", [name, _]) if method.parameter_types == ["java.lang.String", "boolean"] => {
+                let values = self
+                    .named_registry_entry(name)
+                    .map_or_else(Vec::new, |(_, values)| values.clone());
+                Some(self.allocate_list("java.util.ArrayList", values))
+            }
+            ("getOres", [AbstractValue::Integer { value: id }]) => {
+                let values = self
+                    .named_registry_name(*id)
+                    .and_then(|name| self.named_registry_entry(&name))
+                    .map_or_else(Vec::new, |(_, values)| values.clone());
+                Some(self.allocate_list("java.util.ArrayList", values))
+            }
+            _ => None,
+        }
+    }
+
+    fn named_registry_entry(
+        &self,
+        name: &AbstractValue,
+    ) -> Option<&(AbstractValue, Vec<AbstractValue>)> {
+        self.named_registry
+            .iter()
+            .find(|(existing, _)| existing == name)
+    }
+
+    fn named_registry_insert(&mut self, name: AbstractValue, value: AbstractValue) {
+        if let Some((_, values)) = self
+            .named_registry
+            .iter_mut()
+            .find(|(existing, _)| existing == &name)
+        {
+            if !values.contains(&value) {
+                values.push(value);
+            }
+            return;
+        }
+        self.named_registry.push((name, vec![value]));
+    }
+
+    fn named_registry_id(&mut self, name: AbstractValue) -> i64 {
+        if let Some(index) = self
+            .named_registry
+            .iter()
+            .position(|(existing, _)| existing == &name)
+        {
+            return i64::try_from(index).unwrap_or(i64::MAX);
+        }
+        let id = i64::try_from(self.named_registry.len()).unwrap_or(i64::MAX);
+        self.named_registry.push((name, Vec::new()));
+        id
+    }
+
+    fn named_registry_name(&self, id: i64) -> Option<AbstractValue> {
+        usize::try_from(id)
+            .ok()
+            .and_then(|index| self.named_registry.get(index))
+            .map(|(name, _)| name.clone())
+    }
+
     fn invoke_jdk(
         &mut self,
         method: &JimpleMethodSignature,
@@ -1105,6 +1361,21 @@ impl<'a> ProgramVm<'a> {
         depth: usize,
     ) -> Result<Option<AbstractValue>> {
         if let Some(value) = invoke_big_integer(method, base, arguments) {
+            return Ok(Some(value));
+        }
+        if let Some(value) = invoke_boxed_primitive(method, base, arguments) {
+            return Ok(Some(value));
+        }
+        if let Some(value) = self.invoke_collection_factory(method, arguments) {
+            return Ok(Some(value));
+        }
+        if let Some(value) = self.invoke_list(method, base, arguments)? {
+            return Ok(Some(value));
+        }
+        if let Some(value) = self.invoke_set(method, base, arguments) {
+            return Ok(Some(value));
+        }
+        if let Some(value) = self.invoke_iterator(method, base, arguments) {
             return Ok(Some(value));
         }
         if let Some(value) = self.invoke_stream(method, base, arguments, depth)? {
@@ -1118,11 +1389,204 @@ impl<'a> ProgramVm<'a> {
         }
         if matches!(method.name.as_str(), "put" | "get" | "getOrDefault")
             && let Some(AbstractValue::ObjectRef { id, class_type }) = base
-            && is_jdk_map(class_type)
+            && is_modeled_map(class_type)
         {
             return self.invoke_map(*id, &method.name, arguments).map(Some);
         }
         Ok(None)
+    }
+
+    fn invoke_collection_factory(
+        &mut self,
+        method: &JimpleMethodSignature,
+        arguments: &[AbstractValue],
+    ) -> Option<AbstractValue> {
+        if method.owner == "com.google.common.collect.Lists" && method.name == "newArrayList" {
+            return Some(self.allocate_list("java.util.ArrayList", Vec::new()));
+        }
+        if method.owner == "com.google.common.collect.Maps"
+            && matches!(
+                method.name.as_str(),
+                "newHashMap" | "newHashMapWithExpectedSize"
+            )
+        {
+            return Some(self.allocate_object("java.util.HashMap"));
+        }
+        if method.owner == "com.google.common.collect.Sets" && method.name == "newHashSet" {
+            return Some(self.allocate_object("java.util.HashSet"));
+        }
+        if method.owner == "java.util.Collections" && method.name == "emptyList" {
+            return Some(self.allocate_list("java.util.Collections$EmptyList", Vec::new()));
+        }
+        if method.owner == "java.util.Collections"
+            && method.name == "unmodifiableList"
+            && let [list] = arguments
+        {
+            return Some(list.clone());
+        }
+        None
+    }
+
+    fn invoke_list(
+        &mut self,
+        method: &JimpleMethodSignature,
+        base: Option<&AbstractValue>,
+        arguments: &[AbstractValue],
+    ) -> Result<Option<AbstractValue>> {
+        let Some(AbstractValue::ObjectRef { id, .. }) = base else {
+            return Ok(None);
+        };
+        if !matches!(
+            method.owner.as_str(),
+            "java.util.List" | "java.util.ArrayList"
+        ) || !self.lists.contains_key(id)
+        {
+            return Ok(None);
+        }
+        match (method.name.as_str(), arguments) {
+            ("add", [value]) => {
+                self.lists.entry(*id).or_default().push(value.clone());
+                Ok(Some(AbstractValue::Integer { value: 1 }))
+            }
+            ("get", [AbstractValue::Integer { value: index }]) => {
+                let index = usize::try_from(*index).context("negative list index")?;
+                let value = self
+                    .lists
+                    .get(id)
+                    .and_then(|values| values.get(index))
+                    .cloned()
+                    .unwrap_or(AbstractValue::Null);
+                Ok(Some(value))
+            }
+            ("size", []) => {
+                let size = self.lists.get(id).map_or(0, Vec::len);
+                let size = i64::try_from(size).context("list size does not fit i64")?;
+                Ok(Some(AbstractValue::Integer { value: size }))
+            }
+            ("contains", [needle]) => Ok(Some(AbstractValue::Integer {
+                value: i64::from(
+                    self.lists
+                        .get(id)
+                        .is_some_and(|values| values.contains(needle)),
+                ),
+            })),
+            ("iterator", []) => {
+                let values = self.lists.get(id).cloned().unwrap_or_default();
+                Ok(Some(self.allocate_iterator(values)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn invoke_set(
+        &mut self,
+        method: &JimpleMethodSignature,
+        base: Option<&AbstractValue>,
+        arguments: &[AbstractValue],
+    ) -> Option<AbstractValue> {
+        let Some(AbstractValue::ObjectRef { id, .. }) = base else {
+            return None;
+        };
+        let values = self.sets.get_mut(id)?;
+        match (method.name.as_str(), arguments) {
+            ("add", [value]) => {
+                let inserted = !values.contains(value);
+                if inserted {
+                    values.push(value.clone());
+                }
+                Some(AbstractValue::Integer {
+                    value: i64::from(inserted),
+                })
+            }
+            ("remove", [value]) => {
+                let before = values.len();
+                values.retain(|existing| existing != value);
+                Some(AbstractValue::Integer {
+                    value: i64::from(values.len() != before),
+                })
+            }
+            ("contains", [value]) => Some(AbstractValue::Integer {
+                value: i64::from(values.contains(value)),
+            }),
+            ("isEmpty", []) => Some(AbstractValue::Integer {
+                value: i64::from(values.is_empty()),
+            }),
+            ("size", []) => Some(AbstractValue::Integer {
+                value: i64::try_from(values.len()).unwrap_or(i64::MAX),
+            }),
+            ("clear", []) => {
+                values.clear();
+                Some(AbstractValue::Null)
+            }
+            ("iterator", []) => {
+                let snapshot = values.clone();
+                Some(self.allocate_iterator(snapshot))
+            }
+            _ => None,
+        }
+    }
+
+    fn invoke_iterator(
+        &mut self,
+        method: &JimpleMethodSignature,
+        base: Option<&AbstractValue>,
+        arguments: &[AbstractValue],
+    ) -> Option<AbstractValue> {
+        if method.owner != "java.util.Iterator" || !arguments.is_empty() {
+            return None;
+        }
+        let Some(AbstractValue::ObjectRef { id, .. }) = base else {
+            return None;
+        };
+        let iterator = self.iterators.get_mut(id)?;
+        match method.name.as_str() {
+            "hasNext" => Some(AbstractValue::Integer {
+                value: i64::from(iterator.index < iterator.values.len()),
+            }),
+            "next" => {
+                let value = iterator
+                    .values
+                    .get(iterator.index)
+                    .cloned()
+                    .unwrap_or(AbstractValue::Null);
+                iterator.index = iterator.index.saturating_add(1);
+                Some(value)
+            }
+            _ => None,
+        }
+    }
+
+    fn allocate_list(&mut self, class_type: &str, values: Vec<AbstractValue>) -> AbstractValue {
+        let value = self.allocate_object(class_type);
+        if let AbstractValue::ObjectRef { id, .. } = value {
+            self.lists.insert(id, values);
+            AbstractValue::ObjectRef {
+                id,
+                class_type: class_type.to_owned(),
+            }
+        } else {
+            value
+        }
+    }
+
+    fn allocate_iterator(&mut self, values: Vec<AbstractValue>) -> AbstractValue {
+        let id = self.state.next_id;
+        self.state.next_id = self.state.next_id.saturating_add(1);
+        self.state.objects.insert(
+            id,
+            MutableObject {
+                class_type: String::from("java.util.Iterator"),
+                constructor: None,
+                fields_may_be_opaque: false,
+                fields: BTreeMap::new(),
+            },
+        );
+        self.iterators
+            .insert(id, AbstractIterator { values, index: 0 });
+        AbstractValue::ObjectRef {
+            id,
+            class_type: String::from("java.util.Iterator"),
+        }
     }
 
     fn invoke_stream(
@@ -1322,8 +1786,14 @@ impl<'a> ProgramVm<'a> {
                 fields: BTreeMap::new(),
             },
         );
-        if is_jdk_map(class_type) {
+        if is_modeled_map(class_type) {
             self.maps.insert(id, Vec::new());
+        }
+        if is_modeled_set(class_type) {
+            self.sets.insert(id, Vec::new());
+        }
+        if is_jdk_list(class_type) {
+            self.lists.insert(id, Vec::new());
         }
         AbstractValue::ObjectRef {
             id,
@@ -1354,6 +1824,7 @@ impl<'a> ProgramVm<'a> {
     fn finish(self) -> ProgramExecution {
         ProgramExecution {
             steps: self.steps,
+            initialized_classes: self.initialized_classes.into_iter().collect(),
             static_fields: self
                 .state
                 .static_fields
@@ -1400,6 +1871,21 @@ impl<'a> ProgramVm<'a> {
                         .map(|(key, value)| AbstractMapEntry { key, value })
                         .collect(),
                 })
+                .collect(),
+            lists: self
+                .lists
+                .into_iter()
+                .map(|(object_id, values)| AbstractListSnapshot { object_id, values })
+                .collect(),
+            sets: self
+                .sets
+                .into_iter()
+                .map(|(object_id, values)| AbstractSetSnapshot { object_id, values })
+                .collect(),
+            named_registry: self
+                .named_registry
+                .into_iter()
+                .map(|(name, values)| AbstractNamedRegistryEntry { name, values })
                 .collect(),
             opaque_call_shapes: self.opaque_call_shapes,
             unresolved_array_writes: self.unresolved_array_writes,
@@ -1690,6 +2176,73 @@ fn object_field_value(
     })
 }
 
+fn join_named_registry(
+    left: &[(AbstractValue, Vec<AbstractValue>)],
+    right: &[(AbstractValue, Vec<AbstractValue>)],
+) -> Vec<(AbstractValue, Vec<AbstractValue>)> {
+    let mut joined = left.to_vec();
+    for (name, right_values) in right {
+        if let Some((_, values)) = joined.iter_mut().find(|(existing, _)| existing == name) {
+            for value in right_values {
+                if !values.contains(value) {
+                    values.push(value.clone());
+                }
+            }
+        } else {
+            joined.push((name.clone(), right_values.clone()));
+        }
+    }
+    joined
+}
+
+fn join_sets(
+    left: &BTreeMap<u64, Vec<AbstractValue>>,
+    right: &BTreeMap<u64, Vec<AbstractValue>>,
+) -> BTreeMap<u64, Vec<AbstractValue>> {
+    let ids: BTreeSet<_> = left.keys().chain(right.keys()).copied().collect();
+    ids.into_iter()
+        .filter_map(|id| match (left.get(&id), right.get(&id)) {
+            (Some(left), Some(right)) if left == right => Some((id, left.clone())),
+            (Some(values), None) | (None, Some(values)) => Some((id, values.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+fn join_lists(
+    left: &BTreeMap<u64, Vec<AbstractValue>>,
+    right: &BTreeMap<u64, Vec<AbstractValue>>,
+) -> BTreeMap<u64, Vec<AbstractValue>> {
+    let ids: BTreeSet<_> = left.keys().chain(right.keys()).copied().collect();
+    ids.into_iter()
+        .filter_map(|id| match (left.get(&id), right.get(&id)) {
+            (Some(left), Some(right)) if left.len() == right.len() => Some((
+                id,
+                left.iter()
+                    .zip(right)
+                    .map(|(left, right)| join_value(left, right, &value_type_hint(left)))
+                    .collect(),
+            )),
+            (Some(values), None) | (None, Some(values)) => Some((id, values.clone())),
+            (Some(_), Some(_)) | (None, None) => None,
+        })
+        .collect()
+}
+
+fn join_iterators(
+    left: &BTreeMap<u64, AbstractIterator>,
+    right: &BTreeMap<u64, AbstractIterator>,
+) -> BTreeMap<u64, AbstractIterator> {
+    let ids: BTreeSet<_> = left.keys().chain(right.keys()).copied().collect();
+    ids.into_iter()
+        .filter_map(|id| match (left.get(&id), right.get(&id)) {
+            (Some(left), Some(right)) if left == right => Some((id, left.clone())),
+            (Some(iterator), None) | (None, Some(iterator)) => Some((id, iterator.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
 fn join_maps(
     left: &BTreeMap<u64, Vec<(AbstractValue, AbstractValue)>>,
     right: &BTreeMap<u64, Vec<(AbstractValue, AbstractValue)>>,
@@ -1892,11 +2445,57 @@ fn invoke_string(
     None
 }
 
-fn is_jdk_map(class_type: &str) -> bool {
+fn invoke_boxed_primitive(
+    method: &JimpleMethodSignature,
+    base: Option<&AbstractValue>,
+    arguments: &[AbstractValue],
+) -> Option<AbstractValue> {
+    let primitive_owner = matches!(
+        method.owner.as_str(),
+        "java.lang.Integer"
+            | "java.lang.Long"
+            | "java.lang.Short"
+            | "java.lang.Byte"
+            | "java.lang.Boolean"
+    );
+    if !primitive_owner {
+        return None;
+    }
+    if method.name == "valueOf"
+        && let [value @ AbstractValue::Integer { .. }] = arguments
+    {
+        return Some(value.clone());
+    }
+    if matches!(
+        method.name.as_str(),
+        "intValue" | "longValue" | "shortValue" | "byteValue" | "booleanValue"
+    ) && arguments.is_empty()
+        && let Some(value @ AbstractValue::Integer { .. }) = base
+    {
+        return Some(value.clone());
+    }
+    None
+}
+
+fn is_jdk_list(class_type: &str) -> bool {
+    matches!(
+        class_type,
+        "java.util.ArrayList" | "java.util.LinkedList" | "java.util.Collections$EmptyList"
+    )
+}
+
+fn is_modeled_map(class_type: &str) -> bool {
     matches!(
         class_type,
         "java.util.HashMap" | "java.util.LinkedHashMap" | "java.util.EnumMap"
-    )
+    ) || (class_type.starts_with("it.unimi.dsi.fastutil.") && class_type.ends_with("Map"))
+}
+
+fn is_modeled_set(class_type: &str) -> bool {
+    matches!(
+        class_type,
+        "java.util.HashSet" | "java.util.LinkedHashSet" | "java.util.Collections$EmptySet"
+    ) || (class_type.starts_with("it.unimi.dsi.fastutil.") && class_type.ends_with("Set"))
 }
 
 fn object_binary(
@@ -2265,6 +2864,113 @@ mod tests {
     }
 
     #[test]
+    fn initializes_static_owner_before_first_use() -> Result<()> {
+        let answer_field = field("demo.AutoInit", "ANSWER", "int");
+        let clinit = method(
+            "demo.AutoInit",
+            "<clinit>",
+            vec![
+                statement(
+                    0,
+                    vec![1],
+                    JimpleOperation::Assign {
+                        left: static_field(&answer_field),
+                        right: integer(42),
+                    },
+                ),
+                statement(1, Vec::new(), JimpleOperation::ReturnVoid),
+            ],
+        );
+        let getter = JimpleMethod {
+            signature: JimpleMethodSignature {
+                owner: String::from("demo.AutoInit"),
+                name: String::from("answer"),
+                return_type: String::from("int"),
+                parameter_types: Vec::new(),
+            },
+            display_signature: String::from("<demo.AutoInit: int answer()>"),
+            statements: vec![statement(
+                0,
+                Vec::new(),
+                JimpleOperation::Return {
+                    value: static_field(&answer_field),
+                },
+            )],
+        };
+        let signature = getter.signature.clone();
+        let (returned, execution) = JimpleProgram::new(vec![clinit, getter]).execute_call(
+            &signature,
+            None,
+            Vec::new(),
+            100,
+        )?;
+
+        assert_eq!(returned, Some(AbstractValue::Integer { value: 42 }));
+        assert_eq!(
+            execution.initialized_classes,
+            vec![String::from("demo.AutoInit")]
+        );
+        assert_eq!(
+            execution.static_field_value("demo.AutoInit", "ANSWER"),
+            Some(&AbstractValue::Integer { value: 42 })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_class_initializer_is_not_run_twice() -> Result<()> {
+        let object_field = field("demo.Once", "OBJECT", "demo.Value");
+        let object = local("object", "demo.Value");
+        let clinit = method(
+            "demo.Once",
+            "<clinit>",
+            vec![
+                statement(
+                    0,
+                    vec![1],
+                    JimpleOperation::Assign {
+                        left: object.clone(),
+                        right: new_object("demo.Value"),
+                    },
+                ),
+                statement(
+                    1,
+                    vec![2],
+                    JimpleOperation::Assign {
+                        left: static_field(&object_field),
+                        right: object,
+                    },
+                ),
+                statement(2, Vec::new(), JimpleOperation::ReturnVoid),
+            ],
+        );
+        let read = method(
+            "demo.Once",
+            "read",
+            vec![
+                statement(
+                    0,
+                    vec![1],
+                    JimpleOperation::Assign {
+                        left: local("copy", "demo.Value"),
+                        right: static_field(&object_field),
+                    },
+                ),
+                statement(1, Vec::new(), JimpleOperation::ReturnVoid),
+            ],
+        );
+        let execution = JimpleProgram::new(vec![clinit, read])
+            .execute_named_sequence(&[("demo.Once", "<clinit>"), ("demo.Once", "read")], 100)?;
+
+        assert_eq!(execution.objects.len(), 1);
+        assert_eq!(
+            execution.initialized_classes,
+            vec![String::from("demo.Once"), String::from("demo.Value")]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn executes_exact_method_with_abstract_arguments() -> Result<()> {
         let argument = local("argument", "int");
         let signature = JimpleMethodSignature {
@@ -2405,6 +3111,144 @@ mod tests {
     }
 
     #[test]
+    fn models_finite_list_iteration() -> Result<()> {
+        let program = JimpleProgram::default();
+        let mut vm = ProgramVm::new(&program, 100);
+        let list = vm.allocate_list(
+            "java.util.ArrayList",
+            vec![
+                AbstractValue::Integer { value: 3 },
+                AbstractValue::Integer { value: 5 },
+            ],
+        );
+        let iterator_method = JimpleMethodSignature {
+            owner: String::from("java.util.List"),
+            name: String::from("iterator"),
+            return_type: String::from("java.util.Iterator"),
+            parameter_types: Vec::new(),
+        };
+        let iterator = vm
+            .invoke_list(&iterator_method, Some(&list), &[])?
+            .context("iterator missing")?;
+        let has_next = JimpleMethodSignature {
+            owner: String::from("java.util.Iterator"),
+            name: String::from("hasNext"),
+            return_type: String::from("boolean"),
+            parameter_types: Vec::new(),
+        };
+        let next = JimpleMethodSignature {
+            owner: String::from("java.util.Iterator"),
+            name: String::from("next"),
+            return_type: String::from("java.lang.Object"),
+            parameter_types: Vec::new(),
+        };
+
+        assert_eq!(
+            vm.invoke_iterator(&has_next, Some(&iterator), &[]),
+            Some(AbstractValue::Integer { value: 1 })
+        );
+        assert_eq!(
+            vm.invoke_iterator(&next, Some(&iterator), &[]),
+            Some(AbstractValue::Integer { value: 3 })
+        );
+        assert_eq!(
+            vm.invoke_iterator(&next, Some(&iterator), &[]),
+            Some(AbstractValue::Integer { value: 5 })
+        );
+        assert_eq!(
+            vm.invoke_iterator(&has_next, Some(&iterator), &[]),
+            Some(AbstractValue::Integer { value: 0 })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn models_finite_set_membership_and_iteration() -> Result<()> {
+        let program = JimpleProgram::default();
+        let mut vm = ProgramVm::new(&program, 100);
+        let set = vm.allocate_object("it.unimi.dsi.fastutil.objects.ObjectOpenHashSet");
+        let add = JimpleMethodSignature {
+            owner: String::from("java.util.Set"),
+            name: String::from("add"),
+            return_type: String::from("boolean"),
+            parameter_types: vec![String::from("java.lang.Object")],
+        };
+        let contains = JimpleMethodSignature {
+            owner: String::from("java.util.Set"),
+            name: String::from("contains"),
+            return_type: String::from("boolean"),
+            parameter_types: vec![String::from("java.lang.Object")],
+        };
+        let iterator = JimpleMethodSignature {
+            owner: String::from("java.util.Set"),
+            name: String::from("iterator"),
+            return_type: String::from("java.util.Iterator"),
+            parameter_types: Vec::new(),
+        };
+
+        assert_eq!(
+            vm.invoke_set(&add, Some(&set), &[AbstractValue::Integer { value: 7 }]),
+            Some(AbstractValue::Integer { value: 1 })
+        );
+        assert_eq!(
+            vm.invoke_set(
+                &contains,
+                Some(&set),
+                &[AbstractValue::Integer { value: 7 }]
+            ),
+            Some(AbstractValue::Integer { value: 1 })
+        );
+        let iterator = vm
+            .invoke_set(&iterator, Some(&set), &[])
+            .context("set iterator missing")?;
+        let next = JimpleMethodSignature {
+            owner: String::from("java.util.Iterator"),
+            name: String::from("next"),
+            return_type: String::from("java.lang.Object"),
+            parameter_types: Vec::new(),
+        };
+        assert_eq!(
+            vm.invoke_iterator(&next, Some(&iterator), &[]),
+            Some(AbstractValue::Integer { value: 7 })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn models_guava_collection_factories_without_project_rules() -> Result<()> {
+        let program = JimpleProgram::default();
+        let mut vm = ProgramVm::new(&program, 100);
+        let list_factory = JimpleMethodSignature {
+            owner: String::from("com.google.common.collect.Lists"),
+            name: String::from("newArrayList"),
+            return_type: String::from("java.util.ArrayList"),
+            parameter_types: Vec::new(),
+        };
+        let map_factory = JimpleMethodSignature {
+            owner: String::from("com.google.common.collect.Maps"),
+            name: String::from("newHashMapWithExpectedSize"),
+            return_type: String::from("java.util.HashMap"),
+            parameter_types: vec![String::from("int")],
+        };
+
+        let list = vm
+            .invoke_collection_factory(&list_factory, &[])
+            .context("list factory missing")?;
+        let map = vm
+            .invoke_collection_factory(&map_factory, &[AbstractValue::Integer { value: 96 }])
+            .context("map factory missing")?;
+        let AbstractValue::ObjectRef { id: list_id, .. } = list else {
+            bail!("list factory did not allocate an object");
+        };
+        let AbstractValue::ObjectRef { id: map_id, .. } = map else {
+            bail!("map factory did not allocate an object");
+        };
+        assert_eq!(vm.lists.get(&list_id), Some(&Vec::new()));
+        assert_eq!(vm.maps.get(&map_id), Some(&Vec::new()));
+        Ok(())
+    }
+
+    #[test]
     fn records_unresolved_call_shapes_with_receiver_provenance() -> Result<()> {
         let target_field = field("demo.Registry", "TARGET", "demo.Api");
         let call = invoke(
@@ -2443,6 +3287,123 @@ mod tests {
             })
         );
         assert_eq!(shape.arguments, vec![AbstractValue::Integer { value: 7 }]);
+        Ok(())
+    }
+
+    fn registry_lookup_method(
+        map_field: &super::super::JimpleFieldSignature,
+    ) -> (JimpleMethodSignature, JimpleMethod) {
+        let key = local("key", "int");
+        let result = local("result", "java.lang.Object");
+        let signature = JimpleMethodSignature {
+            owner: String::from("demo.Registry"),
+            name: String::from("lookup"),
+            return_type: String::from("java.lang.Object"),
+            parameter_types: vec![String::from("int")],
+        };
+        let method = JimpleMethod {
+            signature: signature.clone(),
+            display_signature: String::from("<demo.Registry: java.lang.Object lookup(int)>"),
+            statements: vec![
+                statement(
+                    0,
+                    vec![1],
+                    JimpleOperation::Identity {
+                        left: key.clone(),
+                        right: value(
+                            JimpleValueKind::Parameter { index: 0 },
+                            "int",
+                            "@parameter0",
+                        ),
+                    },
+                ),
+                statement(
+                    1,
+                    vec![2],
+                    JimpleOperation::Assign {
+                        left: result.clone(),
+                        right: invoke(
+                            static_field(map_field),
+                            "java.util.HashMap",
+                            "get",
+                            vec!["java.lang.Object"],
+                            vec![key],
+                        ),
+                    },
+                ),
+                statement(2, Vec::new(), JimpleOperation::Return { value: result }),
+            ],
+        };
+        (signature, method)
+    }
+
+    #[test]
+    fn startup_registry_state_flows_into_followup_helper_call() -> Result<()> {
+        let map_field = field("demo.Registry", "MAP", "java.util.HashMap");
+        let map = local("map", "java.util.HashMap");
+        let clinit = method(
+            "demo.Registry",
+            "<clinit>",
+            vec![
+                statement(
+                    0,
+                    vec![1],
+                    JimpleOperation::Assign {
+                        left: map.clone(),
+                        right: new_object("java.util.HashMap"),
+                    },
+                ),
+                statement(
+                    1,
+                    vec![2],
+                    JimpleOperation::Assign {
+                        left: static_field(&map_field),
+                        right: map,
+                    },
+                ),
+                statement(2, Vec::new(), JimpleOperation::ReturnVoid),
+            ],
+        );
+        let register = method(
+            "demo.Registry",
+            "register",
+            vec![
+                statement(
+                    0,
+                    vec![1],
+                    JimpleOperation::Invoke {
+                        expression: Some(invoke(
+                            static_field(&map_field),
+                            "java.util.HashMap",
+                            "put",
+                            vec!["java.lang.Object", "java.lang.Object"],
+                            vec![integer(7), integer(9)],
+                        )),
+                    },
+                ),
+                statement(1, Vec::new(), JimpleOperation::ReturnVoid),
+            ],
+        );
+        let (signature, lookup) = registry_lookup_method(&map_field);
+
+        let program = JimpleProgram::new(vec![clinit, register, lookup]);
+        let (returned, execution) = program.execute_named_sequence_then_call(
+            &[("demo.Registry", "register")],
+            &signature,
+            None,
+            vec![AbstractValue::Integer { value: 7 }],
+            100,
+        )?;
+
+        assert_eq!(returned, Some(AbstractValue::Integer { value: 9 }));
+        assert_eq!(execution.maps.len(), 1);
+        assert_eq!(
+            execution.initialized_classes,
+            vec![
+                String::from("demo.Registry"),
+                String::from("java.util.HashMap")
+            ]
+        );
         Ok(())
     }
 
