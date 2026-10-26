@@ -17,7 +17,7 @@ use crate::{
     recipe_expression::{
         literal_i64, recover_items, recover_items_with_project, resolved_reference_name,
     },
-    scalar_expression::scalar_i64,
+    scalar_expression::{scalar_i64, scalar_i64_at},
 };
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -507,7 +507,7 @@ fn collect_metadata_entry<'a>(
         }
     } else if let Some(spec) = minimum_capability_metadata(key) {
         if let Some(level) =
-            lower_capability_requirement(recipe, key, spec, value, bindings, project, blockers)
+            lower_capability_requirement(recipe, call, key, spec, bindings, project, blockers)
         {
             state
                 .minimum_capabilities
@@ -1479,13 +1479,14 @@ fn lower_exact_algae_tier(
 
 fn lower_capability_requirement(
     recipe: &RecipeDefinition,
+    call: &crate::BuilderCall,
     key: &str,
     spec: MinimumCapabilityMetadata,
-    value: &JavaExpression,
     bindings: &JavaBindings,
     project: Option<&JavaProjectIndex>,
     blockers: &mut Vec<RecipeLoweringBlocker>,
 ) -> Option<u64> {
+    let value = call.argument_expressions.get(1)?;
     if !spec.recipe_maps.contains(&recipe.recipe_map.as_str()) {
         push_blocker(
             blockers,
@@ -1497,7 +1498,7 @@ fn lower_capability_requirement(
         );
         return None;
     }
-    let Some(level) = lower_nonnegative_scalar(value, bindings, project) else {
+    let Some(level) = lower_nonnegative_scalar_at(recipe, call, value, bindings, project) else {
         push_blocker(
             blockers,
             RecipeLoweringBlockerKind::Metadata,
@@ -2198,6 +2199,28 @@ fn minimum_capability_metadata(key: &str) -> Option<MinimumCapabilityMetadata> {
         capability,
         recipe_maps,
     })
+}
+
+fn lower_nonnegative_scalar_at(
+    recipe: &RecipeDefinition,
+    call: &crate::BuilderCall,
+    expression: &JavaExpression,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+) -> Option<u64> {
+    let value = project.map_or_else(
+        || literal_i64(expression),
+        |project| {
+            scalar_i64_at(
+                expression,
+                bindings,
+                project,
+                &recipe.origin.path,
+                call.byte_start,
+            )
+        },
+    )?;
+    u64::try_from(value).ok()
 }
 
 fn lower_nonnegative_scalar(
@@ -4583,11 +4606,12 @@ mod tests {
             import gregtech.api.enums.GTValues;
             import gregtech.api.enums.Materials;
             class Recipes {
+                static final int COAL_LV = 6;
                 void component() {
                     GTValues.RA.stdBuilder()
                         .itemInputs(Materials.Iron.getDust(1))
                         .itemOutputs(Materials.Steel.getDust(1))
-                        .metadata(COAL_CASING_TIER, 6)
+                        .metadata(COAL_CASING_TIER, COAL_LV)
                         .duration(20).eut(2).addTo(componentAssemblyLineRecipes);
                 }
                 void chemical() {
@@ -4628,7 +4652,9 @@ mod tests {
             }
         ";
         let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
-        let recovery = recover(&analysis);
+        let mut project = JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let recovery = crate::recover_with_project(&analysis, &project);
         let expected = [
             ("machine_capability.component_assembly_line_casing", 6),
             ("machine_capability.chemical_plant_solid_casing", 3),
@@ -4639,7 +4665,7 @@ mod tests {
         ];
         assert_eq!(recovery.recipes.len(), expected.len());
         for (recipe, (capability, level)) in recovery.recipes.iter().zip(expected) {
-            let lowered = lower_recipe(recipe, &analysis.bindings)
+            let lowered = super::lower_recipe_with_project(recipe, &analysis.bindings, &project)
                 .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
             assert_eq!(
                 lowered.requirements,

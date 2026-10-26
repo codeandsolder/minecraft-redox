@@ -1330,3 +1330,27 @@ Full pinned-corpus result:
 - missing-EU/t blockers: **24**;
 - post-add blockers: **7**;
 - modifier blockers: **6**.
+
+
+### Call-site scalar owner resolution
+
+Project scalar evaluation can now start from the Java owner enclosing the exact source use site. This lets unqualified same-class `static final` constants participate in the same recursive scalar evaluator used for qualified fields, arrays, casts, and arithmetic, while local variables and parameters retain normal Java shadowing semantics.
+
+The target uses this path for machine-capability metadata by carrying the builder call's source byte position into scalar reduction. No project-specific constant table is involved: for example, `COAL_LV` in `ComponentAssemblyLineLoader` resolves through that class's own field initializer.
+
+This removes the Component Assembly Line casing-tier blocker family without changing the capability IR or loosening dynamic metadata handling.
+
+Full pinned-corpus result:
+
+- target recipes lowered: **4,309 / 5,791 (74.41%)**, up from 4,287 / 5,791 (74.03%);
+- metadata blockers: **224**, down from 331;
+- item-input blockers: **1,029**;
+- item-output blockers: **823**;
+- fluid blockers: **291**;
+- non-constant EU/t blockers: **417**;
+- missing-duration blockers: **332**;
+- chance blockers: **50**;
+- special blockers: **31**;
+- missing-EU/t blockers: **24**;
+- post-add blockers: **7**;
+- modifier blockers: **6**.

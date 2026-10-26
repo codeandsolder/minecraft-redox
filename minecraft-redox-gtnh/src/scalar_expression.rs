@@ -15,6 +15,18 @@ pub(crate) fn scalar_i64(
     eval_i64(expression, bindings, project, None, 0, &mut seen)
 }
 
+pub(crate) fn scalar_i64_at(
+    expression: &JavaExpression,
+    bindings: &JavaBindings,
+    project: &JavaProjectIndex,
+    source_path: &str,
+    byte_position: usize,
+) -> Option<i64> {
+    let mut seen = BTreeSet::new();
+    let current_owner = project.enclosing_owner_at(source_path, byte_position);
+    eval_i64(expression, bindings, project, current_owner, 0, &mut seen)
+}
+
 fn eval_i64(
     expression: &JavaExpression,
     bindings: &JavaBindings,

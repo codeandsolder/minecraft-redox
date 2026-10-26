@@ -701,6 +701,13 @@ impl JavaProjectIndex {
             })
     }
 
+    /// Return the fully-qualified owner of the method/constructor enclosing a use site.
+    #[must_use]
+    pub fn enclosing_owner_at(&self, path: &str, byte_position: usize) -> Option<&str> {
+        self.enclosing_method(path, byte_position)
+            .map(|method| method.owner.as_str())
+    }
+
     #[must_use]
     pub fn resolve_value_at(
         &self,
