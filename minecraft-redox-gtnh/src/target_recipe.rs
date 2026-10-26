@@ -3,9 +3,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use minecraft_redox_core::{
     SourceOrigin,
     content::{
-        ContentId, ContentRecipe, FluidInputSpec, FluidSelector, FluidStackSpec, ItemFuelSpec,
-        ItemInputSpec, ItemInputStackSpec, ItemOutputSpec, ItemSelector, ItemStackSpec,
-        ContentAvailabilityRequirement, Probability, ProgressResourceSpec, RecipeExecutionMode,
+        ContentAvailabilityRequirement, ContentId, ContentRecipe, FluidInputSpec, FluidSelector,
+        FluidStackSpec, ItemFuelSpec, ItemInputSpec, ItemInputStackSpec, ItemOutputSpec,
+        ItemSelector, ItemStackSpec, Probability, ProgressResourceSpec, RecipeExecutionMode,
         RecipeInputConstraint, RecipeProgress, RecipeRequirement, RecipeUnlock,
     },
 };
@@ -173,11 +173,7 @@ fn lower_recipe_internal(
     if blockers.is_empty()
         && let (Some(duration_ticks), Some(eut)) = (duration_ticks, eut)
     {
-        let target_eut = if lowered_metadata.item_fuel.is_some() {
-            0
-        } else {
-            eut
-        };
+        let target_eut = lowered_metadata.item_fuel.as_ref().map_or(eut, |_| 0);
         return Ok(ContentRecipe {
             origin: recipe.origin.clone(),
             recipe_map: lowered_metadata
@@ -193,6 +189,7 @@ fn lower_recipe_internal(
             requirements: lowered_metadata.requirements,
             unlock: lowered_metadata.unlock,
             startup_energy_eu: lowered_metadata.startup_energy_eu,
+            generated_energy_eu_per_tick: lowered_metadata.generated_energy_eu_per_tick,
             fuel_energy_eu_per_liter: lowered_metadata.fuel_energy_eu_per_liter,
             item_fuel: lowered_metadata.item_fuel,
             progress: lowered_metadata
@@ -399,6 +396,7 @@ struct LoweredMetadata {
     requirements: Vec<RecipeRequirement>,
     unlock: Option<RecipeUnlock>,
     startup_energy_eu: u64,
+    generated_energy_eu_per_tick: u64,
     fuel_energy_eu_per_liter: Option<u64>,
     item_fuel: Option<ItemFuelSpec>,
     recipe_map_override: Option<ContentId>,
@@ -413,6 +411,7 @@ struct MetadataAccumulator<'a> {
     minimum_capabilities: BTreeMap<ContentId, u64>,
     exact_capabilities: BTreeMap<ContentId, u64>,
     startup_energy_eu: u64,
+    generated_energy_eu_per_tick: u64,
     fuel_value: Option<(&'a crate::BuilderCall, &'a JavaExpression)>,
     fuel_type: Option<(&'a crate::BuilderCall, &'a JavaExpression)>,
     rtg_duration_days: Option<(&'a crate::BuilderCall, &'a JavaExpression)>,
@@ -482,6 +481,7 @@ fn lower_metadata(
         requirements,
         unlock,
         startup_energy_eu: state.startup_energy_eu,
+        generated_energy_eu_per_tick: state.generated_energy_eu_per_tick,
         fuel_energy_eu_per_liter,
         item_fuel,
         recipe_map_override,
@@ -551,6 +551,12 @@ fn collect_metadata_entry<'a>(
             lower_fusion_startup_energy(recipe, call, value, bindings, project, blockers)
         {
             state.startup_energy_eu = value;
+        }
+    } else if key == "gregtech.api.util.GTRecipeConstants.LFTR_OUTPUT_POWER" {
+        if let Some(value) =
+            lower_lftr_generated_energy(recipe, call, value, bindings, project, blockers)
+        {
+            state.generated_energy_eu_per_tick = value;
         }
     } else if key == "gregtech.api.util.GTRecipeConstants.FUEL_VALUE" {
         state.fuel_value = Some((call, value));
@@ -1517,6 +1523,46 @@ fn lower_capability_requirement(
     Some(level)
 }
 
+fn lower_lftr_generated_energy(
+    recipe: &RecipeDefinition,
+    call: &crate::BuilderCall,
+    value: &JavaExpression,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+    blockers: &mut Vec<RecipeLoweringBlocker>,
+) -> Option<u64> {
+    const LFTR_MAP: &str = "gregtech.api.recipe.RecipeMaps.liquidFluorineThoriumReactorRecipes";
+    if recipe.recipe_map != LFTR_MAP {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            format!(
+                "LFTR output power used on unsupported recipe map {}",
+                recipe.recipe_map
+            ),
+        );
+        return None;
+    }
+    let Some(nominal_eut) = lower_nonnegative_scalar_at(recipe, call, value, bindings, project)
+    else {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            "LFTR output power is not a static non-negative rate",
+        );
+        return None;
+    };
+    let Some(total_eut) = nominal_eut.checked_mul(4) else {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            "LFTR total generated power overflows target EU/t",
+        );
+        return None;
+    };
+    Some(total_eut)
+}
+
 fn lower_fusion_startup_energy(
     recipe: &RecipeDefinition,
     call: &crate::BuilderCall,
@@ -2451,7 +2497,9 @@ fn lower_outputs(
                 push_blocker(
                     blockers,
                     RecipeLoweringBlockerKind::ItemOutput,
-                    format!("output {index}: conditional outputs with explicit chances are unsupported"),
+                    format!(
+                        "output {index}: conditional outputs with explicit chances are unsupported"
+                    ),
                 );
                 continue;
             }
@@ -2517,11 +2565,7 @@ fn module_conditional_item_parts(
             module,
             when_present,
             when_absent,
-        } => Some((
-            module,
-            when_present.as_deref(),
-            when_absent.as_deref(),
-        )),
+        } => Some((module, when_present.as_deref(), when_absent.as_deref())),
         ItemSemantic::InlinedMethod { result, .. } | ItemSemantic::InlinedValue { result, .. } => {
             module_conditional_item_parts(result)
         }
@@ -3188,13 +3232,16 @@ fn lower_fluid_semantic(
             amount,
         } if source_ref.contains('.')
             && !source_ref.starts_with("this.")
-            && !source_ref.starts_with("super.") => Some(FluidStackSpec {
+            && !source_ref.starts_with("super.") =>
+        {
+            Some(FluidStackSpec {
                 selector: FluidSelector::MaterialForm {
                     material: ContentId::new(source_ref.clone()),
                     form: ContentId::new(fluid_form(accessor)?),
                 },
                 amount: scalar_amount_u64(amount, bindings, project)?,
-            }),
+            })
+        }
         FluidSemantic::FluidStack { fluid, amount } => Some(FluidStackSpec {
             selector: lower_fluid_selector_expression(fluid, bindings, project)?,
             amount: scalar_amount_u64(amount, bindings, project)?,
@@ -3320,9 +3367,7 @@ fn lower_transparent_linked_fluid_helper(
     bindings: &JavaBindings,
     project: Option<&JavaProjectIndex>,
 ) -> Option<FluidStackSpec> {
-    if method_id == "gtPlusPlus.core.material.Material#getFluidStack(int)"
-        && arguments.len() == 1
-    {
+    if method_id == "gtPlusPlus.core.material.Material#getFluidStack(int)" && arguments.len() == 1 {
         let material = concrete_gtpp_material_receiver(receiver?, bindings)?;
         if !material.starts_with("gtPlusPlus.") {
             return None;
@@ -3430,9 +3475,9 @@ fn push_blocker(
 #[cfg(test)]
 mod tests {
     use minecraft_redox_core::content::{
-        FluidInputSpec, FluidSelector, ItemInputSpec, ItemSelector, Probability,
-        ContentAvailabilityRequirement, RecipeExecutionMode, RecipeInputConstraint, RecipeProgress,
-        RecipeRequirement, RecipeUnlock,
+        ContentAvailabilityRequirement, FluidInputSpec, FluidSelector, ItemInputSpec, ItemSelector,
+        Probability, RecipeExecutionMode, RecipeInputConstraint, RecipeProgress, RecipeRequirement,
+        RecipeUnlock,
     };
     use minecraft_redox_java::{JavaExpression, JavaProjectIndex, analyze_source};
 
@@ -3929,8 +3974,9 @@ mod tests {
         }
         let recovery = crate::recover_with_project(&recipe, &project);
         assert_eq!(recovery.recipes.len(), 2);
-        let lowered = super::lower_recipe_with_project(&recovery.recipes[0], &recipe.bindings, &project)
-            .map_err(|failure| anyhow::anyhow!("qualified linked item failed: {failure:?}"))?;
+        let lowered =
+            super::lower_recipe_with_project(&recovery.recipes[0], &recipe.bindings, &project)
+                .map_err(|failure| anyhow::anyhow!("qualified linked item failed: {failure:?}"))?;
         let ItemInputSpec::Stack(input) = &lowered.item_inputs[0] else {
             return Err(anyhow::anyhow!("linked item became alternatives"));
         };
@@ -3940,10 +3986,16 @@ mod tests {
                 if material.as_str() == "demo.Pool.Phosgene"
                     && form.as_str() == "gregtech.api.enums.OrePrefixes.cell"
         ));
-        let failure = super::lower_recipe_with_project(&recovery.recipes[1], &recipe.bindings, &project)
-            .err()
-            .ok_or_else(|| anyhow::anyhow!("dynamic linked receiver unexpectedly lowered"))?;
-        assert!(failure.blockers.iter().any(|blocker| blocker.kind == RecipeLoweringBlockerKind::ItemInput));
+        let failure =
+            super::lower_recipe_with_project(&recovery.recipes[1], &recipe.bindings, &project)
+                .err()
+                .ok_or_else(|| anyhow::anyhow!("dynamic linked receiver unexpectedly lowered"))?;
+        assert!(
+            failure
+                .blockers
+                .iter()
+                .any(|blocker| blocker.kind == RecipeLoweringBlockerKind::ItemInput)
+        );
         Ok(())
     }
 
@@ -4445,6 +4497,135 @@ mod tests {
         assert!(failure.blockers.iter().any(|blocker| {
             blocker.kind == RecipeLoweringBlockerKind::ItemInput
                 && blocker.detail.contains("non-circuit item input")
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn lowers_lftr_output_power_as_generated_energy_rate() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.recipe.RecipeMaps.liquidFluorineThoriumReactorRecipes;
+            import static gregtech.api.util.GTRecipeConstants.LFTR_OUTPUT_POWER;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            class Recipes {
+                static final int BASE_POWER = 32_768;
+                void run() {
+                    GTValues.RA.stdBuilder()
+                        .fluidInputs(Materials.Water.getFluid(100))
+                        .fluidOutputs(Materials.Steam.getGas(100))
+                        .metadata(LFTR_OUTPUT_POWER, BASE_POWER * 4)
+                        .duration(2000)
+                        .eut(0)
+                        .addTo(liquidFluorineThoriumReactorRecipes);
+                }
+            }
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let mut project = JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let recovery = recover_with_project(&analysis, &project);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let lowered = lower_recipe_with_project(recipe, &analysis.bindings, &project)
+            .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
+        assert_eq!(lowered.generated_energy_eu_per_tick, 524_288);
+        assert_eq!(lowered.eut, 0);
+        assert_eq!(
+            lowered.progress,
+            RecipeProgress::Timed {
+                duration_ticks: 2000
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn lftr_output_power_on_wrong_map_stays_blocked() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+            import static gregtech.api.util.GTRecipeConstants.LFTR_OUTPUT_POWER;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .itemInputs(Materials.Iron.getDust(1))
+                    .itemOutputs(Materials.Steel.getDust(1))
+                    .metadata(LFTR_OUTPUT_POWER, 8192)
+                    .duration(20)
+                    .eut(2)
+                    .addTo(compressorRecipes);
+            }}
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let recovery = recover(&analysis);
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let failure = lower_recipe(recipe, &analysis.bindings)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("wrong-map LFTR metadata unexpectedly lowered"))?;
+        assert!(failure.blockers.iter().any(|blocker| {
+            blocker.kind == RecipeLoweringBlockerKind::Metadata
+                && blocker
+                    .detail
+                    .contains("LFTR output power used on unsupported recipe map")
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn dynamic_or_overflowing_lftr_output_power_stays_blocked() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.recipe.RecipeMaps.liquidFluorineThoriumReactorRecipes;
+            import static gregtech.api.util.GTRecipeConstants.LFTR_OUTPUT_POWER;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            class Recipes {
+                void dynamic(int power) {
+                    GTValues.RA.stdBuilder()
+                        .fluidInputs(Materials.Water.getFluid(100))
+                        .fluidOutputs(Materials.Steam.getGas(100))
+                        .metadata(LFTR_OUTPUT_POWER, power)
+                        .duration(20).eut(0).addTo(liquidFluorineThoriumReactorRecipes);
+                }
+                void overflowing() {
+                    GTValues.RA.stdBuilder()
+                        .fluidInputs(Materials.Water.getFluid(100))
+                        .fluidOutputs(Materials.Steam.getGas(100))
+                        .metadata(LFTR_OUTPUT_POWER, Long.MAX_VALUE)
+                        .duration(20).eut(0).addTo(liquidFluorineThoriumReactorRecipes);
+                }
+            }
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let mut project = JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let recovery = recover_with_project(&analysis, &project);
+        assert_eq!(recovery.recipes.len(), 2);
+
+        let dynamic = lower_recipe_with_project(&recovery.recipes[0], &analysis.bindings, &project)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("dynamic LFTR metadata unexpectedly lowered"))?;
+        assert!(dynamic.blockers.iter().any(|blocker| {
+            blocker.kind == RecipeLoweringBlockerKind::Metadata
+                && blocker
+                    .detail
+                    .contains("LFTR output power is not a static non-negative rate")
+        }));
+
+        let overflowing =
+            lower_recipe_with_project(&recovery.recipes[1], &analysis.bindings, &project)
+                .err()
+                .ok_or_else(|| anyhow::anyhow!("overflowing LFTR metadata unexpectedly lowered"))?;
+        assert!(overflowing.blockers.iter().any(|blocker| {
+            blocker.kind == RecipeLoweringBlockerKind::Metadata
+                && blocker
+                    .detail
+                    .contains("LFTR total generated power overflows target EU/t")
         }));
         Ok(())
     }
@@ -5911,8 +6092,9 @@ mod tests {
         let recovery = crate::recover_with_project(&analysis, &project);
         assert_eq!(recovery.recipes.len(), 3);
 
-        let lowered = super::lower_recipe_with_project(&recovery.recipes[0], &analysis.bindings, &project)
-            .map_err(|failure| anyhow::anyhow!("conditional output failed: {failure:?}"))?;
+        let lowered =
+            super::lower_recipe_with_project(&recovery.recipes[0], &analysis.bindings, &project)
+                .map_err(|failure| anyhow::anyhow!("conditional output failed: {failure:?}"))?;
         assert_eq!(lowered.item_outputs.len(), 1);
         let output = &lowered.item_outputs[0];
         assert_eq!(output.stack.amount, 1);
@@ -5930,11 +6112,15 @@ mod tests {
         for recipe in &recovery.recipes[1..] {
             let failure = super::lower_recipe_with_project(recipe, &analysis.bindings, &project)
                 .err()
-                .ok_or_else(|| anyhow::anyhow!("unsupported conditional output unexpectedly lowered"))?;
-            assert!(failure
-                .blockers
-                .iter()
-                .any(|blocker| blocker.kind == RecipeLoweringBlockerKind::ItemOutput));
+                .ok_or_else(|| {
+                    anyhow::anyhow!("unsupported conditional output unexpectedly lowered")
+                })?;
+            assert!(
+                failure
+                    .blockers
+                    .iter()
+                    .any(|blocker| blocker.kind == RecipeLoweringBlockerKind::ItemOutput)
+            );
         }
         Ok(())
     }
@@ -6099,12 +6285,9 @@ mod tests {
         }
         let recovery = crate::recover_with_project(&recipe, &project);
         assert_eq!(recovery.recipes.len(), 2);
-        let lowered = super::lower_recipe_with_project(
-            &recovery.recipes[0],
-            &recipe.bindings,
-            &project,
-        )
-        .map_err(|failure| anyhow::anyhow!("GT++ fluid lowering failed: {failure:?}"))?;
+        let lowered =
+            super::lower_recipe_with_project(&recovery.recipes[0], &recipe.bindings, &project)
+                .map_err(|failure| anyhow::anyhow!("GT++ fluid lowering failed: {failure:?}"))?;
         let FluidInputSpec::Stack(input) = &lowered.fluid_inputs[0] else {
             return Err(anyhow::anyhow!("GT++ fluid input became alternatives"));
         };
@@ -6123,17 +6306,18 @@ mod tests {
                     && form.as_str() == "plasma"
         ));
 
-        let failure = super::lower_recipe_with_project(
-            &recovery.recipes[1],
-            &recipe.bindings,
-            &project,
-        )
-        .err()
-        .ok_or_else(|| anyhow::anyhow!("dynamic GT++ material fluid unexpectedly lowered"))?;
-        assert!(failure
-            .blockers
-            .iter()
-            .any(|blocker| blocker.kind == RecipeLoweringBlockerKind::Fluids));
+        let failure =
+            super::lower_recipe_with_project(&recovery.recipes[1], &recipe.bindings, &project)
+                .err()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("dynamic GT++ material fluid unexpectedly lowered")
+                })?;
+        assert!(
+            failure
+                .blockers
+                .iter()
+                .any(|blocker| blocker.kind == RecipeLoweringBlockerKind::Fluids)
+        );
         Ok(())
     }
 
@@ -6169,12 +6353,9 @@ mod tests {
         project.add_analysis(&analysis);
         let recovery = crate::recover_with_project(&analysis, &project);
         assert_eq!(recovery.recipes.len(), 2);
-        let lowered = super::lower_recipe_with_project(
-            &recovery.recipes[0],
-            &analysis.bindings,
-            &project,
-        )
-        .map_err(|failure| anyhow::anyhow!("nested fluid lowering failed: {failure:?}"))?;
+        let lowered =
+            super::lower_recipe_with_project(&recovery.recipes[0], &analysis.bindings, &project)
+                .map_err(|failure| anyhow::anyhow!("nested fluid lowering failed: {failure:?}"))?;
         let FluidInputSpec::Stack(input) = &lowered.fluid_inputs[0] else {
             return Err(anyhow::anyhow!("distilled-water copy became alternatives"));
         };
@@ -6186,17 +6367,16 @@ mod tests {
             FluidSelector::Named { id } if id.as_str() == "molten.dragonblood"
         ));
 
-        let failure = super::lower_recipe_with_project(
-            &recovery.recipes[1],
-            &analysis.bindings,
-            &project,
-        )
-        .err()
-        .ok_or_else(|| anyhow::anyhow!("dynamic registry fluid unexpectedly lowered"))?;
-        assert!(failure
-            .blockers
-            .iter()
-            .any(|blocker| blocker.kind == RecipeLoweringBlockerKind::Fluids));
+        let failure =
+            super::lower_recipe_with_project(&recovery.recipes[1], &analysis.bindings, &project)
+                .err()
+                .ok_or_else(|| anyhow::anyhow!("dynamic registry fluid unexpectedly lowered"))?;
+        assert!(
+            failure
+                .blockers
+                .iter()
+                .any(|blocker| blocker.kind == RecipeLoweringBlockerKind::Fluids)
+        );
         Ok(())
     }
 
@@ -6383,21 +6563,38 @@ mod tests {
         let recovery = crate::recover_with_project(&analysis, &project);
         assert_eq!(recovery.recipes.len(), 2);
         let expected = [
-            ("gregtech.api.enums.Mods.IndustrialCraft2", "ic2coolant", "gregtech.api.enums.Materials.Water"),
-            ("gregtech.api.enums.Mods.Gendustry", "liquiddna", "gregtech.api.enums.Materials.Biomass"),
+            (
+                "gregtech.api.enums.Mods.IndustrialCraft2",
+                "ic2coolant",
+                "gregtech.api.enums.Materials.Water",
+            ),
+            (
+                "gregtech.api.enums.Mods.Gendustry",
+                "liquiddna",
+                "gregtech.api.enums.Materials.Biomass",
+            ),
         ];
-        for (recipe, (module_id, preferred_id, fallback_material)) in recovery.recipes.iter().zip(expected) {
+        for (recipe, (module_id, preferred_id, fallback_material)) in
+            recovery.recipes.iter().zip(expected)
+        {
             let lowered = super::lower_recipe_with_project(recipe, &analysis.bindings, &project)
                 .map_err(|failure| anyhow::anyhow!("conditional fluid failed: {failure:?}"))?;
             let FluidInputSpec::Stack(input) = &lowered.fluid_inputs[0] else {
                 return Err(anyhow::anyhow!("conditional fluid became alternatives"));
             };
             assert_eq!(input.amount, 1000);
-            let FluidSelector::ContentModuleConditional { module, when_present, when_absent } = &input.selector else {
+            let FluidSelector::ContentModuleConditional {
+                module,
+                when_present,
+                when_absent,
+            } = &input.selector
+            else {
                 return Err(anyhow::anyhow!("module fallback did not stay conditional"));
             };
             assert_eq!(module.as_str(), module_id);
-            assert!(matches!(when_present.as_ref(), FluidSelector::Named { id } if id.as_str() == preferred_id));
+            assert!(
+                matches!(when_present.as_ref(), FluidSelector::Named { id } if id.as_str() == preferred_id)
+            );
             assert!(matches!(
                 when_absent.as_ref(),
                 FluidSelector::MaterialForm { material, form }
@@ -6766,15 +6963,16 @@ mod tests {
         let recovery = crate::recover_with_project(&analysis, &project);
         assert_eq!(recovery.recipes.len(), 2);
 
-        let lowered = super::lower_recipe_with_project(
-            &recovery.recipes[0],
-            &analysis.bindings,
-            &project,
-        )
-        .map_err(|failure| anyhow::anyhow!("ore-dict object lowering failed: {failure:?}"))?;
+        let lowered =
+            super::lower_recipe_with_project(&recovery.recipes[0], &analysis.bindings, &project)
+                .map_err(|failure| {
+                    anyhow::anyhow!("ore-dict object lowering failed: {failure:?}")
+                })?;
         assert_eq!(lowered.item_inputs.len(), 2);
         let ItemInputSpec::Stack(material_form) = &lowered.item_inputs[0] else {
-            return Err(anyhow::anyhow!("material-form ore input became alternatives"));
+            return Err(anyhow::anyhow!(
+                "material-form ore input became alternatives"
+            ));
         };
         assert_eq!(material_form.amount, 4);
         assert!(matches!(
@@ -6792,17 +6990,16 @@ mod tests {
             ItemSelector::OreKey { key } if key.as_str() == "circuitSpecial"
         ));
 
-        let failure = super::lower_recipe_with_project(
-            &recovery.recipes[1],
-            &analysis.bindings,
-            &project,
-        )
-        .err()
-        .ok_or_else(|| anyhow::anyhow!("dynamic ore-dict amount unexpectedly lowered"))?;
-        assert!(failure
-            .blockers
-            .iter()
-            .any(|blocker| blocker.kind == RecipeLoweringBlockerKind::ItemInput));
+        let failure =
+            super::lower_recipe_with_project(&recovery.recipes[1], &analysis.bindings, &project)
+                .err()
+                .ok_or_else(|| anyhow::anyhow!("dynamic ore-dict amount unexpectedly lowered"))?;
+        assert!(
+            failure
+                .blockers
+                .iter()
+                .any(|blocker| blocker.kind == RecipeLoweringBlockerKind::ItemInput)
+        );
         Ok(())
     }
 
@@ -6834,10 +7031,13 @@ mod tests {
         let recovery = crate::recover_with_project(&analysis, &project);
         assert_eq!(recovery.recipes.len(), 2);
 
-        let lowered = super::lower_recipe_with_project(&recovery.recipes[0], &analysis.bindings, &project)
-            .map_err(|failure| anyhow::anyhow!("direct ore-dict query failed: {failure:?}"))?;
+        let lowered =
+            super::lower_recipe_with_project(&recovery.recipes[0], &analysis.bindings, &project)
+                .map_err(|failure| anyhow::anyhow!("direct ore-dict query failed: {failure:?}"))?;
         let ItemInputSpec::Stack(input) = &lowered.item_inputs[0] else {
-            return Err(anyhow::anyhow!("direct ore query input became alternatives"));
+            return Err(anyhow::anyhow!(
+                "direct ore query input became alternatives"
+            ));
         };
         assert_eq!(input.amount, 2);
         assert!(matches!(
@@ -6854,10 +7054,16 @@ mod tests {
                     && form.as_str() == "gregtech.api.enums.OrePrefixes.plate"
         ));
 
-        let failure = super::lower_recipe_with_project(&recovery.recipes[1], &analysis.bindings, &project)
-            .err()
-            .ok_or_else(|| anyhow::anyhow!("dynamic ore-dict key unexpectedly lowered"))?;
-        assert!(failure.blockers.iter().any(|blocker| blocker.kind == RecipeLoweringBlockerKind::ItemInput));
+        let failure =
+            super::lower_recipe_with_project(&recovery.recipes[1], &analysis.bindings, &project)
+                .err()
+                .ok_or_else(|| anyhow::anyhow!("dynamic ore-dict key unexpectedly lowered"))?;
+        assert!(
+            failure
+                .blockers
+                .iter()
+                .any(|blocker| blocker.kind == RecipeLoweringBlockerKind::ItemInput)
+        );
         Ok(())
     }
 
@@ -6886,12 +7092,18 @@ mod tests {
         project.add_analysis(&analysis);
         let recovery = crate::recover_with_project(&analysis, &project);
         let lowered = super::lower_recipe_with_project(
-            recovery.recipes.first().ok_or_else(|| anyhow::anyhow!("recipe missing"))?,
+            recovery
+                .recipes
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("recipe missing"))?,
             &analysis.bindings,
             &project,
-        ).map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
+        )
+        .map_err(|failure| anyhow::anyhow!("lowering failed: {failure:?}"))?;
         let ItemInputSpec::Alternatives { choices } = &lowered.item_inputs[0] else {
-            return Err(anyhow::anyhow!("enhanced-for input did not become alternatives"));
+            return Err(anyhow::anyhow!(
+                "enhanced-for input did not become alternatives"
+            ));
         };
         assert_eq!(choices.len(), 3);
         assert!(choices.iter().all(|choice| choice.amount == 1));

@@ -286,6 +286,8 @@ pub struct ContentRecipe {
     pub unlock: Option<RecipeUnlock>,
     /// One-time energy charged when the recipe starts, in EU.
     pub startup_energy_eu: u64,
+    /// Continuous energy generated while this recipe runs, in EU per tick.
+    pub generated_energy_eu_per_tick: u64,
     /// Fuel energy density, in EU per litre, when this entry defines a fluid generator fuel.
     pub fuel_energy_eu_per_liter: Option<u64>,
     /// Total-energy/output-rate semantics when consuming one item as generator fuel.

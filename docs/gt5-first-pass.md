@@ -1354,3 +1354,24 @@ Full pinned-corpus result:
 - missing-EU/t blockers: **24**;
 - post-add blockers: **7**;
 - modifier blockers: **6**.
+
+### LFTR generated energy rate
+
+`LFTR_OUTPUT_POWER` is consumed only by the Liquid Fluorine Thorium Reactor recipe map. The machine does not treat it as input EU/t: its processing logic converts the metadata into continuous generated power at exactly four times the stored value while the recipe runs.
+
+The target recipe IR now carries this explicitly as `generated_energy_eu_per_tick`, separate from consumed `eut` and one-time `startup_energy_eu`. Lowering is restricted to the LFTR recipe map, uses call-site scalar evaluation, multiplies with checked arithmetic, and fails closed for dynamic values, wrong-map uses, or overflow.
+
+Full pinned-corpus result:
+
+- target recipes lowered: **4,312 / 5,791 (74.46%)**, up from 4,309 / 5,791 (74.41%);
+- metadata blockers: **221**, down from 224;
+- item-input blockers: **1,029**;
+- item-output blockers: **823**;
+- fluid blockers: **291**;
+- non-constant EU/t blockers: **417**;
+- missing-duration blockers: **332**;
+- chance blockers: **50**;
+- special blockers: **31**;
+- missing-EU/t blockers: **24**;
+- post-add blockers: **7**;
+- modifier blockers: **6**.
