@@ -43,6 +43,7 @@ pub enum JavaExpression {
     Array {
         element_type: Option<String>,
         elements: Vec<JavaExpression>,
+        dimensions: Vec<JavaExpression>,
     },
     ArrayAccess {
         array: Box<JavaExpression>,
@@ -66,6 +67,11 @@ pub enum JavaExpression {
         left: Box<JavaExpression>,
         operator: String,
         right: Box<JavaExpression>,
+    },
+    Conditional {
+        condition: Box<JavaExpression>,
+        when_true: Box<JavaExpression>,
+        when_false: Box<JavaExpression>,
     },
     Parenthesized(Box<JavaExpression>),
     Raw(String),
@@ -514,6 +520,15 @@ impl JavaProjectIndex {
                     &resolve_type_reference(bindings, type_name),
                     bindings.package.as_deref(),
                 ))
+            }
+            JavaExpression::Conditional {
+                when_true,
+                when_false,
+                ..
+            } => {
+                let true_type = self.expression_type_at(path, byte_position, when_true, bindings)?;
+                let false_type = self.expression_type_at(path, byte_position, when_false, bindings)?;
+                (true_type == false_type).then_some(true_type)
             }
             JavaExpression::Parenthesized(inner) => {
                 self.expression_type_at(path, byte_position, inner, bindings)
@@ -1677,9 +1692,14 @@ pub fn substitute_references(
         JavaExpression::Array {
             element_type,
             elements,
+            dimensions,
         } => JavaExpression::Array {
             element_type: element_type.clone(),
             elements: elements
+                .iter()
+                .map(|value| substitute_references(value, replacements))
+                .collect(),
+            dimensions: dimensions
                 .iter()
                 .map(|value| substitute_references(value, replacements))
                 .collect(),
@@ -1724,6 +1744,15 @@ pub fn substitute_references(
             left: Box::new(substitute_references(left, replacements)),
             operator: operator.clone(),
             right: Box::new(substitute_references(right, replacements)),
+        },
+        JavaExpression::Conditional {
+            condition,
+            when_true,
+            when_false,
+        } => JavaExpression::Conditional {
+            condition: Box::new(substitute_references(condition, replacements)),
+            when_true: Box::new(substitute_references(when_true, replacements)),
+            when_false: Box::new(substitute_references(when_false, replacements)),
         },
         JavaExpression::Parenthesized(inner) => {
             JavaExpression::Parenthesized(Box::new(substitute_references(inner, replacements)))
@@ -1850,6 +1879,7 @@ fn expression(node: Node<'_>, source: &str) -> JavaExpression {
         "method_invocation" => expression_call(node, source),
         "object_creation_expression" => expression_new(node, source),
         "binary_expression" => expression_binary(node, source),
+        "ternary_expression" => expression_conditional(node, source),
         "parenthesized_expression" => node.named_child(0).map_or_else(
             || JavaExpression::Raw(node_source(node, source)),
             |child| JavaExpression::Parenthesized(Box::new(expression(child, source))),
@@ -1858,18 +1888,43 @@ fn expression(node: Node<'_>, source: &str) -> JavaExpression {
     }
 }
 
+fn expression_conditional(node: Node<'_>, source: &str) -> JavaExpression {
+    let Some(condition) = node.child_by_field_name("condition") else {
+        return JavaExpression::Raw(node_source(node, source));
+    };
+    let Some(when_true) = node.child_by_field_name("consequence") else {
+        return JavaExpression::Raw(node_source(node, source));
+    };
+    let Some(when_false) = node.child_by_field_name("alternative") else {
+        return JavaExpression::Raw(node_source(node, source));
+    };
+    JavaExpression::Conditional {
+        condition: Box::new(expression(condition, source)),
+        when_true: Box::new(expression(when_true, source)),
+        when_false: Box::new(expression(when_false, source)),
+    }
+}
+
 fn expression_array_creation(node: Node<'_>, source: &str) -> JavaExpression {
     let Some(type_node) = node.child_by_field_name("type") else {
         return JavaExpression::Raw(node_source(node, source));
     };
     let element_type = node_source(type_node, source);
-    node.child_by_field_name("value").map_or_else(
-        || JavaExpression::Array {
-            element_type: Some(element_type.clone()),
-            elements: Vec::new(),
-        },
-        |initializer| expression_array_initializer(initializer, source, Some(element_type.clone())),
-    )
+    if let Some(initializer) = node.child_by_field_name("value") {
+        return expression_array_initializer(initializer, source, Some(element_type));
+    }
+    let mut cursor = node.walk();
+    let dimensions = node
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "dimensions_expr")
+        .filter_map(|dimension| dimension.named_child(0))
+        .map(|length| expression(length, source))
+        .collect();
+    JavaExpression::Array {
+        element_type: Some(element_type),
+        elements: Vec::new(),
+        dimensions,
+    }
 }
 
 fn expression_array_initializer(
@@ -1885,6 +1940,7 @@ fn expression_array_initializer(
             .filter(|child| !is_comment_node(*child))
             .map(|child| expression(child, source))
             .collect(),
+        dimensions: Vec::new(),
     }
 }
 
@@ -2229,6 +2285,7 @@ mod tests {
         let Some(super::JavaExpression::Array {
             element_type: Some(element_type),
             elements,
+            ..
         }) = sink_calls[0].argument_expressions.first()
         else {
             return Err(anyhow::anyhow!("Object array was not structural"));
@@ -2239,6 +2296,7 @@ mod tests {
         let Some(super::JavaExpression::Array {
             element_type: Some(element_type),
             elements,
+            ..
         }) = sink_calls[1].argument_expressions.first()
         else {
             return Err(anyhow::anyhow!("ItemStack array was not structural"));
@@ -2247,6 +2305,18 @@ mod tests {
         assert!(matches!(
             elements.first(),
             Some(super::JavaExpression::ArrayAccess { .. })
+        ));
+
+        let items_field = analysis
+            .fields
+            .iter()
+            .find(|field| field.name == "ITEMS")
+            .ok_or_else(|| anyhow::anyhow!("ITEMS field missing"))?;
+        assert!(matches!(
+            items_field.initializer,
+            Some(super::JavaExpression::Array { ref dimensions, ref elements, .. })
+                if elements.is_empty()
+                    && matches!(dimensions.as_slice(), [super::JavaExpression::Literal(value)] if value == "4")
         ));
 
         let mut index = super::JavaProjectIndex::default();
@@ -2810,6 +2880,38 @@ mod tests {
                 .as_deref()
                 .is_some_and(|source| source.contains("(int) BASE"))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn parses_ternary_expression_structurally() -> anyhow::Result<()> {
+        let source = r"
+            package demo;
+            class Recipe {
+                void run(boolean enabled) {
+                    Object value = enabled ? new Object[] { 1 } : new Object[0];
+                    sink(value);
+                }
+            }
+        ";
+        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
+        let method = analysis
+            .methods
+            .iter()
+            .find(|method| method.name == "run")
+            .ok_or_else(|| anyhow::anyhow!("run method missing"))?;
+        let local = method
+            .local_variables
+            .iter()
+            .find(|local| local.name == "value")
+            .ok_or_else(|| anyhow::anyhow!("value local missing"))?;
+        assert!(matches!(
+            local.initializer,
+            Some(super::JavaExpression::Conditional { ref condition, ref when_true, ref when_false })
+                if matches!(condition.as_ref(), super::JavaExpression::Reference(name) if name == "enabled")
+                    && matches!(when_true.as_ref(), super::JavaExpression::Array { elements, .. } if elements.len() == 1)
+                    && matches!(when_false.as_ref(), super::JavaExpression::Array { elements, .. } if elements.is_empty())
+        ));
         Ok(())
     }
 

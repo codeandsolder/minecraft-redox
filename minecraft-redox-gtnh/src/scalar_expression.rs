@@ -64,6 +64,7 @@ fn eval_i64(
         JavaExpression::Call { .. }
         | JavaExpression::New { .. }
         | JavaExpression::Array { .. }
+        | JavaExpression::Conditional { .. }
         | JavaExpression::Literal(_)
         | JavaExpression::Raw(_) => None,
     }

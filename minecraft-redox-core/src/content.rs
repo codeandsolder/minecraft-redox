@@ -158,6 +158,7 @@ pub struct ItemInputStackSpec {
 pub struct ItemOutputSpec {
     pub stack: ItemStackSpec,
     pub production_probability: Probability,
+    pub availability_requirements: Vec<ContentAvailabilityRequirement>,
 }
 
 /// One recipe input slot. Alternatives occupy one slot, not several inputs.
@@ -246,12 +247,14 @@ pub enum RecipeProgress {
     },
 }
 
-/// A source-independent condition controlling whether recipe content is available at all.
+/// A source-independent condition controlling whether content is available.
+///
+/// The same vocabulary is usable at recipe scope and on conditional outputs.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum RecipeAvailabilityRequirement {
-    /// A named content module must be present before this recipe is registered.
-    RequiredContentModule { module: ContentId },
+pub enum ContentAvailabilityRequirement {
+    ContentModulePresent { module: ContentId },
+    ContentModuleAbsent { module: ContentId },
 }
 
 /// Whether a recipe participates in executable process lookup.
@@ -272,7 +275,7 @@ pub enum RecipeExecutionMode {
 pub struct ContentRecipe {
     pub origin: SourceOrigin,
     pub recipe_map: ContentId,
-    pub availability_requirements: Vec<RecipeAvailabilityRequirement>,
+    pub availability_requirements: Vec<ContentAvailabilityRequirement>,
     pub execution_mode: RecipeExecutionMode,
     pub item_inputs: Vec<ItemInputSpec>,
     pub item_outputs: Vec<ItemOutputSpec>,

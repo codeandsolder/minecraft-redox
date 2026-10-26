@@ -1304,3 +1304,29 @@ Full pinned-corpus result:
 - missing-EU/t blockers: **24**;
 - post-add blockers: **7**;
 - modifier blockers: **6**.
+
+
+### Structural conditional outputs and content availability
+
+Java ternary expressions are now retained structurally instead of falling back to raw source text. Array creation also preserves explicit dimensions, so `new ItemStack[0]` is distinguishable from `new ItemStack[3]`; an elementless initializer is no longer assumed to mean an empty runtime array.
+
+Target availability was generalized from recipe-only required modules into `ContentAvailabilityRequirement`, usable both at recipe scope and on individual item outputs. It can represent module presence or absence without deleting the surrounding recipe.
+
+The first lowering rule intentionally handles only a narrow proven shape: a stable local `ItemStack[]` initialized by `module.isModLoaded() ? [zero-or-one item] : [zero-or-one item]`. Static final array fields may be followed only when their initializer is structurally known, and sized arrays count as empty only when the retained dimension reduces exactly to zero. Conditional outputs with explicit chance arrays or more than one item in either branch remain fail-closed.
+
+This exactly models the `DistilleryRecipes` fertilizer output: CropsNH presence adds the fertilizer output; absence leaves the recipe executable with no item output. The condition belongs to the output, not to recipe registration.
+
+Full pinned-corpus result:
+
+- target recipes lowered: **4,287 / 5,791 (74.03%)**, up from 4,277 / 5,791 (73.86%);
+- item-output blockers: **823**, down from 833;
+- item-input blockers: **1,029**;
+- fluid blockers: **291**;
+- metadata blockers: **331**;
+- non-constant EU/t blockers: **417**;
+- missing-duration blockers: **332**;
+- chance blockers: **50**;
+- special blockers: **31**;
+- missing-EU/t blockers: **24**;
+- post-add blockers: **7**;
+- modifier blockers: **6**.

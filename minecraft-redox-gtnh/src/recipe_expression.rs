@@ -59,6 +59,11 @@ pub enum ItemSemantic {
     ExplicitAlternatives {
         alternatives: Vec<JavaExpression>,
     },
+    ModuleConditionalItem {
+        module: String,
+        when_present: Option<Box<ItemSemantic>>,
+        when_absent: Option<Box<ItemSemantic>>,
+    },
     LinkedMethod {
         method_id: String,
         return_type: String,
@@ -282,6 +287,7 @@ fn recipe_input_semantic(
     let JavaExpression::Array {
         element_type: Some(element_type),
         elements,
+        ..
     } = expression
     else {
         return None;
@@ -390,12 +396,25 @@ fn project_item_semantic(
             }
             if let Some(initializer) =
                 project.stable_local_initializer_at(source_path, byte_position, reference)
-                && let Some(result) = item_semantic(&initializer, bindings)
             {
-                return Some(ItemSemantic::InlinedValue {
-                    value_id: value.value_id,
-                    result: Box::new(result),
-                });
+                if let Some(result) = module_conditional_item_semantic(
+                    &initializer,
+                    bindings,
+                    project,
+                    source_path,
+                    byte_position,
+                ) {
+                    return Some(ItemSemantic::InlinedValue {
+                        value_id: value.value_id,
+                        result: Box::new(result),
+                    });
+                }
+                if let Some(result) = item_semantic(&initializer, bindings) {
+                    return Some(ItemSemantic::InlinedValue {
+                        value_id: value.value_id,
+                        result: Box::new(result),
+                    });
+                }
             }
             Some(ItemSemantic::LinkedValue {
                 value_id: value.value_id,
@@ -449,6 +468,108 @@ fn project_item_semantic(
             project_item_semantic(inner, bindings, project, source_path, byte_position)
         }
         _ => typed_item_expression(expression, bindings, project, source_path, byte_position),
+    }
+}
+
+fn module_conditional_item_semantic(
+    expression: &JavaExpression,
+    bindings: &JavaBindings,
+    project: &JavaProjectIndex,
+    source_path: &str,
+    byte_position: usize,
+) -> Option<ItemSemantic> {
+    let JavaExpression::Conditional {
+        condition,
+        when_true,
+        when_false,
+    } = expression
+    else {
+        return None;
+    };
+    let module = content_module_presence_condition(condition, bindings)?;
+    let present_elements = stable_item_array_elements(when_true, bindings, project)?;
+    let absent_elements = stable_item_array_elements(when_false, bindings, project)?;
+    if present_elements.len() > 1 || absent_elements.len() > 1 {
+        return None;
+    }
+    let recover_branch = |elements: &[JavaExpression]| -> Option<Option<Box<ItemSemantic>>> {
+        let Some(element) = elements.first() else {
+            return Some(None);
+        };
+        let semantic = item_semantic(element, bindings)
+            .or_else(|| project_item_semantic(element, bindings, project, source_path, byte_position))?;
+        Some(Some(Box::new(enrich_item_semantic_with_project(
+            semantic,
+            bindings,
+            project,
+            source_path,
+            byte_position,
+        ))))
+    };
+    let when_present = recover_branch(&present_elements)?;
+    let when_absent = recover_branch(&absent_elements)?;
+    (when_present.is_some() || when_absent.is_some()).then_some(ItemSemantic::ModuleConditionalItem {
+        module,
+        when_present,
+        when_absent,
+    })
+}
+
+fn content_module_presence_condition(
+    expression: &JavaExpression,
+    bindings: &JavaBindings,
+) -> Option<String> {
+    let JavaExpression::Call {
+        receiver: Some(receiver),
+        method,
+        arguments,
+    } = expression
+    else {
+        return None;
+    };
+    if method != "isModLoaded" || !arguments.is_empty() {
+        return None;
+    }
+    let module = resolved_reference_name(receiver, bindings)?;
+    module.contains(".Mods.").then_some(module)
+}
+
+fn stable_item_array_elements(
+    expression: &JavaExpression,
+    bindings: &JavaBindings,
+    project: &JavaProjectIndex,
+) -> Option<Vec<JavaExpression>> {
+    match expression {
+        JavaExpression::Array {
+            elements,
+            dimensions,
+            ..
+        } if !elements.is_empty() && dimensions.is_empty() => Some(elements.clone()),
+        JavaExpression::Array {
+            elements,
+            dimensions,
+            ..
+        } if elements.is_empty() && dimensions.is_empty() => Some(Vec::new()),
+        JavaExpression::Array {
+            elements,
+            dimensions,
+            ..
+        } if elements.is_empty()
+            && matches!(dimensions.as_slice(), [dimension] if literal_i64(dimension) == Some(0)) =>
+        {
+            Some(Vec::new())
+        }
+        JavaExpression::Reference(_) | JavaExpression::FieldAccess { .. } => {
+            let reference = resolved_reference_name(expression, bindings)?;
+            let (owner, field_name) = reference.rsplit_once('.')?;
+            let field = project.resolve_field(owner, field_name, Some(true))?;
+            if !field.is_final {
+                return None;
+            }
+            stable_item_array_elements(field.initializer.as_ref()?, bindings, project)
+        }
+        JavaExpression::Parenthesized(inner) => stable_item_array_elements(inner, bindings, project),
+        _ => None,
     }
 }
 

@@ -5,7 +5,7 @@ use minecraft_redox_core::{
     content::{
         ContentId, ContentRecipe, FluidInputSpec, FluidSelector, FluidStackSpec, ItemFuelSpec,
         ItemInputSpec, ItemInputStackSpec, ItemOutputSpec, ItemSelector, ItemStackSpec,
-        Probability, ProgressResourceSpec, RecipeAvailabilityRequirement, RecipeExecutionMode,
+        ContentAvailabilityRequirement, Probability, ProgressResourceSpec, RecipeExecutionMode,
         RecipeInputConstraint, RecipeProgress, RecipeRequirement, RecipeUnlock,
     },
 };
@@ -212,7 +212,7 @@ fn lower_availability_requirements(
     recipe: &RecipeDefinition,
     bindings: &JavaBindings,
     blockers: &mut Vec<RecipeLoweringBlocker>,
-) -> Vec<RecipeAvailabilityRequirement> {
+) -> Vec<ContentAvailabilityRequirement> {
     let mut modules = BTreeSet::new();
     for call in &recipe.availability_calls {
         if call.name != "requireMods" {
@@ -242,7 +242,7 @@ fn lower_availability_requirements(
     }
     modules
         .into_iter()
-        .map(|module| RecipeAvailabilityRequirement::RequiredContentModule { module })
+        .map(|module| ContentAvailabilityRequirement::ContentModulePresent { module })
         .collect()
 }
 
@@ -2408,27 +2408,102 @@ fn lower_outputs(
     project: Option<&JavaProjectIndex>,
     blockers: &mut Vec<RecipeLoweringBlocker>,
 ) -> Vec<ItemOutputSpec> {
-    recipe
+    let mut outputs = Vec::new();
+    for (index, (recovered, probability)) in recipe
         .item_output_semantics
         .iter()
         .zip(probabilities)
         .enumerate()
-        .filter_map(|(index, (recovered, probability))| {
-            lower_recovered_stack(recovered, bindings, project)
-                .map(|stack| ItemOutputSpec {
+    {
+        let Some(semantic) = recovered.semantic.as_ref() else {
+            push_blocker(
+                blockers,
+                RecipeLoweringBlockerKind::ItemOutput,
+                format!("output {index}: {}", recovered.source),
+            );
+            continue;
+        };
+        if let Some((module, when_present, when_absent)) = module_conditional_item_parts(semantic) {
+            if !recipe.output_chance_expressions.is_empty() {
+                push_blocker(
+                    blockers,
+                    RecipeLoweringBlockerKind::ItemOutput,
+                    format!("output {index}: conditional outputs with explicit chances are unsupported"),
+                );
+                continue;
+            }
+            let mut conditional_outputs = Vec::new();
+            let branches = [(when_present, true), (when_absent, false)];
+            let mut valid = true;
+            for (branch, present) in branches {
+                let Some(branch) = branch else {
+                    continue;
+                };
+                let Some(stack) = lower_item_semantic(branch, bindings, project) else {
+                    valid = false;
+                    break;
+                };
+                let requirement = if present {
+                    ContentAvailabilityRequirement::ContentModulePresent {
+                        module: ContentId::new(module),
+                    }
+                } else {
+                    ContentAvailabilityRequirement::ContentModuleAbsent {
+                        module: ContentId::new(module),
+                    }
+                };
+                conditional_outputs.push(ItemOutputSpec {
                     stack,
                     production_probability: *probability,
-                })
-                .or_else(|| {
-                    push_blocker(
-                        blockers,
-                        RecipeLoweringBlockerKind::ItemOutput,
-                        format!("output {index}: {}", recovered.source),
-                    );
-                    None
-                })
-        })
-        .collect()
+                    availability_requirements: vec![requirement],
+                });
+            }
+            if valid {
+                outputs.extend(conditional_outputs);
+            } else {
+                push_blocker(
+                    blockers,
+                    RecipeLoweringBlockerKind::ItemOutput,
+                    format!("output {index}: {}", recovered.source),
+                );
+            }
+            continue;
+        }
+        if let Some(stack) = lower_item_semantic(semantic, bindings, project) {
+            outputs.push(ItemOutputSpec {
+                stack,
+                production_probability: *probability,
+                availability_requirements: Vec::new(),
+            });
+        } else {
+            push_blocker(
+                blockers,
+                RecipeLoweringBlockerKind::ItemOutput,
+                format!("output {index}: {}", recovered.source),
+            );
+        }
+    }
+    outputs
+}
+
+fn module_conditional_item_parts(
+    semantic: &ItemSemantic,
+) -> Option<(&str, Option<&ItemSemantic>, Option<&ItemSemantic>)> {
+    match semantic {
+        ItemSemantic::ModuleConditionalItem {
+            module,
+            when_present,
+            when_absent,
+        } => Some((
+            module,
+            when_present.as_deref(),
+            when_absent.as_deref(),
+        )),
+        ItemSemantic::InlinedMethod { result, .. } | ItemSemantic::InlinedValue { result, .. } => {
+            module_conditional_item_parts(result)
+        }
+        _ => None,
+    }
 }
 
 fn lower_recovered_stack(
@@ -3333,7 +3408,7 @@ fn push_blocker(
 mod tests {
     use minecraft_redox_core::content::{
         FluidInputSpec, FluidSelector, ItemInputSpec, ItemSelector, Probability,
-        RecipeAvailabilityRequirement, RecipeExecutionMode, RecipeInputConstraint, RecipeProgress,
+        ContentAvailabilityRequirement, RecipeExecutionMode, RecipeInputConstraint, RecipeProgress,
         RecipeRequirement, RecipeUnlock,
     };
     use minecraft_redox_java::{JavaExpression, JavaProjectIndex, analyze_source};
@@ -5277,7 +5352,7 @@ mod tests {
                 .iter()
                 .any(|requirement| matches!(
                     requirement,
-                    RecipeAvailabilityRequirement::RequiredContentModule { module }
+                    ContentAvailabilityRequirement::ContentModulePresent { module }
                         if module.as_str() == "gregtech.api.enums.Mods.Forestry"
                 ))
         );
@@ -5287,7 +5362,7 @@ mod tests {
                 .iter()
                 .any(|requirement| matches!(
                     requirement,
-                    RecipeAvailabilityRequirement::RequiredContentModule { module }
+                    ContentAvailabilityRequirement::ContentModulePresent { module }
                         if module.as_str() == "gregtech.api.enums.Mods.Railcraft"
                 ))
         );
@@ -5745,6 +5820,96 @@ mod tests {
                 .iter()
                 .any(|blocker| blocker.kind == RecipeLoweringBlockerKind::Metadata)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn lowers_module_conditional_single_item_outputs() -> anyhow::Result<()> {
+        let gt_values = analyze_source(
+            "GTValues.java",
+            "gt5",
+            None,
+            r"
+                package gregtech.api.enums;
+                import net.minecraft.item.ItemStack;
+                class GTValues {
+                    static final ItemStack[] emptyItemStackArray = new ItemStack[0];
+                }
+            ",
+        )?;
+        let source = r#"
+            import static gregtech.api.recipe.RecipeMaps.distilleryRecipes;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            import gregtech.api.enums.Mods;
+            import gregtech.api.util.GTModHandler;
+            import net.minecraft.item.ItemStack;
+            class Recipes {
+                void run() {
+                    ItemStack[] fertOutput = Mods.CropsNH.isModLoaded()
+                        ? new ItemStack[] { GTModHandler.getModItem(Mods.CropsNH.ID, "fertilizer", 1L) }
+                        : GTValues.emptyItemStackArray;
+                    GTValues.RA.stdBuilder()
+                        .itemOutputs(fertOutput)
+                        .fluidInputs(Materials.Water.getFluid(1000))
+                        .duration(20).eut(2).addTo(distilleryRecipes);
+                }
+                void explicitChance() {
+                    ItemStack[] fertOutput = Mods.CropsNH.isModLoaded()
+                        ? new ItemStack[] { GTModHandler.getModItem(Mods.CropsNH.ID, "fertilizer", 1L) }
+                        : GTValues.emptyItemStackArray;
+                    GTValues.RA.stdBuilder()
+                        .itemOutputs(fertOutput)
+                        .outputChances(5000)
+                        .fluidInputs(Materials.Water.getFluid(1000))
+                        .duration(20).eut(2).addTo(distilleryRecipes);
+                }
+                void multiple() {
+                    ItemStack[] outputs = Mods.CropsNH.isModLoaded()
+                        ? new ItemStack[] {
+                            GTModHandler.getModItem(Mods.CropsNH.ID, "fertilizer", 1L),
+                            GTModHandler.getModItem(Mods.CropsNH.ID, "fertilizer", 2L)
+                        }
+                        : GTValues.emptyItemStackArray;
+                    GTValues.RA.stdBuilder()
+                        .itemOutputs(outputs)
+                        .fluidInputs(Materials.Water.getFluid(1000))
+                        .duration(20).eut(2).addTo(distilleryRecipes);
+                }
+            }
+        "#;
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let mut project = JavaProjectIndex::default();
+        project.add_analysis(&gt_values);
+        project.add_analysis(&analysis);
+        let recovery = crate::recover_with_project(&analysis, &project);
+        assert_eq!(recovery.recipes.len(), 3);
+
+        let lowered = super::lower_recipe_with_project(&recovery.recipes[0], &analysis.bindings, &project)
+            .map_err(|failure| anyhow::anyhow!("conditional output failed: {failure:?}"))?;
+        assert_eq!(lowered.item_outputs.len(), 1);
+        let output = &lowered.item_outputs[0];
+        assert_eq!(output.stack.amount, 1);
+        assert_eq!(output.production_probability, Probability::ONE);
+        assert!(matches!(
+            output.availability_requirements.as_slice(),
+            [ContentAvailabilityRequirement::ContentModulePresent { module }]
+                if module.as_str() == "gregtech.api.enums.Mods.CropsNH"
+        ));
+        assert!(matches!(
+            &output.stack.selector,
+            ItemSelector::Named { id, variant: None } if id.as_str().ends_with(":fertilizer")
+        ));
+
+        for recipe in &recovery.recipes[1..] {
+            let failure = super::lower_recipe_with_project(recipe, &analysis.bindings, &project)
+                .err()
+                .ok_or_else(|| anyhow::anyhow!("unsupported conditional output unexpectedly lowered"))?;
+            assert!(failure
+                .blockers
+                .iter()
+                .any(|blocker| blocker.kind == RecipeLoweringBlockerKind::ItemOutput));
+        }
         Ok(())
     }
 
