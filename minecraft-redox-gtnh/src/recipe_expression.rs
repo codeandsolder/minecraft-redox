@@ -306,8 +306,21 @@ fn recipe_input_semantic(
     }
 }
 
-pub(crate) fn item_semantic(expression: &JavaExpression, bindings: &JavaBindings) -> Option<ItemSemantic> {
+pub(crate) fn item_semantic(
+    expression: &JavaExpression,
+    bindings: &JavaBindings,
+) -> Option<ItemSemantic> {
     match expression {
+        JavaExpression::Call {
+            receiver: Some(receiver),
+            method,
+            arguments,
+        } if method == "copy" && arguments.is_empty() => {
+            item_semantic(receiver, bindings).map(|result| ItemSemantic::InlinedMethod {
+                method_id: String::from("net.minecraft.item.ItemStack#copy()"),
+                result: Box::new(result),
+            })
+        }
         JavaExpression::Call {
             receiver: Some(receiver),
             method,
@@ -425,9 +438,20 @@ fn project_item_semantic(
         }
         JavaExpression::Call {
             receiver,
+            method,
             arguments,
-            ..
         } => {
+            if let Some(copy) = transparent_item_copy_semantic(
+                receiver.as_deref(),
+                method,
+                arguments,
+                bindings,
+                project,
+                source_path,
+                byte_position,
+            ) {
+                return Some(copy);
+            }
             if let Some((resolved, receiver_type)) =
                 project.resolve_call_at(source_path, byte_position, expression, bindings)
             {
@@ -471,6 +495,34 @@ fn project_item_semantic(
     }
 }
 
+fn transparent_item_copy_semantic(
+    receiver: Option<&JavaExpression>,
+    method: &str,
+    arguments: &[JavaExpression],
+    bindings: &JavaBindings,
+    project: &JavaProjectIndex,
+    source_path: &str,
+    byte_position: usize,
+) -> Option<ItemSemantic> {
+    if method != "copy" || !arguments.is_empty() {
+        return None;
+    }
+    let receiver = receiver?;
+    let result = item_semantic(receiver, bindings).or_else(|| {
+        project_item_semantic(receiver, bindings, project, source_path, byte_position)
+    })?;
+    Some(ItemSemantic::InlinedMethod {
+        method_id: String::from("net.minecraft.item.ItemStack#copy()"),
+        result: Box::new(enrich_item_semantic_with_project(
+            result,
+            bindings,
+            project,
+            source_path,
+            byte_position,
+        )),
+    })
+}
+
 fn module_conditional_item_semantic(
     expression: &JavaExpression,
     bindings: &JavaBindings,
@@ -496,8 +548,9 @@ fn module_conditional_item_semantic(
         let Some(element) = elements.first() else {
             return Some(None);
         };
-        let semantic = item_semantic(element, bindings)
-            .or_else(|| project_item_semantic(element, bindings, project, source_path, byte_position))?;
+        let semantic = item_semantic(element, bindings).or_else(|| {
+            project_item_semantic(element, bindings, project, source_path, byte_position)
+        })?;
         Some(Some(Box::new(enrich_item_semantic_with_project(
             semantic,
             bindings,
@@ -508,11 +561,13 @@ fn module_conditional_item_semantic(
     };
     let when_present = recover_branch(&present_elements)?;
     let when_absent = recover_branch(&absent_elements)?;
-    (when_present.is_some() || when_absent.is_some()).then_some(ItemSemantic::ModuleConditionalItem {
-        module,
-        when_present,
-        when_absent,
-    })
+    (when_present.is_some() || when_absent.is_some()).then_some(
+        ItemSemantic::ModuleConditionalItem {
+            module,
+            when_present,
+            when_absent,
+        },
+    )
 }
 
 fn content_module_presence_condition(
@@ -568,7 +623,9 @@ fn stable_item_array_elements(
             }
             stable_item_array_elements(field.initializer.as_ref()?, bindings, project)
         }
-        JavaExpression::Parenthesized(inner) => stable_item_array_elements(inner, bindings, project),
+        JavaExpression::Parenthesized(inner) => {
+            stable_item_array_elements(inner, bindings, project)
+        }
         _ => None,
     }
 }
@@ -937,7 +994,10 @@ fn classify_new_item(
     None
 }
 
-pub(crate) fn fluid_semantic(expression: &JavaExpression, bindings: &JavaBindings) -> Option<FluidSemantic> {
+pub(crate) fn fluid_semantic(
+    expression: &JavaExpression,
+    bindings: &JavaBindings,
+) -> Option<FluidSemantic> {
     match expression {
         JavaExpression::Call {
             receiver: Some(receiver),
@@ -1399,7 +1459,10 @@ mod tests {
         let mut project = JavaProjectIndex::default();
         project.add_analysis(&analysis);
         let recovery = crate::recover_with_project(&analysis, &project);
-        let recipe = recovery.recipes.first().ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
+        let recipe = recovery
+            .recipes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("recipe missing"))?;
         assert!(matches!(
             &recipe.item_input_semantics[0].semantic,
             Some(ItemSemantic::ExplicitAlternatives { alternatives }) if alternatives.len() == 3

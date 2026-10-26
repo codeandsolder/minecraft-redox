@@ -3076,6 +3076,22 @@ fn lower_named_subtype_item_helper(
         ));
     }
 
+    if method_id.starts_with("gtPlusPlus.core.item.crafting.ItemDummyResearch#getResearchStack(")
+        && arguments.len() == 2
+    {
+        let variant = qualified_reference_name(arguments.first()?, bindings)?;
+        if !variant.contains(
+            "gtPlusPlus.core.item.crafting.ItemDummyResearch.ASSEMBLY_LINE_RESEARCH.RESEARCH_",
+        ) {
+            return None;
+        }
+        return Some(named_variant_stack(
+            "gtPlusPlus.core.item.ModItems.itemDummyResearch",
+            variant,
+            scalar_amount_u64(arguments.get(1)?, bindings, project)?,
+        ));
+    }
+
     if method_id
         == "kekztech.common.items.MetaItemCraftingComponent#getStackOfAmountFromDamage(int,int)"
         && arguments.len() == 2
@@ -4264,6 +4280,7 @@ mod tests {
                 package demo;
                 import gregtech.common.items.CombType;
                 import gregtech.common.items.GTBees;
+                import gtPlusPlus.core.item.crafting.ItemDummyResearch;
                 import gtPlusPlus.core.material.Particle;
                 import kekztech.Items;
                 class Variants {}
@@ -4343,6 +4360,43 @@ mod tests {
             )
             .is_none()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn lowers_gtpp_research_tokens_as_named_variants() -> anyhow::Result<()> {
+        let analysis = analyze_source(
+            "Research.java",
+            "gt5",
+            None,
+            r"
+                package demo;
+                import gtPlusPlus.core.item.crafting.ItemDummyResearch;
+                class Research {}
+            ",
+        )?;
+        let bindings = &analysis.bindings;
+        let research = lower_named_subtype_item_helper(
+            "gtPlusPlus.core.item.crafting.ItemDummyResearch#getResearchStack(ASSEMBLY_LINE_RESEARCH,int)",
+            Some(&JavaExpression::Reference("ItemDummyResearch".into())),
+            &[
+                JavaExpression::Reference(
+                    "ItemDummyResearch.ASSEMBLY_LINE_RESEARCH.RESEARCH_10_SPARGING".into(),
+                ),
+                JavaExpression::Literal("2".into()),
+            ],
+            bindings,
+            None,
+        )
+        .ok_or_else(|| anyhow::anyhow!("research subtype did not lower"))?;
+        assert_eq!(research.amount, 2);
+        assert!(matches!(
+            research.selector,
+            ItemSelector::NamedVariant { id, variant }
+                if id.as_str() == "gtPlusPlus.core.item.ModItems.itemDummyResearch"
+                    && variant.as_str()
+                        == "gtPlusPlus.core.item.crafting.ItemDummyResearch.ASSEMBLY_LINE_RESEARCH.RESEARCH_10_SPARGING"
+        ));
         Ok(())
     }
 
@@ -4583,6 +4637,63 @@ mod tests {
             ItemSelector::Named { id, variant: None }
                 if id.as_str() == "goodgenerator.util.ItemRefer.Radiation_Protection_Plate"
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn assembly_line_research_transparently_lowers_item_stack_copy() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.util.GTRecipeConstants.AssemblyLine;
+            import static gregtech.api.util.GTRecipeConstants.RESEARCH_ITEM;
+            import static gregtech.api.util.GTRecipeConstants.SCANNING;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.ItemList;
+            import gregtech.api.enums.Materials;
+            import gregtech.api.util.recipe.Scanning;
+            class Recipes {
+                void concrete() {
+                    GTValues.RA.stdBuilder()
+                        .itemInputs(Materials.Iron.getDust(1))
+                        .itemOutputs(Materials.Steel.getDust(1))
+                        .metadata(RESEARCH_ITEM, ItemList.Generator_Naquadah_Mark_III.get(1).copy())
+                        .metadata(SCANNING, new Scanning(1200, 2048))
+                        .duration(20).eut(2).addTo(AssemblyLine);
+                }
+                void dynamic(net.minecraft.item.ItemStack research) {
+                    GTValues.RA.stdBuilder()
+                        .itemInputs(Materials.Iron.getDust(1))
+                        .itemOutputs(Materials.Steel.getDust(1))
+                        .metadata(RESEARCH_ITEM, research.copy())
+                        .metadata(SCANNING, new Scanning(1200, 2048))
+                        .duration(20).eut(2).addTo(AssemblyLine);
+                }
+            }
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let mut project = JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let recovery = recover_with_project(&analysis, &project);
+        assert_eq!(recovery.recipes.len(), 2);
+
+        let concrete =
+            lower_recipe_with_project(&recovery.recipes[0], &analysis.bindings, &project)
+                .map_err(|failure| anyhow::anyhow!("copied research stack failed: {failure:?}"))?;
+        let Some(RecipeUnlock::Scan { sample, .. }) = concrete.unlock else {
+            return Err(anyhow::anyhow!("scan unlock missing"));
+        };
+        assert!(matches!(
+            sample.selector,
+            ItemSelector::Named { id, variant: None }
+                if id.as_str() == "gregtech.api.enums.ItemList.Generator_Naquadah_Mark_III"
+        ));
+
+        let failure = lower_recipe_with_project(&recovery.recipes[1], &analysis.bindings, &project)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("dynamic copied research stack unexpectedly lowered"))?;
+        assert!(failure.blockers.iter().any(|blocker| {
+            blocker.kind == RecipeLoweringBlockerKind::Metadata
+                && blocker.detail.contains("RESEARCH_ITEM")
+        }));
         Ok(())
     }
 

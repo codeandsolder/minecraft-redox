@@ -1451,3 +1451,19 @@ Full pinned-corpus result:
 - target recipes lowered: **4,424 / 5,791 (76.40%)**, up from 4,422 / 5,791 (76.36%);
 - metadata blockers: **217**, down from 219;
 - all other blocker-category recipe counts are unchanged.
+
+### Transparent stack copies and semantic GT++ research tokens
+
+`ItemStack.copy()` is object-identity plumbing, not content semantics: it preserves the copied stack's item identity, amount, damage, and NBT while returning an independent mutable Java object. Target content IR is immutable, so copy calls now transparently preserve the receiver's recovered item semantics, but only when that receiver was already concrete. Copies of dynamic parameters or unresolved state remain unresolved.
+
+GT++ `ItemDummyResearch.getResearchStack(ASSEMBLY_LINE_RESEARCH, amount)` is also normalized semantically. The source maps the research enum's registered name to a runtime numeric meta value on one base item; target IR instead stores the stable enum identity as a `NamedVariant` of `gtPlusPlus.core.item.ModItems.itemDummyResearch`. No legacy registration-order ID is retained.
+
+This resolves both the five recipes that manufacture GT++ research tokens and their five matching Assembly Line scan unlocks, plus the two GoodGenerator research items wrapped in `ItemStack.copy()`.
+
+Full pinned-corpus result:
+
+- target recipes lowered: **4,436 / 5,791 (76.60%)**, up from 4,424 / 5,791 (76.40%);
+- item-input blockers: **956**, down from 957;
+- item-output blockers: **781**, down from 786;
+- metadata blockers: **210**, down from 217;
+- all other blocker-category recipe counts are unchanged.
