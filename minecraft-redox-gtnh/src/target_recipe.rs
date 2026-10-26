@@ -2343,36 +2343,43 @@ fn lower_ore_dict_alternative_input(
     bindings: &JavaBindings,
     project: Option<&JavaProjectIndex>,
 ) -> Option<ItemStackSpec> {
-    let amount = scalar_amount_u64(amount, bindings, project)?;
-    let selector = if let Some(key) = simple_string_literal(key) {
-        ItemSelector::OreKey {
+    Some(ItemStackSpec {
+        selector: lower_ore_dict_key_selector(key, bindings)?,
+        amount: scalar_amount_u64(amount, bindings, project)?,
+    })
+}
+
+fn lower_ore_dict_key_selector(
+    key: &JavaExpression,
+    bindings: &JavaBindings,
+) -> Option<ItemSelector> {
+    if let Some(key) = simple_string_literal(key) {
+        return Some(ItemSelector::OreKey {
             key: ContentId::new(key),
-        }
-    } else {
-        let JavaExpression::Call {
-            receiver: Some(receiver),
-            method,
-            arguments,
-        } = key
-        else {
-            return None;
-        };
-        if method != "get" || arguments.len() != 1 {
-            return None;
-        }
-        let form = resolved_reference_name(receiver, bindings)?;
-        let material = resolved_reference_name(arguments.first()?, bindings)?;
-        if !form.starts_with("gregtech.api.enums.OrePrefixes.")
-            || !material.starts_with("gregtech.api.enums.Materials.")
-        {
-            return None;
-        }
-        ItemSelector::MaterialForm {
-            material: ContentId::new(material),
-            form: ContentId::new(form),
-        }
+        });
+    }
+    let JavaExpression::Call {
+        receiver: Some(receiver),
+        method,
+        arguments,
+    } = key
+    else {
+        return None;
     };
-    Some(ItemStackSpec { selector, amount })
+    if method != "get" || arguments.len() != 1 {
+        return None;
+    }
+    let form = resolved_reference_name(receiver, bindings)?;
+    let material = resolved_reference_name(arguments.first()?, bindings)?;
+    if !form.starts_with("gregtech.api.enums.OrePrefixes.")
+        || !material.starts_with("gregtech.api.enums.Materials.")
+    {
+        return None;
+    }
+    Some(ItemSelector::MaterialForm {
+        material: ContentId::new(material),
+        form: ContentId::new(form),
+    })
 }
 
 fn input_stack_spec(
@@ -2450,9 +2457,7 @@ fn lower_item_semantic(
             amount: scalar_amount_u64(amount, bindings, project)?,
         }),
         ItemSemantic::OreDictQuery { key, amount } => Some(ItemStackSpec {
-            selector: ItemSelector::OreKey {
-                key: ContentId::new(simple_string_literal(key)?),
-            },
+            selector: lower_ore_dict_key_selector(key, bindings)?,
             amount: scalar_amount_u64(amount, bindings, project)?,
         }),
         ItemSemantic::MaterialItem {
@@ -6522,6 +6527,61 @@ mod tests {
             .blockers
             .iter()
             .any(|blocker| blocker.kind == RecipeLoweringBlockerKind::ItemInput));
+        Ok(())
+    }
+
+    #[test]
+    fn lowers_direct_ore_dict_queries_from_semantic_keys() -> anyhow::Result<()> {
+        let source = r"
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            import gregtech.api.enums.OrePrefixes;
+            import gregtech.api.util.GTOreDictUnificator;
+            class Recipes {
+                void concrete() {
+                    GTValues.RA.stdBuilder()
+                        .itemInputs(GTOreDictUnificator.get(OrePrefixes.circuit.get(Materials.MV), 2))
+                        .itemOutputs(GTOreDictUnificator.get(OrePrefixes.plate.get(Materials.Steel), 4))
+                        .duration(20).eut(4).addTo(gregtech.api.recipe.RecipeMaps.assemblerRecipes);
+                }
+                void dynamic(Materials material) {
+                    GTValues.RA.stdBuilder()
+                        .itemInputs(GTOreDictUnificator.get(OrePrefixes.circuit.get(material), 2))
+                        .itemOutputs(Materials.Iron.getDust(1))
+                        .duration(20).eut(4).addTo(gregtech.api.recipe.RecipeMaps.assemblerRecipes);
+                }
+            }
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let mut project = JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let recovery = crate::recover_with_project(&analysis, &project);
+        assert_eq!(recovery.recipes.len(), 2);
+
+        let lowered = super::lower_recipe_with_project(&recovery.recipes[0], &analysis.bindings, &project)
+            .map_err(|failure| anyhow::anyhow!("direct ore-dict query failed: {failure:?}"))?;
+        let ItemInputSpec::Stack(input) = &lowered.item_inputs[0] else {
+            return Err(anyhow::anyhow!("direct ore query input became alternatives"));
+        };
+        assert_eq!(input.amount, 2);
+        assert!(matches!(
+            &input.selector,
+            ItemSelector::MaterialForm { material, form }
+                if material.as_str() == "gregtech.api.enums.Materials.MV"
+                    && form.as_str() == "gregtech.api.enums.OrePrefixes.circuit"
+        ));
+        assert_eq!(lowered.item_outputs[0].stack.amount, 4);
+        assert!(matches!(
+            &lowered.item_outputs[0].stack.selector,
+            ItemSelector::MaterialForm { material, form }
+                if material.as_str() == "gregtech.api.enums.Materials.Steel"
+                    && form.as_str() == "gregtech.api.enums.OrePrefixes.plate"
+        ));
+
+        let failure = super::lower_recipe_with_project(&recovery.recipes[1], &analysis.bindings, &project)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("dynamic ore-dict key unexpectedly lowered"))?;
+        assert!(failure.blockers.iter().any(|blocker| blocker.kind == RecipeLoweringBlockerKind::ItemInput));
         Ok(())
     }
 

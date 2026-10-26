@@ -1251,3 +1251,32 @@ Full pinned-corpus result:
 - missing-EU/t blockers: **24**;
 - post-add blockers: **7**;
 - modifier blockers: **6**.
+
+
+### Direct semantic ore-dictionary queries
+
+`GTOreDictUnificator.get(Object key, long amount)` uses the same ore-key lookup semantics as the two-element `Object[] { key, amount }` recipe-input form: it resolves the first registered stack under the supplied ore key and applies the requested amount.
+
+The target lowerer now shares one ore-key selector normalization path between both source surfaces:
+
+- literal keys become `ItemSelector::OreKey`;
+- `OrePrefixes.<form>.get(Materials.<material>)` becomes `ItemSelector::MaterialForm`;
+- dynamic material/key expressions remain fail-closed;
+- the same normalization applies to direct recipe outputs as well as inputs.
+
+This removes the direct circuit-tier family such as `GTOreDictUnificator.get(OrePrefixes.circuit.get(Materials.MV), 2)` without preserving GT's incidental ore-dictionary string encoding.
+
+Full pinned-corpus result:
+
+- target recipes lowered: **4,272 / 5,791 (73.76%)**, up from 4,243 / 5,791 (73.27%);
+- item-input blockers: **1,059**, down from 1,086;
+- item-output blockers: **943**, down from 945;
+- fluid blockers: **291**;
+- metadata blockers: **331**;
+- non-constant EU/t blockers: **417**;
+- missing-duration blockers: **332**;
+- chance blockers: **50**;
+- special blockers: **31**;
+- missing-EU/t blockers: **24**;
+- post-add blockers: **7**;
+- modifier blockers: **6**.
