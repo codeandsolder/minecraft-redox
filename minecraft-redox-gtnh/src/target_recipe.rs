@@ -105,53 +105,16 @@ fn lower_recipe_internal(
     validate_recipe_category(recipe, bindings, &mut blockers);
     let lowered_metadata = lower_metadata(recipe, bindings, project, &mut blockers);
 
-    let mut duration_ticks = match recipe.duration_ticks {
-        None if lowered_metadata.fuel_energy_eu_per_liter.is_some() => Some(0),
-        None => {
-            push_blocker(
-                &mut blockers,
-                RecipeLoweringBlockerKind::MissingDuration,
-                "duration did not reduce to ticks",
-            );
-            None
-        }
-        Some(value) => {
-            if let Ok(value) = u64::try_from(value) {
-                Some(value)
-            } else {
-                push_blocker(
-                    &mut blockers,
-                    RecipeLoweringBlockerKind::InvalidDuration,
-                    format!("duration ticks must be non-negative: {value}"),
-                );
-                None
-            }
-        }
-    };
+    let mut duration_ticks = lower_duration_ticks(recipe, &lowered_metadata, &mut blockers);
+    let eut = lower_eut(recipe, &lowered_metadata, &mut blockers);
 
-    let eut = match (recipe.eut_expression.as_ref(), recipe.eut_value) {
-        (None, _) if lowered_metadata.fuel_energy_eu_per_liter.is_some() => Some(0),
-        (None, _) => {
-            push_blocker(
-                &mut blockers,
-                RecipeLoweringBlockerKind::MissingEut,
-                "recipe has no EU/t expression",
-            );
-            None
-        }
-        (Some(_), Some(value)) => Some(value),
-        (Some(_), None) => {
-            push_blocker(
-                &mut blockers,
-                RecipeLoweringBlockerKind::NonConstantEut,
-                recipe
-                    .eut
-                    .clone()
-                    .unwrap_or_else(|| String::from("<missing source>")),
-            );
-            None
-        }
-    };
+    let (startup_energy_eu, target_eut) = lower_runtime_energy(
+        recipe,
+        duration_ticks,
+        eut,
+        &lowered_metadata,
+        &mut blockers,
+    );
 
     let (mut item_inputs, item_outputs) = lower_item_io(recipe, bindings, project, &mut blockers);
     let (fluid_inputs, fluid_outputs) = lower_fluid_io(
@@ -171,9 +134,8 @@ fn lower_recipe_internal(
         lower_availability_requirements(recipe, bindings, &mut blockers);
 
     if blockers.is_empty()
-        && let (Some(duration_ticks), Some(eut)) = (duration_ticks, eut)
+        && let (Some(duration_ticks), Some(target_eut)) = (duration_ticks, target_eut)
     {
-        let target_eut = lowered_metadata.item_fuel.as_ref().map_or(eut, |_| 0);
         return Ok(ContentRecipe {
             origin: recipe.origin.clone(),
             recipe_map: lowered_metadata
@@ -188,7 +150,7 @@ fn lower_recipe_internal(
             input_constraints: lowered_metadata.input_constraints,
             requirements: lowered_metadata.requirements,
             unlock: lowered_metadata.unlock,
-            startup_energy_eu: lowered_metadata.startup_energy_eu,
+            startup_energy_eu,
             generated_energy_eu_per_tick: lowered_metadata.generated_energy_eu_per_tick,
             fuel_energy_eu_per_liter: lowered_metadata.fuel_energy_eu_per_liter,
             item_fuel: lowered_metadata.item_fuel,
@@ -203,6 +165,150 @@ fn lower_recipe_internal(
         origin: recipe.origin.clone(),
         blockers,
     }))
+}
+
+fn lower_duration_ticks(
+    recipe: &RecipeDefinition,
+    metadata: &LoweredMetadata,
+    blockers: &mut Vec<RecipeLoweringBlocker>,
+) -> Option<u64> {
+    match recipe.duration_ticks {
+        None if metadata.fuel_energy_eu_per_liter.is_some() => Some(0),
+        None => {
+            push_blocker(
+                blockers,
+                RecipeLoweringBlockerKind::MissingDuration,
+                "duration did not reduce to ticks",
+            );
+            None
+        }
+        Some(value) => u64::try_from(value).map_or_else(
+            |_| {
+                push_blocker(
+                    blockers,
+                    RecipeLoweringBlockerKind::InvalidDuration,
+                    format!("duration ticks must be non-negative: {value}"),
+                );
+                None
+            },
+            Some,
+        ),
+    }
+}
+
+fn lower_eut(
+    recipe: &RecipeDefinition,
+    metadata: &LoweredMetadata,
+    blockers: &mut Vec<RecipeLoweringBlocker>,
+) -> Option<i64> {
+    match (recipe.eut_expression.as_ref(), recipe.eut_value) {
+        (None, _) if metadata.fuel_energy_eu_per_liter.is_some() => Some(0),
+        (None, _) => {
+            push_blocker(
+                blockers,
+                RecipeLoweringBlockerKind::MissingEut,
+                "recipe has no EU/t expression",
+            );
+            None
+        }
+        (Some(_), Some(value)) => Some(value),
+        (Some(_), None) => {
+            push_blocker(
+                blockers,
+                RecipeLoweringBlockerKind::NonConstantEut,
+                recipe
+                    .eut
+                    .clone()
+                    .unwrap_or_else(|| String::from("<missing source>")),
+            );
+            None
+        }
+    }
+}
+
+const TRANSCENDENT_PLASMA_MIXER_MAP: &str =
+    "gregtech.api.recipe.RecipeMaps.transcendentPlasmaMixerRecipes";
+
+fn lower_runtime_energy(
+    recipe: &RecipeDefinition,
+    duration_ticks: Option<u64>,
+    eut: Option<i64>,
+    metadata: &LoweredMetadata,
+    blockers: &mut Vec<RecipeLoweringBlocker>,
+) -> (u64, Option<i64>) {
+    let mut startup_energy_eu = metadata.startup_energy_eu;
+    let mut target_eut = eut;
+
+    if let Some(multiplier) = metadata.transcendent_plasma_eu_multiplier
+        && let (Some(duration_ticks), Some(eut)) = (duration_ticks, eut)
+    {
+        let Some(eut) = u64::try_from(eut).ok() else {
+            push_blocker(
+                blockers,
+                RecipeLoweringBlockerKind::Metadata,
+                "Transcendent Plasma Mixer EU/t must be non-negative",
+            );
+            return (startup_energy_eu, target_eut);
+        };
+        let Some(total) = multiplier
+            .checked_mul(eut)
+            .and_then(|value| value.checked_mul(duration_ticks))
+        else {
+            push_blocker(
+                blockers,
+                RecipeLoweringBlockerKind::Metadata,
+                "Transcendent Plasma Mixer startup energy overflows target EU",
+            );
+            return (startup_energy_eu, target_eut);
+        };
+        startup_energy_eu = total;
+        target_eut = Some(0);
+    }
+
+    if metadata.item_fuel.is_some() {
+        target_eut = target_eut.map(|_| 0);
+    }
+    if recipe.recipe_map != TRANSCENDENT_PLASMA_MIXER_MAP {
+        debug_assert!(metadata.transcendent_plasma_eu_multiplier.is_none());
+    }
+    (startup_energy_eu, target_eut)
+}
+
+fn lower_transcendent_plasma_eu_multiplier(
+    recipe: &RecipeDefinition,
+    metadata: Option<(&crate::BuilderCall, &JavaExpression)>,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+    blockers: &mut Vec<RecipeLoweringBlocker>,
+) -> Option<u64> {
+    if recipe.recipe_map != TRANSCENDENT_PLASMA_MIXER_MAP {
+        if metadata.is_some() {
+            push_blocker(
+                blockers,
+                RecipeLoweringBlockerKind::Metadata,
+                format!(
+                    "EU_MULTIPLIER used on unsupported recipe map {}",
+                    recipe.recipe_map
+                ),
+            );
+        }
+        return None;
+    }
+
+    let Some((call, expression)) = metadata else {
+        return Some(10);
+    };
+    lower_nonnegative_scalar_at(recipe, call, expression, bindings, project).or_else(|| {
+        push_blocker(
+            blockers,
+            RecipeLoweringBlockerKind::Metadata,
+            format!(
+                "EU_MULTIPLIER is not a static non-negative value: {}",
+                call.arguments.join(", ")
+            ),
+        );
+        None
+    })
 }
 
 fn lower_availability_requirements(
@@ -397,6 +503,7 @@ struct LoweredMetadata {
     unlock: Option<RecipeUnlock>,
     startup_energy_eu: u64,
     generated_energy_eu_per_tick: u64,
+    transcendent_plasma_eu_multiplier: Option<u64>,
     fuel_energy_eu_per_liter: Option<u64>,
     item_fuel: Option<ItemFuelSpec>,
     recipe_map_override: Option<ContentId>,
@@ -412,6 +519,7 @@ struct MetadataAccumulator<'a> {
     exact_capabilities: BTreeMap<ContentId, u64>,
     startup_energy_eu: u64,
     generated_energy_eu_per_tick: u64,
+    transcendent_plasma_eu_multiplier: Option<(&'a crate::BuilderCall, &'a JavaExpression)>,
     fuel_value: Option<(&'a crate::BuilderCall, &'a JavaExpression)>,
     fuel_type: Option<(&'a crate::BuilderCall, &'a JavaExpression)>,
     rtg_duration_days: Option<(&'a crate::BuilderCall, &'a JavaExpression)>,
@@ -474,6 +582,13 @@ fn lower_metadata(
     );
     let item_fuel =
         lower_rtg_item_fuel(recipe, state.rtg_duration_days, bindings, project, blockers);
+    let transcendent_plasma_eu_multiplier = lower_transcendent_plasma_eu_multiplier(
+        recipe,
+        state.transcendent_plasma_eu_multiplier,
+        bindings,
+        project,
+        blockers,
+    );
     let (synthetic_transform, synthetic_map_override) =
         lower_universal_arc_furnace(recipe, state.recycle, state.arc_additive_amount, blockers);
     let recipe_map_override = synthetic_map_override.or(fuel_map_override);
@@ -482,6 +597,7 @@ fn lower_metadata(
         unlock,
         startup_energy_eu: state.startup_energy_eu,
         generated_energy_eu_per_tick: state.generated_energy_eu_per_tick,
+        transcendent_plasma_eu_multiplier,
         fuel_energy_eu_per_liter,
         item_fuel,
         recipe_map_override,
@@ -558,6 +674,8 @@ fn collect_metadata_entry<'a>(
         {
             state.generated_energy_eu_per_tick = value;
         }
+    } else if key == "gregtech.api.util.GTRecipeConstants.EU_MULTIPLIER" {
+        state.transcendent_plasma_eu_multiplier = Some((call, value));
     } else if key == "gregtech.api.util.GTRecipeConstants.FUEL_VALUE" {
         state.fuel_value = Some((call, value));
     } else if key == "gregtech.api.util.GTRecipeConstants.FUEL_TYPE" {
@@ -4595,6 +4713,83 @@ mod tests {
             blocker.kind == RecipeLoweringBlockerKind::ItemInput
                 && blocker.detail.contains("non-circuit item input")
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn transcendent_plasma_mixer_consumes_total_wireless_energy_at_start() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.recipe.RecipeMaps.transcendentPlasmaMixerRecipes;
+            import static gregtech.api.util.GTRecipeConstants.EU_MULTIPLIER;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            class Recipes { void run() {
+                GTValues.RA.stdBuilder()
+                    .fluidInputs(Materials.Water.getFluid(100))
+                    .fluidOutputs(Materials.Steam.getGas(100))
+                    .duration(100).eut(123)
+                    .addTo(transcendentPlasmaMixerRecipes);
+                GTValues.RA.stdBuilder()
+                    .fluidInputs(Materials.Water.getFluid(100))
+                    .fluidOutputs(Materials.Steam.getGas(100))
+                    .metadata(EU_MULTIPLIER, 20)
+                    .duration(100).eut(123)
+                    .addTo(transcendentPlasmaMixerRecipes);
+            }}
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let recovery = recover(&analysis);
+        assert_eq!(recovery.recipes.len(), 2);
+
+        let default = lower_recipe(&recovery.recipes[0], &analysis.bindings)
+            .map_err(|failure| anyhow::anyhow!("default multiplier failed: {failure:?}"))?;
+        assert_eq!(default.startup_energy_eu, 123_000);
+        assert_eq!(default.eut, 0);
+
+        let explicit = lower_recipe(&recovery.recipes[1], &analysis.bindings)
+            .map_err(|failure| anyhow::anyhow!("explicit multiplier failed: {failure:?}"))?;
+        assert_eq!(explicit.startup_energy_eu, 246_000);
+        assert_eq!(explicit.eut, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn transcendent_plasma_multiplier_is_map_scoped_and_fail_closed() -> anyhow::Result<()> {
+        let source = r"
+            import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+            import static gregtech.api.recipe.RecipeMaps.transcendentPlasmaMixerRecipes;
+            import static gregtech.api.util.GTRecipeConstants.EU_MULTIPLIER;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            class Recipes {
+                void wrongMap() {
+                    GTValues.RA.stdBuilder()
+                        .itemInputs(Materials.Iron.getDust(1))
+                        .itemOutputs(Materials.Steel.getDust(1))
+                        .metadata(EU_MULTIPLIER, 20)
+                        .duration(20).eut(2).addTo(compressorRecipes);
+                }
+                void dynamic(int multiplier) {
+                    GTValues.RA.stdBuilder()
+                        .fluidInputs(Materials.Water.getFluid(100))
+                        .fluidOutputs(Materials.Steam.getGas(100))
+                        .metadata(EU_MULTIPLIER, multiplier)
+                        .duration(20).eut(2).addTo(transcendentPlasmaMixerRecipes);
+                }
+            }
+        ";
+        let analysis = analyze_source("Recipes.java", "gt5", None, source)?;
+        let recovery = recover(&analysis);
+        assert_eq!(recovery.recipes.len(), 2);
+        for recipe in &recovery.recipes {
+            let failure = lower_recipe(recipe, &analysis.bindings)
+                .err()
+                .ok_or_else(|| anyhow::anyhow!("invalid multiplier unexpectedly lowered"))?;
+            assert!(failure.blockers.iter().any(|blocker| {
+                blocker.kind == RecipeLoweringBlockerKind::Metadata
+                    && blocker.detail.contains("EU_MULTIPLIER")
+            }));
+        }
         Ok(())
     }
 

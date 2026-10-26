@@ -1425,3 +1425,17 @@ Full pinned-corpus result:
 - target recipes lowered: **4,420 / 5,791 (76.33%)**, up from 4,383 / 5,791 (75.69%);
 - item-output blockers: **786**, down from 823;
 - all other blocker-category recipe counts are unchanged.
+
+### Transcendent Plasma Mixer wireless startup energy
+
+The Transcendent Plasma Mixer does not continuously draw the recipe's nominal EU/t. Its processing logic computes `multiplier × recipe EU/t × duration`, verifies the owner's wireless energy balance, debits that entire amount at recipe start, and then overwrites calculated EU/t to zero. The metadata multiplier defaults to 10; `EU_MULTIPLIER` overrides it for the two exceptional recipes.
+
+Target lowering now applies that execution model to the entire `transcendentPlasmaMixerRecipes` map. `startup_energy_eu` carries the checked total wireless debit and target `eut` is zero. `EU_MULTIPLIER` is accepted only on this map and must be a static non-negative scalar; dynamic, wrong-map, negative, or overflowing values remain fail-closed.
+
+This is primarily a correctness repair: seven recipes were already lowering with the wrong continuous-energy semantics. It additionally unblocks the two recipes with explicit multipliers.
+
+Full pinned-corpus result:
+
+- target recipes lowered: **4,422 / 5,791 (76.36%)**, up from 4,420 / 5,791 (76.33%);
+- metadata blockers: **219**, down from 221;
+- all other blocker-category recipe counts are unchanged.
