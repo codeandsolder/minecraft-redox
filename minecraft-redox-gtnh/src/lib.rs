@@ -420,7 +420,11 @@ fn recognize_recipe(
     let mut integrated_circuit_inputs = Vec::new();
     for call in chain.calls.iter().skip(1) {
         if after_add {
-            recipe.post_add_calls.push(call.into());
+            if is_legacy_defc_hidden_alias(&recipe.recipe_map, call, bindings) {
+                recipe.registration_calls.push(call.into());
+            } else {
+                recipe.post_add_calls.push(call.into());
+            }
             continue;
         }
         match call.name.as_str() {
@@ -505,6 +509,21 @@ fn recognize_recipe(
         recipe.item_input_semantics.push(input);
     }
     Some(recipe)
+}
+
+fn is_legacy_defc_hidden_alias(recipe_map: &str, call: &JavaCall, bindings: &JavaBindings) -> bool {
+    const DEFC_MAP: &str = "kubatech.loaders.DEFCRecipes.fusionCraftingRecipes";
+    if recipe_map != DEFC_MAP || call.name != "forEach" || call.arguments.len() != 1 {
+        return false;
+    }
+    let Some((owner, method)) = call.arguments[0].trim().split_once("::") else {
+        return false;
+    };
+    method.trim() == "addOldHiddenRecipe"
+        && matches!(
+            bindings.resolve_reference(owner.trim()).as_str(),
+            "DEFCRecipes" | "kubatech.loaders.DEFCRecipes"
+        )
 }
 
 fn chance_expressions(call: &JavaCall) -> Vec<JavaExpression> {
@@ -910,6 +929,68 @@ mod tests {
         assert_eq!(
             recovery.recipes[0].recipe_map,
             "kubatech.loaders.DEFCRecipes.fusionCraftingRecipes"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn classifies_only_the_defc_hidden_legacy_alias_as_registration_policy() -> anyhow::Result<()> {
+        let source = r"
+            package kubatech.loaders;
+            import static gregtech.api.recipe.RecipeMaps.compressorRecipes;
+            import gregtech.api.enums.GTValues;
+            import gregtech.api.enums.Materials;
+            class DEFCRecipes {
+                static final Object fusionCraftingRecipes = null;
+                static void addOldHiddenRecipe(Object recipe) {}
+                static void unrelated(Object recipe) {}
+                void run() {
+                    GTValues.RA.stdBuilder()
+                        .itemInputs(Materials.Iron.getDust(1))
+                        .itemOutputs(Materials.Steel.getDust(1))
+                        .duration(20)
+                        .eut(2)
+                        .addTo(fusionCraftingRecipes)
+                        .forEach(DEFCRecipes::addOldHiddenRecipe);
+                    GTValues.RA.stdBuilder()
+                        .itemInputs(Materials.Iron.getDust(1))
+                        .itemOutputs(Materials.Steel.getDust(1))
+                        .duration(20)
+                        .eut(2)
+                        .addTo(compressorRecipes)
+                        .forEach(DEFCRecipes::unrelated);
+                }
+            }
+        ";
+        let analysis = analyze_source("DEFCRecipes.java", "gt5", None, source)?;
+        let mut project = JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let recovery = recover_with_project(&analysis, &project);
+        assert_eq!(recovery.recipes.len(), 2);
+
+        let defc = &recovery.recipes[0];
+        assert_eq!(defc.post_add_calls, []);
+        assert_eq!(
+            defc.registration_calls
+                .iter()
+                .map(|call| call.name.as_str())
+                .collect::<Vec<_>>(),
+            ["forEach"]
+        );
+        super::lower_recipe_with_project(defc, &analysis.bindings, &project)
+            .map_err(|failure| anyhow::anyhow!("DEFC primary recipe failed: {failure:?}"))?;
+
+        let unrelated = &recovery.recipes[1];
+        assert_eq!(unrelated.registration_calls, []);
+        assert_eq!(unrelated.post_add_calls.len(), 1);
+        let failure = super::lower_recipe_with_project(unrelated, &analysis.bindings, &project)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("unrelated post-add callback unexpectedly lowered"))?;
+        assert!(
+            failure
+                .blockers
+                .iter()
+                .any(|blocker| { blocker.kind == super::RecipeLoweringBlockerKind::PostAdd })
         );
         Ok(())
     }

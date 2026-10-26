@@ -1401,3 +1401,15 @@ Full pinned-corpus result:
 - missing-EU/t blockers: **24**;
 - post-add blockers: **7**;
 - modifier blockers: **6**.
+
+### DEFC legacy hidden-recipe aliases
+
+KubaTech's Draconic Evolution Fusion Crafting loader appends `.forEach(DEFCRecipes::addOldHiddenRecipe)` after seven primary recipes are added. The callback is compatibility glue only: when Electro-Magic Tools is loaded it copies the already-created recipe, rewrites the KubaTech schematic input to the old EMT item/meta encoding, marks the duplicate hidden, and registers that duplicate in the same source recipe map.
+
+Because the target has no legacy Minecraft/mod compatibility requirement, this exact post-add callback is now classified as source registration policy rather than process semantics. The rule is deliberately narrow: it applies only to `kubatech.loaders.DEFCRecipes.fusionCraftingRecipes` plus the exact `addOldHiddenRecipe` method reference. Arbitrary post-add callbacks remain fail-closed.
+
+Full pinned-corpus result:
+
+- target recipes lowered: **4,383 / 5,791 (75.69%)**, up from 4,376 / 5,791 (75.56%);
+- `post_add` blockers: **0**, down from 7;
+- all other blocker-category recipe counts are unchanged.
