@@ -10,15 +10,63 @@ use serde::Serialize;
 
 use super::{
     AbstractArrayEntry, AbstractArrayIdentity, AbstractArraySnapshot, AbstractFieldValue,
-    AbstractInvocation, AbstractObjectSnapshot, AbstractValue, ExecutionState, JimpleMethod,
-    JimpleMethodSignature, JimpleOperation, JimpleStatement, JimpleValue, JimpleValueKind,
-    MutableArray, MutableObject, abstract_array_identity, abstract_binary, abstract_cast,
-    abstract_default_value, abstract_truth, abstract_unary,
+    AbstractInvocation, AbstractObjectSnapshot, AbstractValue, ExecutionState, JimpleDirectEffect,
+    JimpleInvocation, JimpleMethod, JimpleMethodSignature, JimpleOperation, JimpleStatement,
+    JimpleValue, JimpleValueKind, MutableArray, MutableObject, SymbolicValue,
+    abstract_array_identity, abstract_binary, abstract_cast, abstract_default_value,
+    abstract_truth, abstract_unary, substitute_symbolic,
 };
 
 #[derive(Clone, Debug, Default)]
 pub struct JimpleProgram {
     methods: Vec<JimpleMethod>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct JimpleEffectCallFrame {
+    pub caller: JimpleMethodSignature,
+    pub statement_id: usize,
+    pub invoke_kind: String,
+    pub callee: JimpleMethodSignature,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct JimpleProgramFieldWrite {
+    pub call_path: Vec<JimpleEffectCallFrame>,
+    pub statement_id: usize,
+    pub field: super::JimpleFieldSignature,
+    pub receiver: Option<SymbolicValue>,
+    pub value: SymbolicValue,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JimpleUnresolvedEffectReason {
+    MissingMethod,
+    DynamicDispatch,
+    RecursiveCycle,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct JimpleUnresolvedEffectCall {
+    pub call_path: Vec<JimpleEffectCallFrame>,
+    pub receiver: Option<SymbolicValue>,
+    pub arguments: Vec<SymbolicValue>,
+    pub reason: JimpleUnresolvedEffectReason,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct JimpleProgramEffectSummary {
+    pub entry: JimpleMethodSignature,
+    pub possible_field_writes: Vec<JimpleProgramFieldWrite>,
+    pub unresolved_calls: Vec<JimpleUnresolvedEffectCall>,
+}
+
+#[derive(Clone, Copy)]
+struct StructuralEffectContext<'a> {
+    this_value: Option<&'a SymbolicValue>,
+    arguments: &'a [SymbolicValue],
+    call_path: &'a [JimpleEffectCallFrame],
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -102,6 +150,155 @@ impl JimpleProgram {
         self.methods
             .iter()
             .find(|method| method.signature == *signature)
+    }
+
+    /// Expand possible field writes through structurally exact in-program calls.
+    ///
+    /// This is a structural effect summary, not path execution: writes retain their call path but
+    /// are not claimed to occur unconditionally. Static/special calls are exact. Virtual calls are
+    /// expanded only when the receiver is structurally known to be exactly the declared owner
+    /// (`this` of that concrete entry class or a directly allocated instance). Other dynamic calls
+    /// remain explicit blockers instead of guessing dispatch. Recursive call-graph cycles are cut
+    /// explicitly after preserving effects reached before the cycle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `entry` is absent from the program.
+    pub fn structural_effects(
+        &self,
+        entry: &JimpleMethodSignature,
+    ) -> Result<JimpleProgramEffectSummary> {
+        let method = self
+            .method(entry)
+            .with_context(|| format!("Jimple method {entry:?} does not exist"))?;
+        let mut summary = JimpleProgramEffectSummary {
+            entry: entry.clone(),
+            possible_field_writes: Vec::new(),
+            unresolved_calls: Vec::new(),
+        };
+        let mut active = vec![entry.clone()];
+        self.expand_structural_effects(
+            method,
+            StructuralEffectContext {
+                this_value: None,
+                arguments: &[],
+                call_path: &[],
+            },
+            &mut active,
+            &mut summary,
+        );
+        Ok(summary)
+    }
+
+    fn expand_structural_effects(
+        &self,
+        method: &JimpleMethod,
+        context: StructuralEffectContext<'_>,
+        active: &mut Vec<JimpleMethodSignature>,
+        summary: &mut JimpleProgramEffectSummary,
+    ) {
+        for effect in method.effect_summary().effects {
+            match effect {
+                JimpleDirectEffect::FieldWrite(write) => {
+                    summary.possible_field_writes.push(JimpleProgramFieldWrite {
+                        call_path: context.call_path.to_vec(),
+                        statement_id: write.statement_id,
+                        field: write.field,
+                        receiver: write.receiver.as_ref().map(|receiver| {
+                            substitute_symbolic(receiver, context.this_value, context.arguments)
+                        }),
+                        value: substitute_symbolic(
+                            &write.value,
+                            context.this_value,
+                            context.arguments,
+                        ),
+                    });
+                }
+                JimpleDirectEffect::Invocation(invocation) => {
+                    self.expand_structural_invocation(
+                        method,
+                        &invocation,
+                        &context,
+                        active,
+                        summary,
+                    );
+                }
+            }
+        }
+    }
+
+    fn expand_structural_invocation(
+        &self,
+        current_method: &JimpleMethod,
+        invocation: &JimpleInvocation,
+        context: &StructuralEffectContext<'_>,
+        active: &mut Vec<JimpleMethodSignature>,
+        summary: &mut JimpleProgramEffectSummary,
+    ) {
+        let receiver = invocation
+            .receiver
+            .as_ref()
+            .map(|receiver| substitute_symbolic(receiver, context.this_value, context.arguments));
+        let call_arguments: Vec<_> = invocation
+            .arguments
+            .iter()
+            .map(|argument| substitute_symbolic(argument, context.this_value, context.arguments))
+            .collect();
+        let frame = JimpleEffectCallFrame {
+            caller: current_method.signature.clone(),
+            statement_id: invocation.statement_id,
+            invoke_kind: invocation.invoke_kind.clone(),
+            callee: invocation.method.clone(),
+        };
+        let mut next_path = context.call_path.to_vec();
+        next_path.push(frame);
+
+        let Some(target_method) = self.method(&invocation.method) else {
+            summary.unresolved_calls.push(JimpleUnresolvedEffectCall {
+                call_path: next_path,
+                receiver,
+                arguments: call_arguments,
+                reason: JimpleUnresolvedEffectReason::MissingMethod,
+            });
+            return;
+        };
+
+        if !structurally_exact_dispatch(
+            &invocation.invoke_kind,
+            receiver.as_ref(),
+            &invocation.method,
+        ) {
+            summary.unresolved_calls.push(JimpleUnresolvedEffectCall {
+                call_path: next_path,
+                receiver,
+                arguments: call_arguments,
+                reason: JimpleUnresolvedEffectReason::DynamicDispatch,
+            });
+            return;
+        }
+
+        if active.contains(&target_method.signature) {
+            summary.unresolved_calls.push(JimpleUnresolvedEffectCall {
+                call_path: next_path,
+                receiver,
+                arguments: call_arguments,
+                reason: JimpleUnresolvedEffectReason::RecursiveCycle,
+            });
+            return;
+        }
+
+        active.push(target_method.signature.clone());
+        self.expand_structural_effects(
+            target_method,
+            StructuralEffectContext {
+                this_value: receiver.as_ref(),
+                arguments: &call_arguments,
+                call_path: &next_path,
+            },
+            active,
+            summary,
+        );
+        active.pop();
     }
 
     fn class_initializer(&self, owner: &str) -> Option<&JimpleMethod> {
@@ -1894,6 +2091,28 @@ impl<'a> ProgramVm<'a> {
     }
 }
 
+fn structurally_exact_dispatch(
+    invoke_kind: &str,
+    receiver: Option<&SymbolicValue>,
+    method: &JimpleMethodSignature,
+) -> bool {
+    match invoke_kind {
+        "JStaticInvokeExpr" | "JSpecialInvokeExpr" => true,
+        "JVirtualInvokeExpr" => {
+            exact_symbolic_runtime_type(receiver) == Some(method.owner.as_str())
+        }
+        _ => false,
+    }
+}
+
+fn exact_symbolic_runtime_type(value: Option<&SymbolicValue>) -> Option<&str> {
+    match value? {
+        SymbolicValue::This { type_name } => Some(type_name),
+        SymbolicValue::New { class_type } => Some(class_type),
+        _ => None,
+    }
+}
+
 fn immediate_postdominator(method: &JimpleMethod, statement_id: usize) -> Option<usize> {
     const EXIT: usize = usize::MAX;
 
@@ -2966,6 +3185,212 @@ mod tests {
         assert_eq!(
             execution.initialized_classes,
             vec![String::from("demo.Once"), String::from("demo.Value")]
+        );
+        Ok(())
+    }
+
+    fn timer_setter(timer: &super::super::JimpleFieldSignature) -> JimpleMethod {
+        let this_local = local("this", "demo.Timer");
+        let parameter_local = local("value", "int");
+        let mut setter = method(
+            "demo.Timer",
+            "set",
+            vec![
+                statement(
+                    0,
+                    vec![1],
+                    JimpleOperation::Identity {
+                        left: this_local.clone(),
+                        right: value(JimpleValueKind::This, "demo.Timer", "@this"),
+                    },
+                ),
+                statement(
+                    1,
+                    vec![2],
+                    JimpleOperation::Identity {
+                        left: parameter_local.clone(),
+                        right: value(
+                            JimpleValueKind::Parameter { index: 0 },
+                            "int",
+                            "@parameter0",
+                        ),
+                    },
+                ),
+                statement(
+                    2,
+                    vec![3],
+                    JimpleOperation::Assign {
+                        left: instance_field(this_local, timer),
+                        right: parameter_local,
+                    },
+                ),
+                statement(3, Vec::new(), JimpleOperation::ReturnVoid),
+            ],
+        );
+        setter.signature.return_type = String::from("java.lang.Object");
+        setter.signature.parameter_types = vec![String::from("int")];
+        setter
+    }
+
+    fn timer_transfer() -> JimpleMethod {
+        let this_local = local("this", "demo.Timer");
+        let mut transfer = method(
+            "demo.Timer",
+            "transfer",
+            vec![
+                statement(
+                    0,
+                    vec![1],
+                    JimpleOperation::Identity {
+                        left: this_local.clone(),
+                        right: value(JimpleValueKind::This, "demo.Timer", "@this"),
+                    },
+                ),
+                statement(
+                    1,
+                    vec![2],
+                    JimpleOperation::Invoke {
+                        expression: Some(invoke(
+                            this_local,
+                            "demo.Timer",
+                            "set",
+                            vec!["int"],
+                            vec![integer(8)],
+                        )),
+                    },
+                ),
+                statement(2, Vec::new(), JimpleOperation::ReturnVoid),
+            ],
+        );
+        transfer.signature.return_type = String::from("java.lang.Object");
+        transfer
+    }
+
+    fn timer_tick() -> JimpleMethod {
+        let this_local = local("this", "demo.Timer");
+        method(
+            "demo.Timer",
+            "tick",
+            vec![
+                statement(
+                    0,
+                    vec![1],
+                    JimpleOperation::Identity {
+                        left: this_local.clone(),
+                        right: value(JimpleValueKind::This, "demo.Timer", "@this"),
+                    },
+                ),
+                statement(
+                    1,
+                    vec![2],
+                    JimpleOperation::Invoke {
+                        expression: Some(invoke(
+                            this_local.clone(),
+                            "demo.Timer",
+                            "set",
+                            vec!["int"],
+                            vec![integer(0)],
+                        )),
+                    },
+                ),
+                statement(
+                    2,
+                    vec![3],
+                    JimpleOperation::Invoke {
+                        expression: Some(invoke(
+                            this_local,
+                            "demo.Timer",
+                            "transfer",
+                            Vec::new(),
+                            Vec::new(),
+                        )),
+                    },
+                ),
+                statement(3, Vec::new(), JimpleOperation::ReturnVoid),
+            ],
+        )
+    }
+
+    #[test]
+    fn composes_parameterized_field_writes_through_exact_calls() -> Result<()> {
+        let timer = field("demo.Timer", "timer", "int");
+        let tick = timer_tick();
+        let entry = tick.signature.clone();
+        let program = JimpleProgram::new(vec![tick, timer_transfer(), timer_setter(&timer)]);
+        let effects = program.structural_effects(&entry)?;
+
+        let values: Vec<_> = effects
+            .possible_field_writes
+            .iter()
+            .filter_map(|write| match write.value {
+                SymbolicValue::Integer { value, .. } => Some((value, write.call_path.len())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(values, vec![(0, 1), (8, 2)]);
+        assert_eq!(effects.unresolved_calls, Vec::new());
+        assert!(
+            effects
+                .possible_field_writes
+                .iter()
+                .all(|write| write.field == timer)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn leaves_ambiguous_virtual_dispatch_explicit() -> Result<()> {
+        let this_local = local("this", "demo.Caller");
+        let target_local = local("target", "demo.Base");
+        let target_field = field("demo.Caller", "target", "demo.Base");
+        let caller = method(
+            "demo.Caller",
+            "run",
+            vec![
+                statement(
+                    0,
+                    vec![1],
+                    JimpleOperation::Identity {
+                        left: this_local.clone(),
+                        right: value(JimpleValueKind::This, "demo.Caller", "@this"),
+                    },
+                ),
+                statement(
+                    1,
+                    vec![2],
+                    JimpleOperation::Assign {
+                        left: target_local.clone(),
+                        right: instance_field(this_local, &target_field),
+                    },
+                ),
+                statement(
+                    2,
+                    vec![3],
+                    JimpleOperation::Invoke {
+                        expression: Some(invoke(
+                            target_local,
+                            "demo.Base",
+                            "mutate",
+                            Vec::new(),
+                            Vec::new(),
+                        )),
+                    },
+                ),
+                statement(3, Vec::new(), JimpleOperation::ReturnVoid),
+            ],
+        );
+        let mut base_method = method(
+            "demo.Base",
+            "mutate",
+            vec![statement(0, Vec::new(), JimpleOperation::ReturnVoid)],
+        );
+        base_method.signature.return_type = String::from("java.lang.Object");
+        let entry = caller.signature.clone();
+        let effects = JimpleProgram::new(vec![caller, base_method]).structural_effects(&entry)?;
+        assert_eq!(effects.unresolved_calls.len(), 1);
+        assert_eq!(
+            effects.unresolved_calls[0].reason,
+            JimpleUnresolvedEffectReason::DynamicDispatch
         );
         Ok(())
     }

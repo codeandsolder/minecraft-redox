@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 mod program;
 pub use program::{
     AbstractMapEntry, AbstractMapSnapshot, AbstractOpaqueCallShape, AbstractStaticFieldValue,
-    JimpleProgram, ProgramExecution,
+    JimpleEffectCallFrame, JimpleProgram, JimpleProgramEffectSummary, JimpleProgramFieldWrite,
+    JimpleUnresolvedEffectCall, JimpleUnresolvedEffectReason, ProgramExecution,
 };
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
@@ -287,6 +288,36 @@ pub struct SymbolicAssignment {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct JimpleFieldWrite {
+    pub statement_id: usize,
+    pub field: JimpleFieldSignature,
+    pub receiver: Option<SymbolicValue>,
+    pub value: SymbolicValue,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct JimpleInvocation {
+    pub statement_id: usize,
+    pub invoke_kind: String,
+    pub method: JimpleMethodSignature,
+    pub receiver: Option<SymbolicValue>,
+    pub arguments: Vec<SymbolicValue>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(tag = "kind", content = "effect", rename_all = "snake_case")]
+pub enum JimpleDirectEffect {
+    FieldWrite(JimpleFieldWrite),
+    Invocation(JimpleInvocation),
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct JimpleEffectSummary {
+    pub method: JimpleMethodSignature,
+    pub effects: Vec<JimpleDirectEffect>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct JimpleCounterUpdate {
     pub statement_id: usize,
     pub field: JimpleFieldSignature,
@@ -355,6 +386,56 @@ impl JimpleMethod {
         included.into_iter().collect()
     }
 
+    /// Recover direct structural effects from this method without interpreting domain names.
+    ///
+    /// Local temporaries are resolved at each program point, while heap fields remain state facts.
+    /// Calls are reported separately so a program-level analysis can compose exact callees without
+    /// pretending ambiguous dynamic dispatch is known.
+    #[must_use]
+    pub fn effect_summary(&self) -> JimpleEffectSummary {
+        let mut effects = Vec::new();
+
+        for statement in &self.statements {
+            for value in operation_input_values(&statement.operation) {
+                collect_invocations(value, &mut |invoke_kind, method, base, arguments| {
+                    let mut visiting = BTreeSet::new();
+                    let receiver = base
+                        .map(|base| self.resolve_locals_only(statement.id, base, &mut visiting));
+                    let arguments = arguments
+                        .iter()
+                        .map(|argument| {
+                            self.resolve_locals_only(statement.id, argument, &mut visiting)
+                        })
+                        .collect();
+                    effects.push(JimpleDirectEffect::Invocation(JimpleInvocation {
+                        statement_id: statement.id,
+                        invoke_kind: invoke_kind.to_owned(),
+                        method: method.clone(),
+                        receiver,
+                        arguments,
+                    }));
+                });
+            }
+
+            if let JimpleOperation::Assign { left, right } = &statement.operation
+                && let Some((field, receiver)) = self.field_target(statement.id, left)
+            {
+                let mut visiting = BTreeSet::new();
+                effects.push(JimpleDirectEffect::FieldWrite(JimpleFieldWrite {
+                    statement_id: statement.id,
+                    field,
+                    receiver,
+                    value: self.resolve_locals_only(statement.id, right, &mut visiting),
+                }));
+            }
+        }
+
+        JimpleEffectSummary {
+            method: self.signature.clone(),
+            effects,
+        }
+    }
+
     /// Recover source-independent temporal counter structure from this method.
     ///
     /// The detector follows local definitions before matching, so it recognizes JVM/Jimple
@@ -362,51 +443,42 @@ impl JimpleMethod {
     /// knowing the source field or class name.
     #[must_use]
     pub fn temporal_summary(&self) -> JimpleTemporalSummary {
+        let effects = self.effect_summary();
         let mut counter_updates = Vec::new();
         let mut constant_writes = Vec::new();
         let mut comparisons = Vec::new();
 
+        for effect in effects.effects {
+            let JimpleDirectEffect::FieldWrite(write) = effect else {
+                continue;
+            };
+            if let Some(value) = symbolic_integer(&write.value) {
+                constant_writes.push(JimpleFieldConstantWrite {
+                    statement_id: write.statement_id,
+                    field: write.field,
+                    receiver: write.receiver,
+                    value,
+                });
+                continue;
+            }
+            if let Some(delta) = counter_delta(&write.field, write.receiver.as_ref(), &write.value)
+            {
+                counter_updates.push(JimpleCounterUpdate {
+                    statement_id: write.statement_id,
+                    field: write.field,
+                    receiver: write.receiver,
+                    delta,
+                });
+            }
+        }
+
         for statement in &self.statements {
-            match &statement.operation {
-                JimpleOperation::Assign { left, right } => {
-                    let Some((field, receiver)) = self.field_target(statement.id, left) else {
-                        continue;
-                    };
-                    let mut visiting = BTreeSet::new();
-                    let resolved = self.resolve_locals_only(statement.id, right, &mut visiting);
-                    if let Some(value) = symbolic_integer(&resolved) {
-                        constant_writes.push(JimpleFieldConstantWrite {
-                            statement_id: statement.id,
-                            field,
-                            receiver,
-                            value,
-                        });
-                        continue;
-                    }
-                    if let Some(delta) = counter_delta(&field, receiver.as_ref(), &resolved) {
-                        counter_updates.push(JimpleCounterUpdate {
-                            statement_id: statement.id,
-                            field,
-                            receiver,
-                            delta,
-                        });
-                    }
+            if let JimpleOperation::If { condition } = &statement.operation {
+                let mut visiting = BTreeSet::new();
+                let resolved = self.resolve_locals_only(statement.id, condition, &mut visiting);
+                if let Some(comparison) = field_comparison(statement.id, &resolved) {
+                    comparisons.push(comparison);
                 }
-                JimpleOperation::If { condition } => {
-                    let mut visiting = BTreeSet::new();
-                    let resolved = self.resolve_locals_only(statement.id, condition, &mut visiting);
-                    if let Some(comparison) = field_comparison(statement.id, &resolved) {
-                        comparisons.push(comparison);
-                    }
-                }
-                JimpleOperation::Identity { .. }
-                | JimpleOperation::Invoke { .. }
-                | JimpleOperation::Return { .. }
-                | JimpleOperation::ReturnVoid
-                | JimpleOperation::Throw { .. }
-                | JimpleOperation::Switch { .. }
-                | JimpleOperation::Goto
-                | JimpleOperation::Opaque => {}
             }
         }
 
@@ -768,6 +840,128 @@ fn field_comparison(statement_id: usize, value: &SymbolicValue) -> Option<Jimple
         });
     }
     None
+}
+
+fn operation_input_values(operation: &JimpleOperation) -> Vec<&JimpleValue> {
+    match operation {
+        JimpleOperation::Assign { right, .. } | JimpleOperation::Identity { right, .. } => {
+            vec![right]
+        }
+        JimpleOperation::If { condition } => vec![condition],
+        JimpleOperation::Invoke {
+            expression: Some(expression),
+        } => vec![expression],
+        JimpleOperation::Return { value } | JimpleOperation::Throw { value } => vec![value],
+        JimpleOperation::Switch { key, .. } => vec![key],
+        JimpleOperation::Invoke { expression: None }
+        | JimpleOperation::ReturnVoid
+        | JimpleOperation::Goto
+        | JimpleOperation::Opaque => Vec::new(),
+    }
+}
+
+fn collect_invocations<'a>(
+    value: &'a JimpleValue,
+    visitor: &mut impl FnMut(
+        &'a str,
+        &'a JimpleMethodSignature,
+        Option<&'a JimpleValue>,
+        &'a [JimpleValue],
+    ),
+) {
+    if let JimpleValueKind::Invoke {
+        invoke_kind,
+        method,
+        base,
+        arguments,
+        ..
+    } = &value.kind
+    {
+        visitor(invoke_kind, method, base.as_deref(), arguments);
+    }
+    for child in value_children(value) {
+        collect_invocations(child, visitor);
+    }
+}
+
+pub(super) fn substitute_symbolic(
+    value: &SymbolicValue,
+    this_value: Option<&SymbolicValue>,
+    arguments: &[SymbolicValue],
+) -> SymbolicValue {
+    match value {
+        SymbolicValue::This { .. } => this_value.cloned().unwrap_or_else(|| value.clone()),
+        SymbolicValue::Parameter { index, .. } => arguments
+            .get(*index)
+            .cloned()
+            .unwrap_or_else(|| value.clone()),
+        SymbolicValue::InstanceField { base, field } => SymbolicValue::InstanceField {
+            base: Box::new(substitute_symbolic(base, this_value, arguments)),
+            field: field.clone(),
+        },
+        SymbolicValue::ArrayElement { base, index } => SymbolicValue::ArrayElement {
+            base: Box::new(substitute_symbolic(base, this_value, arguments)),
+            index: Box::new(substitute_symbolic(index, this_value, arguments)),
+        },
+        SymbolicValue::Binary {
+            operator,
+            left,
+            right,
+        } => SymbolicValue::Binary {
+            operator: operator.clone(),
+            left: Box::new(substitute_symbolic(left, this_value, arguments)),
+            right: Box::new(substitute_symbolic(right, this_value, arguments)),
+        },
+        SymbolicValue::Cast { type_name, value } => SymbolicValue::Cast {
+            type_name: type_name.clone(),
+            value: Box::new(substitute_symbolic(value, this_value, arguments)),
+        },
+        SymbolicValue::Unary { operator, value } => SymbolicValue::Unary {
+            operator: operator.clone(),
+            value: Box::new(substitute_symbolic(value, this_value, arguments)),
+        },
+        SymbolicValue::ArrayLength { value } => SymbolicValue::ArrayLength {
+            value: Box::new(substitute_symbolic(value, this_value, arguments)),
+        },
+        SymbolicValue::NewArray { element_type, size } => SymbolicValue::NewArray {
+            element_type: element_type.clone(),
+            size: Box::new(substitute_symbolic(size, this_value, arguments)),
+        },
+        SymbolicValue::NewMultiArray { array_type, sizes } => SymbolicValue::NewMultiArray {
+            array_type: array_type.clone(),
+            sizes: sizes
+                .iter()
+                .map(|size| substitute_symbolic(size, this_value, arguments))
+                .collect(),
+        },
+        SymbolicValue::Phi { values } => SymbolicValue::Phi {
+            values: values
+                .iter()
+                .map(|item| substitute_symbolic(item, this_value, arguments))
+                .collect(),
+        },
+        SymbolicValue::Invoke {
+            method,
+            base,
+            arguments: inner_arguments,
+        } => SymbolicValue::Invoke {
+            method: method.clone(),
+            base: base
+                .as_deref()
+                .map(|base| Box::new(substitute_symbolic(base, this_value, arguments))),
+            arguments: inner_arguments
+                .iter()
+                .map(|argument| substitute_symbolic(argument, this_value, arguments))
+                .collect(),
+        },
+        SymbolicValue::Integer { .. }
+        | SymbolicValue::Float { .. }
+        | SymbolicValue::String { .. }
+        | SymbolicValue::Null
+        | SymbolicValue::StaticField { .. }
+        | SymbolicValue::New { .. }
+        | SymbolicValue::Unknown { .. } => value.clone(),
+    }
 }
 
 fn operation_definition(operation: &JimpleOperation) -> Option<&JimpleValue> {

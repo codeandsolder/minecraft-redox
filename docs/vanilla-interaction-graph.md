@@ -61,6 +61,18 @@ The graph should encode sparse causal semantics, not historical polling frequenc
 5. **Presentation/effects -> outputs.** Dirty notifications, sounds, particles, and client progress are effects/views of semantic state changes, not reasons to poll the simulation.
 6. **Dense work stays specialized.** Block breaking, bulk spatial edits, rendering, collision/physics inner loops, and similar dense operations should keep specialized representations. Their sparse boundary effects can still feed the graph.
 
+## Interprocedural structural effects
+
+The next generic step is now implemented locally: each method exposes an ordered direct effect stream of symbolic field writes and invocations. Program-level composition substitutes `this` and parameters through exact in-program calls, preserves the call path for each possible write, cuts recursive call-graph cycles explicitly, and refuses ambiguous dynamic dispatch. Static/special calls are exact; virtual calls are composed only when the receiver is structurally known to be exactly the declared owner (for example a same-class call on the entry `this`).
+
+On the real vanilla Hopper `updateEntity` reachable dump this recovers the cooldown field in three forms without Hopper-specific names:
+
+- direct decrement: `cooldown = cooldown - 1`;
+- one-hop helper effect: `setCooldown(0)` -> cooldown write `0`;
+- two-hop successful-transfer effect: `tryTransfer()` -> `setCooldown(8)` -> cooldown write `8`.
+
+These are reported as **possible structural effects**, not unconditional writes. CFG guards still need to be attached before they become executable graph reactions. Missing methods and unresolved dynamic dispatch remain explicit in the summary rather than being guessed.
+
 ## Missing pieces exposed by vanilla
 
 The current graph runtime proves the scheduling model but intentionally still has prototype numeric state. Exact Minecraft lowering needs:
