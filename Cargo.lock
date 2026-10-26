@@ -140,6 +140,7 @@ dependencies = [
  "anyhow",
  "minecraft-redox-core",
  "serde",
+ "serde_json",
  "tree-sitter",
  "tree-sitter-java",
 ]

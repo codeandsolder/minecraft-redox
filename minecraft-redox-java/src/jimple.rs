@@ -1,0 +1,1471 @@
+//! Structured Jimple interchange and generic provenance recovery.
+//!
+//! This module intentionally contains no `GregTech` vocabulary. The Java-side
+//! exporter lowers JVM bytecode to structured Jimple; Rust then follows defs,
+//! uses and expression structure without parsing Java or Jimple text.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
+pub struct JimpleFieldSignature {
+    pub owner: String,
+    pub name: String,
+    #[serde(rename = "type")]
+    pub type_name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct JimpleMethodSignature {
+    pub owner: String,
+    pub name: String,
+    pub return_type: String,
+    pub parameter_types: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+pub struct JimpleMethod {
+    pub signature: JimpleMethodSignature,
+    pub display_signature: String,
+    pub statements: Vec<JimpleStatement>,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+pub struct JimpleStatement {
+    pub id: usize,
+    pub kind: String,
+    pub text: String,
+    pub def: Option<String>,
+    pub uses: Vec<JimpleValueSummary>,
+    pub successors: Vec<usize>,
+    pub operation: JimpleOperation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct JimpleValueSummary {
+    pub kind: String,
+    #[serde(rename = "type")]
+    pub type_name: String,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+pub struct JimpleValue {
+    pub jimple_kind: String,
+    #[serde(rename = "type")]
+    pub type_name: String,
+    pub text: String,
+    #[serde(flatten)]
+    pub kind: JimpleValueKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum JimpleValueKind {
+    Local {
+        name: String,
+    },
+    IntegerConstant {
+        value: i64,
+    },
+    FloatConstant {
+        value: f64,
+    },
+    StringConstant {
+        value: String,
+    },
+    NullConstant,
+    Parameter {
+        index: usize,
+    },
+    This,
+    ArrayRef {
+        base: Box<JimpleValue>,
+        index: Box<JimpleValue>,
+    },
+    InstanceField {
+        base: Box<JimpleValue>,
+        field: JimpleFieldSignature,
+    },
+    StaticField {
+        field: JimpleFieldSignature,
+    },
+    Binary {
+        operator: String,
+        left: Box<JimpleValue>,
+        right: Box<JimpleValue>,
+    },
+    Cast {
+        cast_type: String,
+        value: Box<JimpleValue>,
+    },
+    Unary {
+        operator: String,
+        value: Box<JimpleValue>,
+    },
+    ArrayLength {
+        value: Box<JimpleValue>,
+    },
+    New {
+        class_type: String,
+    },
+    NewArray {
+        element_type: String,
+        size: Box<JimpleValue>,
+    },
+    NewMultiArray {
+        array_type: String,
+        sizes: Vec<JimpleValue>,
+    },
+    Phi {
+        values: Vec<JimpleValue>,
+    },
+    Invoke {
+        invoke_kind: String,
+        method: JimpleMethodSignature,
+        base: Option<Box<JimpleValue>>,
+        arguments: Vec<JimpleValue>,
+        #[serde(default)]
+        bootstrap_method: Option<JimpleMethodSignature>,
+        #[serde(default)]
+        bootstrap_arguments: Vec<JimpleValue>,
+    },
+    Opaque,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum JimpleOperation {
+    Assign {
+        left: JimpleValue,
+        right: JimpleValue,
+    },
+    Identity {
+        left: JimpleValue,
+        right: JimpleValue,
+    },
+    If {
+        condition: JimpleValue,
+    },
+    Invoke {
+        expression: Option<JimpleValue>,
+    },
+    Return {
+        value: JimpleValue,
+    },
+    ReturnVoid,
+    Goto,
+    Opaque,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum StorageLocation {
+    Local(String),
+    StaticField(JimpleFieldSignature),
+    InstanceField {
+        base: Box<StorageLocation>,
+        field: JimpleFieldSignature,
+    },
+    ArrayElement {
+        base: Box<StorageLocation>,
+        index: i64,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SymbolicValue {
+    Integer {
+        value: i64,
+        type_name: String,
+    },
+    Float {
+        value: f64,
+        type_name: String,
+    },
+    String {
+        value: String,
+    },
+    Null,
+    Parameter {
+        index: usize,
+        type_name: String,
+    },
+    This {
+        type_name: String,
+    },
+    StaticField {
+        field: JimpleFieldSignature,
+    },
+    InstanceField {
+        base: Box<SymbolicValue>,
+        field: JimpleFieldSignature,
+    },
+    ArrayElement {
+        base: Box<SymbolicValue>,
+        index: Box<SymbolicValue>,
+    },
+    Binary {
+        operator: String,
+        left: Box<SymbolicValue>,
+        right: Box<SymbolicValue>,
+    },
+    Cast {
+        type_name: String,
+        value: Box<SymbolicValue>,
+    },
+    Unary {
+        operator: String,
+        value: Box<SymbolicValue>,
+    },
+    ArrayLength {
+        value: Box<SymbolicValue>,
+    },
+    New {
+        class_type: String,
+    },
+    NewArray {
+        element_type: String,
+        size: Box<SymbolicValue>,
+    },
+    NewMultiArray {
+        array_type: String,
+        sizes: Vec<SymbolicValue>,
+    },
+    Phi {
+        values: Vec<SymbolicValue>,
+    },
+    Invoke {
+        method: JimpleMethodSignature,
+        base: Option<Box<SymbolicValue>>,
+        arguments: Vec<SymbolicValue>,
+    },
+    Unknown {
+        type_name: String,
+        text: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SymbolicAssignment {
+    pub statement_id: usize,
+    pub target: SymbolicValue,
+    pub value: SymbolicValue,
+}
+
+/// Decode methods produced by the structured Jimple exporter.
+///
+/// # Errors
+///
+/// Returns an error when the input is not valid structured Jimple JSON.
+pub fn parse_methods(json: &str) -> Result<Vec<JimpleMethod>> {
+    serde_json::from_str(json).context("failed to decode structured Jimple JSON")
+}
+
+impl JimpleMethod {
+    #[must_use]
+    pub fn statement_containing(&self, text: &str) -> Option<&JimpleStatement> {
+        self.statements
+            .iter()
+            .find(|statement| statement.text.contains(text))
+    }
+
+    #[must_use]
+    pub fn backward_slice(&self, sink_id: usize) -> Vec<usize> {
+        let Some(sink) = self
+            .statements
+            .iter()
+            .find(|statement| statement.id == sink_id)
+        else {
+            return Vec::new();
+        };
+        let mut included = BTreeSet::from([sink_id]);
+        let mut pending = Vec::new();
+        operation_inputs_before(&sink.operation, sink.id, &mut pending);
+        while let Some((before_id, value)) = pending.pop() {
+            self.add_value_dependencies(before_id, value, &mut included, &mut pending);
+        }
+        included.into_iter().collect()
+    }
+
+    /// Resolve an assignment RHS through preceding structured definitions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the statement does not exist or is not an assignment.
+    pub fn symbolic_assignment(&self, statement_id: usize) -> Result<SymbolicAssignment> {
+        let statement = self
+            .statements
+            .iter()
+            .find(|statement| statement.id == statement_id)
+            .with_context(|| format!("Jimple statement {statement_id} does not exist"))?;
+        let JimpleOperation::Assign { left, right } = &statement.operation else {
+            bail!("Jimple statement {statement_id} is not an assignment");
+        };
+        let mut visiting = BTreeSet::new();
+        Ok(SymbolicAssignment {
+            statement_id,
+            target: self.resolve_value(statement_id, left, &mut visiting),
+            value: self.resolve_value(statement_id, right, &mut visiting),
+        })
+    }
+
+    fn add_value_dependencies<'a>(
+        &'a self,
+        before_id: usize,
+        value: &'a JimpleValue,
+        included: &mut BTreeSet<usize>,
+        pending: &mut Vec<(usize, &'a JimpleValue)>,
+    ) {
+        if let Some(location) = storage_location(value)
+            && let Some(definition) = self.latest_definition_before(before_id, &location)
+            && included.insert(definition.id)
+        {
+            operation_inputs_before(&definition.operation, definition.id, pending);
+            return;
+        }
+        for child in value_children(value) {
+            pending.push((before_id, child));
+        }
+    }
+
+    fn latest_definition_before(
+        &self,
+        before_id: usize,
+        location: &StorageLocation,
+    ) -> Option<&JimpleStatement> {
+        self.statements.iter().rev().find(|statement| {
+            statement.id < before_id
+                && operation_definition(&statement.operation).and_then(storage_location)
+                    == Some(location.clone())
+        })
+    }
+
+    fn resolve_value(
+        &self,
+        before_id: usize,
+        value: &JimpleValue,
+        visiting: &mut BTreeSet<(usize, StorageLocation)>,
+    ) -> SymbolicValue {
+        if let Some(location) = storage_location(value)
+            && let Some(definition) = self.latest_definition_before(before_id, &location)
+        {
+            let visit = (definition.id, location.clone());
+            if visiting.insert(visit.clone()) {
+                let resolved = match &definition.operation {
+                    JimpleOperation::Assign { right, .. }
+                    | JimpleOperation::Identity { right, .. } => {
+                        self.resolve_value(definition.id, right, visiting)
+                    }
+                    _ => symbolic_leaf(value),
+                };
+                visiting.remove(&visit);
+                return resolved;
+            }
+        }
+        match &value.kind {
+            JimpleValueKind::ArrayRef { base, index } => SymbolicValue::ArrayElement {
+                base: Box::new(self.resolve_value(before_id, base, visiting)),
+                index: Box::new(self.resolve_value(before_id, index, visiting)),
+            },
+            JimpleValueKind::InstanceField { base, field } => SymbolicValue::InstanceField {
+                base: Box::new(self.resolve_value(before_id, base, visiting)),
+                field: field.clone(),
+            },
+            JimpleValueKind::Binary {
+                operator,
+                left,
+                right,
+            } => SymbolicValue::Binary {
+                operator: operator.trim().to_owned(),
+                left: Box::new(self.resolve_value(before_id, left, visiting)),
+                right: Box::new(self.resolve_value(before_id, right, visiting)),
+            },
+            JimpleValueKind::Cast { cast_type, value } => SymbolicValue::Cast {
+                type_name: cast_type.clone(),
+                value: Box::new(self.resolve_value(before_id, value, visiting)),
+            },
+            JimpleValueKind::Unary { operator, value } => SymbolicValue::Unary {
+                operator: operator.clone(),
+                value: Box::new(self.resolve_value(before_id, value, visiting)),
+            },
+            JimpleValueKind::ArrayLength { value } => SymbolicValue::ArrayLength {
+                value: Box::new(self.resolve_value(before_id, value, visiting)),
+            },
+            JimpleValueKind::NewArray { element_type, size } => SymbolicValue::NewArray {
+                element_type: element_type.clone(),
+                size: Box::new(self.resolve_value(before_id, size, visiting)),
+            },
+            JimpleValueKind::NewMultiArray { array_type, sizes } => SymbolicValue::NewMultiArray {
+                array_type: array_type.clone(),
+                sizes: sizes
+                    .iter()
+                    .map(|size| self.resolve_value(before_id, size, visiting))
+                    .collect(),
+            },
+            JimpleValueKind::Phi { values } => SymbolicValue::Phi {
+                values: values
+                    .iter()
+                    .map(|value| self.resolve_value(before_id, value, visiting))
+                    .collect(),
+            },
+            JimpleValueKind::Invoke {
+                method,
+                base,
+                arguments,
+                ..
+            } => SymbolicValue::Invoke {
+                method: method.clone(),
+                base: base
+                    .as_deref()
+                    .map(|base| Box::new(self.resolve_value(before_id, base, visiting))),
+                arguments: arguments
+                    .iter()
+                    .map(|argument| self.resolve_value(before_id, argument, visiting))
+                    .collect(),
+            },
+            _ => symbolic_leaf(value),
+        }
+    }
+}
+
+fn operation_definition(operation: &JimpleOperation) -> Option<&JimpleValue> {
+    match operation {
+        JimpleOperation::Assign { left, .. } | JimpleOperation::Identity { left, .. } => Some(left),
+        _ => None,
+    }
+}
+
+fn operation_inputs_before<'a>(
+    operation: &'a JimpleOperation,
+    before_id: usize,
+    pending: &mut Vec<(usize, &'a JimpleValue)>,
+) {
+    match operation {
+        JimpleOperation::Assign { right, .. } | JimpleOperation::Identity { right, .. } => {
+            pending.push((before_id, right));
+        }
+        JimpleOperation::If { condition } => pending.push((before_id, condition)),
+        JimpleOperation::Invoke {
+            expression: Some(expression),
+        } => pending.push((before_id, expression)),
+        JimpleOperation::Return { value } => pending.push((before_id, value)),
+        JimpleOperation::Invoke { expression: None }
+        | JimpleOperation::ReturnVoid
+        | JimpleOperation::Goto
+        | JimpleOperation::Opaque => {}
+    }
+}
+
+fn storage_location(value: &JimpleValue) -> Option<StorageLocation> {
+    match &value.kind {
+        JimpleValueKind::Local { name } => Some(StorageLocation::Local(name.clone())),
+        JimpleValueKind::StaticField { field } => Some(StorageLocation::StaticField(field.clone())),
+        JimpleValueKind::InstanceField { base, field } => Some(StorageLocation::InstanceField {
+            base: Box::new(storage_location(base)?),
+            field: field.clone(),
+        }),
+        JimpleValueKind::ArrayRef { base, index } => {
+            let JimpleValueKind::IntegerConstant { value: index } = index.kind else {
+                return None;
+            };
+            Some(StorageLocation::ArrayElement {
+                base: Box::new(storage_location(base)?),
+                index,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn value_children(value: &JimpleValue) -> Vec<&JimpleValue> {
+    let mut children = Vec::new();
+    match &value.kind {
+        JimpleValueKind::ArrayRef { base, index }
+        | JimpleValueKind::Binary {
+            left: base,
+            right: index,
+            ..
+        } => {
+            children.push(base.as_ref());
+            children.push(index.as_ref());
+        }
+        JimpleValueKind::InstanceField { base, .. }
+        | JimpleValueKind::Cast { value: base, .. }
+        | JimpleValueKind::Unary { value: base, .. }
+        | JimpleValueKind::ArrayLength { value: base }
+        | JimpleValueKind::NewArray { size: base, .. } => children.push(base.as_ref()),
+        JimpleValueKind::NewMultiArray { sizes, .. } | JimpleValueKind::Phi { values: sizes } => {
+            children.extend(sizes.iter());
+        }
+        JimpleValueKind::Invoke {
+            base, arguments, ..
+        } => {
+            if let Some(base) = base {
+                children.push(base.as_ref());
+            }
+            children.extend(arguments.iter());
+        }
+        JimpleValueKind::Local { .. }
+        | JimpleValueKind::IntegerConstant { .. }
+        | JimpleValueKind::FloatConstant { .. }
+        | JimpleValueKind::StringConstant { .. }
+        | JimpleValueKind::NullConstant
+        | JimpleValueKind::Parameter { .. }
+        | JimpleValueKind::This
+        | JimpleValueKind::StaticField { .. }
+        | JimpleValueKind::New { .. }
+        | JimpleValueKind::Opaque => {}
+    }
+    children
+}
+
+fn symbolic_leaf(value: &JimpleValue) -> SymbolicValue {
+    match &value.kind {
+        JimpleValueKind::IntegerConstant { value: integer } => SymbolicValue::Integer {
+            value: *integer,
+            type_name: value.type_name.clone(),
+        },
+        JimpleValueKind::FloatConstant { value: float } => SymbolicValue::Float {
+            value: *float,
+            type_name: value.type_name.clone(),
+        },
+        JimpleValueKind::StringConstant { value } => SymbolicValue::String {
+            value: value.clone(),
+        },
+        JimpleValueKind::NullConstant => SymbolicValue::Null,
+        JimpleValueKind::Parameter { index } => SymbolicValue::Parameter {
+            index: *index,
+            type_name: value.type_name.clone(),
+        },
+        JimpleValueKind::This => SymbolicValue::This {
+            type_name: value.type_name.clone(),
+        },
+        JimpleValueKind::StaticField { field } => SymbolicValue::StaticField {
+            field: field.clone(),
+        },
+        JimpleValueKind::New { class_type } => SymbolicValue::New {
+            class_type: class_type.clone(),
+        },
+        _ => SymbolicValue::Unknown {
+            type_name: value.type_name.clone(),
+            text: value.text.clone(),
+        },
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AbstractValue {
+    Integer {
+        value: i64,
+    },
+    Float {
+        value: f64,
+    },
+    String {
+        value: String,
+    },
+    Null,
+    Parameter {
+        index: usize,
+        type_name: String,
+    },
+    This {
+        type_name: String,
+    },
+    StaticField {
+        field: JimpleFieldSignature,
+    },
+    InstanceField {
+        base: Box<AbstractValue>,
+        field: JimpleFieldSignature,
+    },
+    ArrayElement {
+        base: Box<AbstractValue>,
+        index: Box<AbstractValue>,
+    },
+    Binary {
+        operator: String,
+        left: Box<AbstractValue>,
+        right: Box<AbstractValue>,
+    },
+    Cast {
+        type_name: String,
+        value: Box<AbstractValue>,
+    },
+    Unary {
+        operator: String,
+        value: Box<AbstractValue>,
+    },
+    ArrayLength {
+        value: Box<AbstractValue>,
+    },
+    ObjectRef {
+        id: u64,
+        class_type: String,
+    },
+    ArrayRef {
+        id: u64,
+        element_type: String,
+    },
+    Invoke {
+        method: JimpleMethodSignature,
+        base: Option<Box<AbstractValue>>,
+        arguments: Vec<AbstractValue>,
+    },
+    Unknown {
+        type_name: String,
+        text: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AbstractArrayIdentity {
+    Allocated { id: u64 },
+    StaticField { field: JimpleFieldSignature },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct AbstractArrayEntry {
+    pub index: i64,
+    pub value: AbstractValue,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct AbstractArraySnapshot {
+    pub identity: AbstractArrayIdentity,
+    pub length: Option<usize>,
+    pub entries: Vec<AbstractArrayEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct AbstractInvocation {
+    pub method: JimpleMethodSignature,
+    pub arguments: Vec<AbstractValue>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct AbstractFieldValue {
+    pub field: JimpleFieldSignature,
+    pub value: AbstractValue,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct AbstractObjectSnapshot {
+    pub id: u64,
+    pub class_type: String,
+    pub constructor: Option<AbstractInvocation>,
+    pub fields: Vec<AbstractFieldValue>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct FiniteExecution {
+    pub steps: usize,
+    pub arrays: Vec<AbstractArraySnapshot>,
+    pub objects: Vec<AbstractObjectSnapshot>,
+}
+
+impl FiniteExecution {
+    #[must_use]
+    pub fn static_array(&self, owner: &str, name: &str) -> Option<&AbstractArraySnapshot> {
+        self.arrays.iter().find(|array| {
+            matches!(
+                &array.identity,
+                AbstractArrayIdentity::StaticField { field }
+                    if field.owner == owner && field.name == name
+            )
+        })
+    }
+
+    #[must_use]
+    pub fn object(&self, id: u64) -> Option<&AbstractObjectSnapshot> {
+        self.objects.iter().find(|object| object.id == id)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct MutableArray {
+    length: Option<usize>,
+    entries: BTreeMap<i64, AbstractValue>,
+}
+
+#[derive(Clone, Debug)]
+struct MutableObject {
+    class_type: String,
+    constructor: Option<AbstractInvocation>,
+    fields: BTreeMap<JimpleFieldSignature, AbstractValue>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ExecutionState {
+    locals: BTreeMap<String, AbstractValue>,
+    static_fields: BTreeMap<JimpleFieldSignature, AbstractValue>,
+    arrays: BTreeMap<AbstractArrayIdentity, MutableArray>,
+    objects: BTreeMap<u64, MutableObject>,
+    next_id: u64,
+}
+
+impl JimpleMethod {
+    /// Execute a method when all encountered branches can be decided finitely.
+    ///
+    /// Unknown values are preserved symbolically; execution only fails if one
+    /// of them controls a branch or the step limit is exceeded.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown branch, malformed control flow, an
+    /// unsupported statement kind reached during execution, or step exhaustion.
+    pub fn execute_finite(&self, max_steps: usize) -> Result<FiniteExecution> {
+        let first = self
+            .statements
+            .first()
+            .context("cannot execute an empty Jimple method")?;
+        let mut state = ExecutionState::default();
+        let mut pc = Some(first.id);
+        let mut steps = 0usize;
+        while let Some(statement_id) = pc {
+            if steps >= max_steps {
+                bail!("finite Jimple execution exceeded {max_steps} steps");
+            }
+            let statement = self
+                .statements
+                .iter()
+                .find(|statement| statement.id == statement_id)
+                .with_context(|| format!("Jimple statement {statement_id} does not exist"))?;
+            pc = state.execute_statement(statement)?;
+            steps += 1;
+        }
+        Ok(state.finish(steps))
+    }
+}
+
+impl ExecutionState {
+    fn execute_statement(&mut self, statement: &JimpleStatement) -> Result<Option<usize>> {
+        match &statement.operation {
+            JimpleOperation::Assign { left, right } | JimpleOperation::Identity { left, right } => {
+                let value = self.evaluate(right);
+                self.assign(left, value)?;
+                Self::fallthrough(statement)
+            }
+            JimpleOperation::Invoke { expression } => {
+                if let Some(expression) = expression {
+                    self.evaluate(expression);
+                }
+                Self::fallthrough(statement)
+            }
+            JimpleOperation::If { condition } => self.branch(statement, condition),
+            JimpleOperation::Goto => Self::jump(statement),
+            JimpleOperation::Return { value } => {
+                self.evaluate(value);
+                Ok(None)
+            }
+            JimpleOperation::ReturnVoid => Ok(None),
+            JimpleOperation::Opaque => {
+                bail!(
+                    "cannot finitely execute opaque Jimple statement {}",
+                    statement.id
+                )
+            }
+        }
+    }
+
+    fn fallthrough(statement: &JimpleStatement) -> Result<Option<usize>> {
+        match statement.successors.as_slice() {
+            [] => Ok(None),
+            [next] => Ok(Some(*next)),
+            successors => bail!(
+                "statement {} has {} fallthrough successors",
+                statement.id,
+                successors.len()
+            ),
+        }
+    }
+
+    fn jump(statement: &JimpleStatement) -> Result<Option<usize>> {
+        let [target] = statement.successors.as_slice() else {
+            bail!("goto statement {} does not have one target", statement.id);
+        };
+        Ok(Some(*target))
+    }
+
+    fn branch(
+        &mut self,
+        statement: &JimpleStatement,
+        condition: &JimpleValue,
+    ) -> Result<Option<usize>> {
+        let condition = self.evaluate(condition);
+        let truth = abstract_truth(&condition).with_context(|| {
+            format!(
+                "branch at statement {} is not concrete: {condition:?}",
+                statement.id
+            )
+        })?;
+        let [when_false, when_true] = statement.successors.as_slice() else {
+            bail!("if statement {} does not have two targets", statement.id);
+        };
+        Ok(Some(if truth { *when_true } else { *when_false }))
+    }
+
+    fn assign(&mut self, target: &JimpleValue, value: AbstractValue) -> Result<()> {
+        match &target.kind {
+            JimpleValueKind::Local { name } => {
+                self.locals.insert(name.clone(), value);
+            }
+            JimpleValueKind::StaticField { field } => {
+                self.static_fields.insert(field.clone(), value);
+            }
+            JimpleValueKind::InstanceField { base, field } => {
+                let base = self.evaluate(base);
+                if let AbstractValue::ObjectRef { id, .. } = base
+                    && let Some(object) = self.objects.get_mut(&id)
+                {
+                    object.fields.insert(field.clone(), value);
+                }
+            }
+            JimpleValueKind::ArrayRef { base, index } => {
+                let base = self.evaluate(base);
+                let index = self.evaluate(index);
+                let AbstractValue::Integer { value: index } = index else {
+                    bail!("array write index is not concrete: {index:?}");
+                };
+                let identity = abstract_array_identity(&base)
+                    .with_context(|| format!("array write base is not addressable: {base:?}"))?;
+                self.arrays
+                    .entry(identity)
+                    .or_default()
+                    .entries
+                    .insert(index, value);
+            }
+            _ => bail!("unsupported Jimple assignment target: {}", target.text),
+        }
+        Ok(())
+    }
+
+    fn evaluate(&mut self, value: &JimpleValue) -> AbstractValue {
+        match &value.kind {
+            JimpleValueKind::Local { name } => {
+                self.locals
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_else(|| AbstractValue::Unknown {
+                        type_name: value.type_name.clone(),
+                        text: value.text.clone(),
+                    })
+            }
+            JimpleValueKind::IntegerConstant { value } => AbstractValue::Integer { value: *value },
+            JimpleValueKind::FloatConstant { value } => AbstractValue::Float { value: *value },
+            JimpleValueKind::StringConstant { value } => AbstractValue::String {
+                value: value.clone(),
+            },
+            JimpleValueKind::NullConstant => AbstractValue::Null,
+            JimpleValueKind::Parameter { index } => AbstractValue::Parameter {
+                index: *index,
+                type_name: value.type_name.clone(),
+            },
+            JimpleValueKind::This => AbstractValue::This {
+                type_name: value.type_name.clone(),
+            },
+            JimpleValueKind::StaticField { field } => {
+                self.static_fields.get(field).cloned().unwrap_or_else(|| {
+                    AbstractValue::StaticField {
+                        field: field.clone(),
+                    }
+                })
+            }
+            JimpleValueKind::InstanceField { base, field } => {
+                self.evaluate_instance_field(base, field)
+            }
+            JimpleValueKind::ArrayRef { base, index } => self.evaluate_array_ref(base, index),
+            JimpleValueKind::Binary {
+                operator,
+                left,
+                right,
+            } => self.evaluate_binary(operator, left, right),
+            JimpleValueKind::Cast { cast_type, value } => {
+                let value = self.evaluate(value);
+                abstract_cast(cast_type, value)
+            }
+            JimpleValueKind::Unary {
+                operator,
+                value: operand,
+            } => {
+                let operand = self.evaluate(operand);
+                abstract_unary(operator, operand, &value.type_name)
+            }
+            JimpleValueKind::ArrayLength { value } => self.evaluate_array_length(value),
+            JimpleValueKind::New { class_type } => self.allocate_object(class_type),
+            JimpleValueKind::NewArray { element_type, size } => {
+                self.allocate_array(element_type, size)
+            }
+            JimpleValueKind::NewMultiArray { .. } | JimpleValueKind::Phi { .. } => {
+                AbstractValue::Unknown {
+                    type_name: value.type_name.clone(),
+                    text: value.text.clone(),
+                }
+            }
+            JimpleValueKind::Invoke {
+                invoke_kind,
+                method,
+                base,
+                arguments,
+                ..
+            } => self.evaluate_invoke(invoke_kind, method, base.as_deref(), arguments),
+            JimpleValueKind::Opaque => AbstractValue::Unknown {
+                type_name: value.type_name.clone(),
+                text: value.text.clone(),
+            },
+        }
+    }
+
+    fn evaluate_instance_field(
+        &mut self,
+        base: &JimpleValue,
+        field: &JimpleFieldSignature,
+    ) -> AbstractValue {
+        let base = self.evaluate(base);
+        if let AbstractValue::ObjectRef { id, .. } = &base
+            && let Some(value) = self
+                .objects
+                .get(id)
+                .and_then(|object| object.fields.get(field))
+        {
+            return value.clone();
+        }
+        AbstractValue::InstanceField {
+            base: Box::new(base),
+            field: field.clone(),
+        }
+    }
+
+    fn evaluate_array_ref(&mut self, base: &JimpleValue, index: &JimpleValue) -> AbstractValue {
+        let base = self.evaluate(base);
+        let index = self.evaluate(index);
+        if let AbstractValue::Integer { value: integer } = index
+            && let Some(identity) = abstract_array_identity(&base)
+            && let Some(value) = self
+                .arrays
+                .get(&identity)
+                .and_then(|array| array.entries.get(&integer))
+        {
+            return value.clone();
+        }
+        AbstractValue::ArrayElement {
+            base: Box::new(base),
+            index: Box::new(index),
+        }
+    }
+
+    fn evaluate_binary(
+        &mut self,
+        operator: &str,
+        left: &JimpleValue,
+        right: &JimpleValue,
+    ) -> AbstractValue {
+        let result_type = left.type_name.as_str();
+        let left = self.evaluate(left);
+        let right = self.evaluate(right);
+        abstract_binary(operator.trim(), left, right, result_type)
+    }
+
+    fn evaluate_array_length(&mut self, value: &JimpleValue) -> AbstractValue {
+        let value = self.evaluate(value);
+        if let Some(identity) = abstract_array_identity(&value)
+            && let Some(length) = self.arrays.get(&identity).and_then(|array| array.length)
+            && let Ok(length) = i64::try_from(length)
+        {
+            return AbstractValue::Integer { value: length };
+        }
+        AbstractValue::ArrayLength {
+            value: Box::new(value),
+        }
+    }
+
+    fn allocate_object(&mut self, class_type: &str) -> AbstractValue {
+        let id = self.next_id;
+        self.next_id = self.next_id.saturating_add(1);
+        self.objects.insert(
+            id,
+            MutableObject {
+                class_type: class_type.to_owned(),
+                constructor: None,
+                fields: BTreeMap::new(),
+            },
+        );
+        AbstractValue::ObjectRef {
+            id,
+            class_type: class_type.to_owned(),
+        }
+    }
+
+    fn allocate_array(&mut self, element_type: &str, size: &JimpleValue) -> AbstractValue {
+        let size = self.evaluate(size);
+        let length = match size {
+            AbstractValue::Integer { value } => usize::try_from(value).ok(),
+            _ => None,
+        };
+        let id = self.next_id;
+        self.next_id = self.next_id.saturating_add(1);
+        self.arrays.insert(
+            AbstractArrayIdentity::Allocated { id },
+            MutableArray {
+                length,
+                entries: BTreeMap::new(),
+            },
+        );
+        AbstractValue::ArrayRef {
+            id,
+            element_type: element_type.to_owned(),
+        }
+    }
+
+    fn evaluate_invoke(
+        &mut self,
+        invoke_kind: &str,
+        method: &JimpleMethodSignature,
+        base: Option<&JimpleValue>,
+        arguments: &[JimpleValue],
+    ) -> AbstractValue {
+        let base = base.map(|base| self.evaluate(base));
+        let arguments: Vec<_> = arguments
+            .iter()
+            .map(|argument| self.evaluate(argument))
+            .collect();
+        if method.name == "<init>" && invoke_kind == "JSpecialInvokeExpr" {
+            if let Some(AbstractValue::ObjectRef { id, .. }) = &base
+                && let Some(object) = self.objects.get_mut(id)
+            {
+                object.constructor = Some(AbstractInvocation {
+                    method: method.clone(),
+                    arguments,
+                });
+            }
+            return base.unwrap_or(AbstractValue::Null);
+        }
+        AbstractValue::Invoke {
+            method: method.clone(),
+            base: base.map(Box::new),
+            arguments,
+        }
+    }
+
+    fn finish(self, steps: usize) -> FiniteExecution {
+        let arrays = self
+            .arrays
+            .into_iter()
+            .map(|(identity, array)| AbstractArraySnapshot {
+                identity,
+                length: array.length,
+                entries: array
+                    .entries
+                    .into_iter()
+                    .map(|(index, value)| AbstractArrayEntry { index, value })
+                    .collect(),
+            })
+            .collect();
+        let objects = self
+            .objects
+            .into_iter()
+            .map(|(id, object)| AbstractObjectSnapshot {
+                id,
+                class_type: object.class_type,
+                constructor: object.constructor,
+                fields: object
+                    .fields
+                    .into_iter()
+                    .map(|(field, value)| AbstractFieldValue { field, value })
+                    .collect(),
+            })
+            .collect();
+        FiniteExecution {
+            steps,
+            arrays,
+            objects,
+        }
+    }
+}
+
+fn abstract_array_identity(value: &AbstractValue) -> Option<AbstractArrayIdentity> {
+    match value {
+        AbstractValue::ArrayRef { id, .. } => Some(AbstractArrayIdentity::Allocated { id: *id }),
+        AbstractValue::StaticField { field } => Some(AbstractArrayIdentity::StaticField {
+            field: field.clone(),
+        }),
+        _ => None,
+    }
+}
+
+fn abstract_truth(value: &AbstractValue) -> Option<bool> {
+    match value {
+        AbstractValue::Integer { value } => Some(*value != 0),
+        _ => None,
+    }
+}
+
+fn abstract_cast(type_name: &str, value: AbstractValue) -> AbstractValue {
+    match value {
+        AbstractValue::Integer { value } => AbstractValue::Integer {
+            value: java_integer_cast(type_name, value),
+        },
+        AbstractValue::Float { value } => AbstractValue::Float { value },
+        other => AbstractValue::Cast {
+            type_name: type_name.to_owned(),
+            value: Box::new(other),
+        },
+    }
+}
+
+fn java_integer_cast(type_name: &str, value: i64) -> i64 {
+    match type_name {
+        "byte" => i64::from(low_i8(value)),
+        "short" => i64::from(low_i16(value)),
+        "char" => i64::from(low_u16(value)),
+        "int" => i64::from(low_i32(value)),
+        _ => value,
+    }
+}
+
+fn low_i8(value: i64) -> i8 {
+    i8::from_le_bytes([value.to_le_bytes()[0]])
+}
+
+fn low_i16(value: i64) -> i16 {
+    let bytes = value.to_le_bytes();
+    i16::from_le_bytes([bytes[0], bytes[1]])
+}
+
+fn low_u16(value: i64) -> u16 {
+    let bytes = value.to_le_bytes();
+    u16::from_le_bytes([bytes[0], bytes[1]])
+}
+
+fn low_i32(value: i64) -> i32 {
+    let bytes = value.to_le_bytes();
+    i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+}
+
+fn abstract_unary(operator: &str, value: AbstractValue, type_name: &str) -> AbstractValue {
+    if operator == "-"
+        && let AbstractValue::Integer { value: integer } = value
+    {
+        return AbstractValue::Integer {
+            value: match type_name {
+                "int" => i64::from(low_i32(integer).wrapping_neg()),
+                "long" => integer.wrapping_neg(),
+                _ => integer.checked_neg().unwrap_or(integer),
+            },
+        };
+    }
+    AbstractValue::Unary {
+        operator: operator.to_owned(),
+        value: Box::new(value),
+    }
+}
+
+fn abstract_binary(
+    operator: &str,
+    left: AbstractValue,
+    right: AbstractValue,
+    type_name: &str,
+) -> AbstractValue {
+    if let (AbstractValue::Integer { value: left_int }, AbstractValue::Integer { value: right_int }) =
+        (&left, &right)
+        && let Some(value) = integer_binary(operator, *left_int, *right_int, type_name)
+    {
+        return AbstractValue::Integer { value };
+    }
+    AbstractValue::Binary {
+        operator: operator.to_owned(),
+        left: Box::new(left),
+        right: Box::new(right),
+    }
+}
+
+fn integer_binary(operator: &str, left: i64, right: i64, type_name: &str) -> Option<i64> {
+    match operator {
+        "+" => java_wrapping_binary(left, right, type_name, i32::wrapping_add, i64::wrapping_add),
+        "-" => java_wrapping_binary(left, right, type_name, i32::wrapping_sub, i64::wrapping_sub),
+        "*" => java_wrapping_binary(left, right, type_name, i32::wrapping_mul, i64::wrapping_mul),
+        "/" => java_divide(left, right, type_name),
+        "%" => java_remainder(left, right, type_name),
+        "==" => Some(i64::from(left == right)),
+        "!=" => Some(i64::from(left != right)),
+        "<" => Some(i64::from(left < right)),
+        "<=" => Some(i64::from(left <= right)),
+        ">" => Some(i64::from(left > right)),
+        ">=" => Some(i64::from(left >= right)),
+        "cmp" => Some(match left.cmp(&right) {
+            std::cmp::Ordering::Less => -1,
+            std::cmp::Ordering::Equal => 0,
+            std::cmp::Ordering::Greater => 1,
+        }),
+        _ => None,
+    }
+}
+
+fn java_wrapping_binary(
+    left: i64,
+    right: i64,
+    type_name: &str,
+    int_operation: fn(i32, i32) -> i32,
+    long_operation: fn(i64, i64) -> i64,
+) -> Option<i64> {
+    match type_name {
+        "int" => Some(i64::from(int_operation(low_i32(left), low_i32(right)))),
+        "long" => Some(long_operation(left, right)),
+        _ => None,
+    }
+}
+
+fn java_divide(left: i64, right: i64, type_name: &str) -> Option<i64> {
+    if right == 0 {
+        return None;
+    }
+    match type_name {
+        "int" => {
+            let left = low_i32(left);
+            let right = low_i32(right);
+            Some(i64::from(left.checked_div(right).unwrap_or(i32::MIN)))
+        }
+        "long" => Some(left.checked_div(right).unwrap_or(i64::MIN)),
+        _ => None,
+    }
+}
+
+fn java_remainder(left: i64, right: i64, type_name: &str) -> Option<i64> {
+    if right == 0 {
+        return None;
+    }
+    match type_name {
+        "int" => {
+            let left = low_i32(left);
+            let right = low_i32(right);
+            Some(i64::from(left.checked_rem(right).unwrap_or(0)))
+        }
+        "long" => Some(left.checked_rem(right).unwrap_or(0)),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{JimpleValueKind, SymbolicValue, parse_methods};
+
+    const SAMPLE: &str = r#"[
+      {
+        "signature":{"owner":"demo.M","name":"f","return_type":"void","parameter_types":["demo.R"]},
+        "display_signature":"<demo.M: void f(demo.R)>",
+        "statements":[
+          {"id":0,"kind":"JIdentityStmt","text":"r := @parameter0: demo.R","def":"r","uses":[],"successors":[1],"operation":{"kind":"identity","left":{"jimple_kind":"JavaLocal","type":"demo.R","text":"r","kind":"local","name":"r"},"right":{"jimple_kind":"JParameterRef","type":"demo.R","text":"@parameter0: demo.R","kind":"parameter","index":0}}},
+          {"id":1,"kind":"JAssignStmt","text":"a = r.<demo.R: long x>","def":"a","uses":[],"successors":[2],"operation":{"kind":"assign","left":{"jimple_kind":"JavaLocal","type":"long","text":"a","kind":"local","name":"a"},"right":{"jimple_kind":"JInstanceFieldRef","type":"long","text":"r.<demo.R: long x>","kind":"instance_field","base":{"jimple_kind":"JavaLocal","type":"demo.R","text":"r","kind":"local","name":"r"},"field":{"owner":"demo.R","name":"x","type":"long"}}}},
+          {"id":2,"kind":"JAssignStmt","text":"b = a * 10L","def":"b","uses":[],"successors":[],"operation":{"kind":"assign","left":{"jimple_kind":"JavaLocal","type":"long","text":"b","kind":"local","name":"b"},"right":{"jimple_kind":"JMulExpr","type":"long","text":"a * 10L","kind":"binary","operator":" * ","left":{"jimple_kind":"JavaLocal","type":"long","text":"a","kind":"local","name":"a"},"right":{"jimple_kind":"LongConstant","type":"long","text":"10L","kind":"integer_constant","value":10}}}}
+        ]
+      }
+    ]"#;
+
+    #[test]
+    fn slices_structured_defs_without_parsing_text() -> anyhow::Result<()> {
+        let methods = parse_methods(SAMPLE)?;
+        let method = methods
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("method missing"))?;
+        assert_eq!(method.backward_slice(2), vec![0, 1, 2]);
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_symbolic_expression_through_locals() -> anyhow::Result<()> {
+        let methods = parse_methods(SAMPLE)?;
+        let method = methods
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("method missing"))?;
+        let assignment = method.symbolic_assignment(2)?;
+        let SymbolicValue::Binary { left, right, .. } = assignment.value else {
+            return Err(anyhow::anyhow!("expected binary symbolic value"));
+        };
+        let SymbolicValue::InstanceField { base, field } = *left else {
+            return Err(anyhow::anyhow!("expected field provenance"));
+        };
+        assert_eq!(field.name, "x");
+        assert!(matches!(*base, SymbolicValue::Parameter { index: 0, .. }));
+        assert!(matches!(*right, SymbolicValue::Integer { value: 10, .. }));
+        Ok(())
+    }
+
+    fn local(name: &str, type_name: &str) -> super::JimpleValue {
+        super::JimpleValue {
+            jimple_kind: String::from("JavaLocal"),
+            type_name: type_name.to_owned(),
+            text: name.to_owned(),
+            kind: super::JimpleValueKind::Local {
+                name: name.to_owned(),
+            },
+        }
+    }
+
+    fn integer(value: i64) -> super::JimpleValue {
+        super::JimpleValue {
+            jimple_kind: String::from("IntConstant"),
+            type_name: String::from("int"),
+            text: value.to_string(),
+            kind: super::JimpleValueKind::IntegerConstant { value },
+        }
+    }
+
+    fn binary(
+        operator: &str,
+        left: super::JimpleValue,
+        right: super::JimpleValue,
+    ) -> super::JimpleValue {
+        super::JimpleValue {
+            jimple_kind: String::from("test_binary"),
+            type_name: String::from("int"),
+            text: String::from("test binary"),
+            kind: super::JimpleValueKind::Binary {
+                operator: operator.to_owned(),
+                left: Box::new(left),
+                right: Box::new(right),
+            },
+        }
+    }
+
+    fn statement(
+        id: usize,
+        successors: Vec<usize>,
+        operation: super::JimpleOperation,
+    ) -> super::JimpleStatement {
+        super::JimpleStatement {
+            id,
+            kind: String::from("test"),
+            text: format!("statement {id}"),
+            def: None,
+            uses: Vec::new(),
+            successors,
+            operation,
+        }
+    }
+
+    #[test]
+    fn finitely_executes_bounded_array_loop() -> anyhow::Result<()> {
+        let array = local("array", "int[]");
+        let index = local("i", "int");
+        let array_element = super::JimpleValue {
+            jimple_kind: String::from("JArrayRef"),
+            type_name: String::from("int"),
+            text: String::from("array[i]"),
+            kind: super::JimpleValueKind::ArrayRef {
+                base: Box::new(array.clone()),
+                index: Box::new(index.clone()),
+            },
+        };
+        let method = super::JimpleMethod {
+            signature: super::JimpleMethodSignature {
+                owner: String::from("demo.Loop"),
+                name: String::from("run"),
+                return_type: String::from("void"),
+                parameter_types: Vec::new(),
+            },
+            display_signature: String::from("<demo.Loop: void run()>"),
+            statements: vec![
+                statement(
+                    0,
+                    vec![1],
+                    super::JimpleOperation::Assign {
+                        left: array.clone(),
+                        right: super::JimpleValue {
+                            jimple_kind: String::from("JNewArrayExpr"),
+                            type_name: String::from("int[]"),
+                            text: String::from("newarray (int)[3]"),
+                            kind: super::JimpleValueKind::NewArray {
+                                element_type: String::from("int"),
+                                size: Box::new(integer(3)),
+                            },
+                        },
+                    },
+                ),
+                statement(
+                    1,
+                    vec![2],
+                    super::JimpleOperation::Assign {
+                        left: index.clone(),
+                        right: integer(0),
+                    },
+                ),
+                statement(
+                    2,
+                    vec![3, 6],
+                    super::JimpleOperation::If {
+                        condition: binary(">=", index.clone(), integer(3)),
+                    },
+                ),
+                statement(
+                    3,
+                    vec![4],
+                    super::JimpleOperation::Assign {
+                        left: array_element,
+                        right: index.clone(),
+                    },
+                ),
+                statement(
+                    4,
+                    vec![5],
+                    super::JimpleOperation::Assign {
+                        left: index.clone(),
+                        right: binary("+", index, integer(1)),
+                    },
+                ),
+                statement(5, vec![2], super::JimpleOperation::Goto),
+                statement(6, Vec::new(), super::JimpleOperation::ReturnVoid),
+            ],
+        };
+        let execution = method.execute_finite(100)?;
+        assert_eq!(execution.steps, 16);
+        let array = execution
+            .arrays
+            .iter()
+            .find(|array| {
+                matches!(
+                    array.identity,
+                    super::AbstractArrayIdentity::Allocated { .. }
+                )
+            })
+            .ok_or_else(|| anyhow::anyhow!("allocated array missing"))?;
+        assert_eq!(array.length, Some(3));
+        assert_eq!(array.entries.len(), 3);
+        for (expected, entry) in (0_i64..3).zip(&array.entries) {
+            assert_eq!(entry.index, expected);
+            assert_eq!(
+                entry.value,
+                super::AbstractValue::Integer { value: expected }
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn parses_integer_constant_shape() -> anyhow::Result<()> {
+        let methods = parse_methods(SAMPLE)?;
+        let method = methods
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("method missing"))?;
+        let statement = method
+            .statements
+            .iter()
+            .find(|statement| statement.id == 2)
+            .ok_or_else(|| anyhow::anyhow!("statement missing"))?;
+        let super::JimpleOperation::Assign { right, .. } = &statement.operation else {
+            return Err(anyhow::anyhow!("assignment missing"));
+        };
+        let JimpleValueKind::Binary { right, .. } = &right.kind else {
+            return Err(anyhow::anyhow!("binary missing"));
+        };
+        assert!(matches!(
+            right.kind,
+            JimpleValueKind::IntegerConstant { value: 10 }
+        ));
+        Ok(())
+    }
+}

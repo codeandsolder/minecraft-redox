@@ -10,6 +10,7 @@ repository.workspace = true
 anyhow.workspace = true
 minecraft-redox-core = { path = "../minecraft-redox-core" }
 serde.workspace = true
+serde_json.workspace = true
 tree-sitter.workspace = true
 tree-sitter-java.workspace = true
 

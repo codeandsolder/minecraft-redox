@@ -6,7 +6,9 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use minecraft_redox_gtnh::{GtnhSummary, lower_recipe_with_project, recover_with_project};
-use minecraft_redox_java::{JavaProjectIndex, analyze_source, inventory_source};
+use minecraft_redox_java::{
+    JavaProjectIndex, analyze_source, inventory_source, jimple::parse_methods,
+};
 use rayon::prelude::*;
 use serde::Serialize;
 
@@ -44,10 +46,93 @@ fn main() -> Result<()> {
         [_, command, flag, path] if command == "gtnh" && flag == "--blockers" => {
             print_gtnh_blockers(path)
         }
+        [_, command, path, method, sink] if command == "jimple-slice" => {
+            print_jimple_slice(path, method, sink)
+        }
+        [_, command, path, method, owner, field] if command == "jimple-execute-array" => {
+            print_jimple_execute_array(path, method, owner, field)
+        }
         _ => bail!(
-            "usage: minecraft-redox [inventory|chains] <java-file> | gtnh [--summary|--blockers] <file-or-dir>"
+            "usage: minecraft-redox [inventory|chains] <java-file> | gtnh [--summary|--blockers] <file-or-dir> | jimple-slice <json> <method-substring> <sink-substring> | jimple-execute-array <json> <method-substring> <field-owner> <field-name>"
         ),
     }
+}
+
+fn print_jimple_execute_array(
+    path: &str,
+    method_filter: &str,
+    field_owner: &str,
+    field_name: &str,
+) -> Result<()> {
+    let json = fs::read_to_string(path).with_context(|| format!("failed to read {path}"))?;
+    let methods = parse_methods(&json)?;
+    let matching: Vec<_> = methods
+        .iter()
+        .filter(|method| {
+            method.signature.name.contains(method_filter)
+                || method.display_signature.contains(method_filter)
+        })
+        .collect();
+    let [method] = matching.as_slice() else {
+        bail!(
+            "expected one Jimple method matching {method_filter:?}, found {}",
+            matching.len()
+        );
+    };
+    let execution = method.execute_finite(10_000)?;
+    let array = execution
+        .static_array(field_owner, field_name)
+        .with_context(|| {
+            format!("no writes observed for static array {field_owner}.{field_name}")
+        })?;
+    let report = serde_json::json!({
+        "method": method.signature,
+        "steps": execution.steps,
+        "array": array,
+        "objects": execution.objects,
+    });
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+fn print_jimple_slice(path: &str, method_filter: &str, sink_filter: &str) -> Result<()> {
+    let json = fs::read_to_string(path).with_context(|| format!("failed to read {path}"))?;
+    let methods = parse_methods(&json)?;
+    let matching: Vec<_> = methods
+        .iter()
+        .filter(|method| {
+            method.signature.name.contains(method_filter)
+                || method.display_signature.contains(method_filter)
+        })
+        .collect();
+    let [method] = matching.as_slice() else {
+        bail!(
+            "expected one Jimple method matching {method_filter:?}, found {}",
+            matching.len()
+        );
+    };
+    let sink = method
+        .statement_containing(sink_filter)
+        .with_context(|| format!("no statement contains {sink_filter:?}"))?;
+    let slice_ids = method.backward_slice(sink.id);
+    let slice: Vec<_> = slice_ids
+        .iter()
+        .filter_map(|id| {
+            method
+                .statements
+                .iter()
+                .find(|statement| statement.id == *id)
+        })
+        .collect();
+    let symbolic = method.symbolic_assignment(sink.id).ok();
+    let report = serde_json::json!({
+        "method": method.signature,
+        "sink_id": sink.id,
+        "slice": slice,
+        "symbolic_assignment": symbolic,
+    });
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
 }
 
 fn print_inventory(path: &str) -> Result<()> {

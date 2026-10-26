@@ -27,7 +27,9 @@ Each concrete method is emitted as JSON with its signature and statements. Every
 - textual form for diagnostics,
 - optional definition,
 - typed uses,
-- CFG successor statement IDs.
+- CFG successor statement IDs,
+- structured statement operations, and
+- recursively structured values for locals, constants, fields, arrays, arithmetic, casts, allocations and calls.
 
 `DumpJimple` is retained as a human-readable debugging companion.
 
@@ -41,4 +43,11 @@ The prototype has been exercised against compiled `GT5-Unofficial` bytecode and 
 - the bounded loop that constructs every `Loaders.NeutronAccelerators[i]`, and
 - the Transcendent Plasma Mixer dataflow from opaque recipe metadata plus recipe fields to stored energy, followed by the wireless balance mutation and explicit zeroing of calculated EU/t.
 
-The next step is intentionally not more Java: consume this JSON from Rust and implement finite abstract execution over values, heap objects, arrays/maps, branches, loops, and calls.
+The Rust side now consumes this structure directly. It has two generic analysis modes:
+
+- backward provenance slicing plus symbolic expression reconstruction, and
+- bounded finite execution over concrete integer control flow, allocations, object constructors, arrays, field writes and opaque symbolic calls.
+
+As a real-corpus acceptance test, the finite executor runs `Loaders.GTMetaTileRegister()` without GoodGenerator-specific rules and materializes exactly 13 writes to `Loaders.NeutronAccelerators[0..12]`. Each entry retains its distinct `MTENeutronAccelerator` allocation, constructor tier argument `0..12`, and `getStackForm(1)` result.
+
+The next frontier is interprocedural execution and generic models for common JDK collection behavior so registry maps such as `LanthItemList.maskMap` can be materialized in the same way.

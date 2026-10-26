@@ -1,5 +1,7 @@
 //! Java source inventory and expression frontend for Minecraft Redox.
 
+pub mod jimple;
+
 use std::{collections::BTreeMap, str::Utf8Error};
 
 use anyhow::{Context, Result};
