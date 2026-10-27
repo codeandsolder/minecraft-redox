@@ -399,6 +399,29 @@ pub struct JimpleTemporalSummary {
     pub comparisons: Vec<JimpleFieldComparison>,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct JimpleLocalCounterUpdate {
+    pub statement_id: usize,
+    pub delta: i64,
+    pub guards: Vec<JimpleGuard>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct JimpleLocalCounterComparison {
+    pub statement_id: usize,
+    pub operator: String,
+    pub constant: i64,
+    pub local_on_left: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct JimpleLocalCounterCandidate {
+    pub local: String,
+    pub initial_values: Vec<i64>,
+    pub updates: Vec<JimpleLocalCounterUpdate>,
+    pub comparisons: Vec<JimpleLocalCounterComparison>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct JimpleFixedTripLoop {
     pub header_statement_id: usize,
@@ -445,6 +468,68 @@ impl JimpleMethod {
             self.add_value_dependencies(before_id, value, &mut included, &mut pending);
         }
         included.into_iter().collect()
+    }
+
+    /// Recover local integer accumulators with constant initialization, constant-delta updates,
+    /// and constant threshold observations.
+    ///
+    /// This intentionally reports compiler locals rather than assigning domain meaning. Loop
+    /// induction variables and semantic counters can share this shape; update guards and use-site
+    /// context let later lowering distinguish them.
+    #[must_use]
+    pub fn local_counter_candidates(&self) -> Vec<JimpleLocalCounterCandidate> {
+        let mut initial_values: BTreeMap<String, Vec<i64>> = BTreeMap::new();
+        let mut updates: BTreeMap<String, Vec<JimpleLocalCounterUpdate>> = BTreeMap::new();
+        let mut comparisons: BTreeMap<String, Vec<JimpleLocalCounterComparison>> = BTreeMap::new();
+        for statement in &self.statements {
+            if let JimpleOperation::Assign { left, right } = &statement.operation
+                && let JimpleValueKind::Local { name } = &left.kind
+            {
+                if let JimpleValueKind::IntegerConstant { value } = right.kind {
+                    initial_values.entry(name.clone()).or_default().push(value);
+                }
+                if let Some(delta) = raw_local_delta(name, right) {
+                    updates
+                        .entry(name.clone())
+                        .or_default()
+                        .push(JimpleLocalCounterUpdate {
+                            statement_id: statement.id,
+                            delta,
+                            guards: self.control_guards(statement.id),
+                        });
+                }
+            }
+            if let JimpleOperation::If { condition } = &statement.operation
+                && let Some((local, operator, constant, local_on_left)) =
+                    local_constant_comparison(condition)
+            {
+                comparisons
+                    .entry(local)
+                    .or_default()
+                    .push(JimpleLocalCounterComparison {
+                        statement_id: statement.id,
+                        operator,
+                        constant,
+                        local_on_left,
+                    });
+            }
+        }
+        let mut candidates = Vec::new();
+        for (local, local_updates) in updates {
+            let Some(initials) = initial_values.get(&local) else {
+                continue;
+            };
+            let Some(local_comparisons) = comparisons.get(&local) else {
+                continue;
+            };
+            candidates.push(JimpleLocalCounterCandidate {
+                local,
+                initial_values: initials.clone(),
+                updates: local_updates,
+                comparisons: local_comparisons.clone(),
+            });
+        }
+        candidates
     }
 
     /// Recover natural loops with a provable constant trip count.
@@ -1086,31 +1171,133 @@ impl JimpleMethod {
     }
 
     fn control_guards(&self, statement_id: usize) -> Vec<JimpleGuard> {
-        let mut guards = Vec::new();
+        let predecessors = self.predecessors();
+        let dominators = self.dominators(&predecessors);
+        let Some(statement_dominators) = dominators.get(&statement_id) else {
+            return Vec::new();
+        };
+        let direct = self.direct_control_dependencies();
+        let mut pending = vec![statement_id];
+        let mut visited_nodes = BTreeSet::new();
+        let mut polarities: BTreeMap<usize, Option<bool>> = BTreeMap::new();
+        while let Some(node) = pending.pop() {
+            if !visited_nodes.insert(node) {
+                continue;
+            }
+            for (branch_id, expected) in direct.get(&node).into_iter().flatten() {
+                let branch_dominates_current = dominators
+                    .get(&node)
+                    .is_some_and(|set| set.contains(branch_id));
+                if !branch_dominates_current || !statement_dominators.contains(branch_id) {
+                    continue;
+                }
+                match polarities.entry(*branch_id) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(Some(*expected));
+                    }
+                    std::collections::btree_map::Entry::Occupied(mut entry) => {
+                        if entry.get().is_some_and(|existing| existing != *expected) {
+                            entry.insert(None);
+                        }
+                    }
+                }
+                pending.push(*branch_id);
+            }
+        }
+        polarities
+            .into_iter()
+            .filter_map(|(branch_statement_id, expected)| {
+                let expected = expected?;
+                let branch = self
+                    .statements
+                    .iter()
+                    .find(|statement| statement.id == branch_statement_id)?;
+                let JimpleOperation::If { condition } = &branch.operation else {
+                    return None;
+                };
+                let mut visiting = BTreeSet::new();
+                Some(JimpleGuard {
+                    branch_statement_id,
+                    expected,
+                    condition: self.resolve_locals_only(branch.id, condition, &mut visiting),
+                })
+            })
+            .collect()
+    }
+
+    fn direct_control_dependencies(&self) -> BTreeMap<usize, Vec<(usize, bool)>> {
+        const EXIT: usize = usize::MAX;
+        let postdominators = self.postdominators();
+        let mut dependencies: BTreeMap<usize, Vec<(usize, bool)>> = BTreeMap::new();
         for branch in &self.statements {
-            let JimpleOperation::If { condition } = &branch.operation else {
+            let JimpleOperation::If { .. } = &branch.operation else {
                 continue;
             };
             let [when_false, when_true] = branch.successors.as_slice() else {
                 continue;
             };
-            let merge = self.immediate_postdominator(branch.id);
-            let false_region = self.reachable_until(*when_false, merge);
-            let true_region = self.reachable_until(*when_true, merge);
-            let in_false = false_region.contains(&statement_id);
-            let in_true = true_region.contains(&statement_id);
-            if in_false == in_true {
-                continue;
+            let branch_ipdom = immediate_postdominator(&postdominators, branch.id).unwrap_or(EXIT);
+            for (successor, expected) in [(*when_false, false), (*when_true, true)] {
+                if postdominators
+                    .get(&branch.id)
+                    .is_some_and(|set| set.contains(&successor))
+                {
+                    continue;
+                }
+                let mut runner = successor;
+                let mut visited = BTreeSet::new();
+                while runner != branch_ipdom && runner != EXIT && visited.insert(runner) {
+                    dependencies
+                        .entry(runner)
+                        .or_default()
+                        .push((branch.id, expected));
+                    runner = immediate_postdominator(&postdominators, runner).unwrap_or(EXIT);
+                }
             }
-            let mut visiting = BTreeSet::new();
-            guards.push(JimpleGuard {
-                branch_statement_id: branch.id,
-                expected: in_true,
-                condition: self.resolve_locals_only(branch.id, condition, &mut visiting),
-            });
         }
-        guards.sort_by_key(|guard| guard.branch_statement_id);
-        guards
+        dependencies
+    }
+
+    fn postdominators(&self) -> BTreeMap<usize, BTreeSet<usize>> {
+        const EXIT: usize = usize::MAX;
+        let ids: BTreeSet<_> = self
+            .statements
+            .iter()
+            .map(|statement| statement.id)
+            .collect();
+        let mut universe = ids.clone();
+        universe.insert(EXIT);
+        let mut postdominators: BTreeMap<usize, BTreeSet<usize>> = ids
+            .iter()
+            .copied()
+            .map(|id| (id, universe.clone()))
+            .collect();
+        postdominators.insert(EXIT, BTreeSet::from([EXIT]));
+        loop {
+            let mut changed = false;
+            for statement in self.statements.iter().rev() {
+                let successors: Vec<_> = if statement.successors.is_empty() {
+                    vec![EXIT]
+                } else {
+                    statement.successors.clone()
+                };
+                let mut intersection = universe.clone();
+                for successor in successors {
+                    if let Some(successor_set) = postdominators.get(&successor) {
+                        intersection.retain(|candidate| successor_set.contains(candidate));
+                    }
+                }
+                intersection.insert(statement.id);
+                if postdominators.get(&statement.id) != Some(&intersection) {
+                    postdominators.insert(statement.id, intersection);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        postdominators
     }
 
     fn reaching_local_definitions(&self, before_id: usize, name: &str) -> Vec<&JimpleStatement> {
@@ -1270,83 +1457,6 @@ impl JimpleMethod {
             }
         }
         predecessors
-    }
-
-    fn reachable_until(&self, start: usize, stop: Option<usize>) -> BTreeSet<usize> {
-        let mut reached = BTreeSet::new();
-        let mut pending = vec![start];
-        while let Some(statement_id) = pending.pop() {
-            if Some(statement_id) == stop || !reached.insert(statement_id) {
-                continue;
-            }
-            if let Some(statement) = self
-                .statements
-                .iter()
-                .find(|statement| statement.id == statement_id)
-            {
-                pending.extend(statement.successors.iter().copied());
-            }
-        }
-        reached
-    }
-
-    fn immediate_postdominator(&self, statement_id: usize) -> Option<usize> {
-        const EXIT: usize = usize::MAX;
-        let ids: BTreeSet<_> = self
-            .statements
-            .iter()
-            .map(|statement| statement.id)
-            .collect();
-        if !ids.contains(&statement_id) {
-            return None;
-        }
-        let mut universe = ids.clone();
-        universe.insert(EXIT);
-        let mut postdominators: BTreeMap<usize, BTreeSet<usize>> = ids
-            .iter()
-            .copied()
-            .map(|id| (id, universe.clone()))
-            .collect();
-        postdominators.insert(EXIT, BTreeSet::from([EXIT]));
-        loop {
-            let mut changed = false;
-            for statement in self.statements.iter().rev() {
-                let successors: Vec<_> = if statement.successors.is_empty() {
-                    vec![EXIT]
-                } else {
-                    statement.successors.clone()
-                };
-                let mut intersection = universe.clone();
-                for successor in successors {
-                    let Some(successor_set) = postdominators.get(&successor) else {
-                        continue;
-                    };
-                    intersection.retain(|candidate| successor_set.contains(candidate));
-                }
-                intersection.insert(statement.id);
-                if postdominators.get(&statement.id) != Some(&intersection) {
-                    postdominators.insert(statement.id, intersection);
-                    changed = true;
-                }
-            }
-            if !changed {
-                break;
-            }
-        }
-        let strict: BTreeSet<_> = postdominators
-            .get(&statement_id)?
-            .iter()
-            .copied()
-            .filter(|candidate| *candidate != statement_id && *candidate != EXIT)
-            .collect();
-        strict.iter().copied().find(|candidate| {
-            strict.iter().all(|other| {
-                other == candidate
-                    || !postdominators
-                        .get(other)
-                        .is_some_and(|set| set.contains(candidate))
-            })
-        })
     }
 
     fn add_value_dependencies<'a>(
@@ -1559,6 +1669,75 @@ fn field_comparison(statement_id: usize, value: &SymbolicValue) -> Option<Jimple
         });
     }
     None
+}
+
+fn raw_local_delta(name: &str, value: &JimpleValue) -> Option<i64> {
+    let JimpleValueKind::Binary {
+        operator,
+        left,
+        right,
+    } = &value.kind
+    else {
+        return None;
+    };
+    if matches!(&left.kind, JimpleValueKind::Local { name: source } if source == name)
+        && let JimpleValueKind::IntegerConstant { value } = right.kind
+    {
+        return match operator.trim() {
+            "+" => Some(value),
+            "-" => value.checked_neg(),
+            _ => None,
+        };
+    }
+    if operator.trim() == "+"
+        && matches!(&right.kind, JimpleValueKind::Local { name: source } if source == name)
+        && let JimpleValueKind::IntegerConstant { value } = left.kind
+    {
+        return Some(value);
+    }
+    None
+}
+
+fn local_constant_comparison(value: &JimpleValue) -> Option<(String, String, i64, bool)> {
+    let JimpleValueKind::Binary {
+        operator,
+        left,
+        right,
+    } = &value.kind
+    else {
+        return None;
+    };
+    if let (JimpleValueKind::Local { name }, JimpleValueKind::IntegerConstant { value }) =
+        (&left.kind, &right.kind)
+    {
+        return Some((name.clone(), operator.trim().to_owned(), *value, true));
+    }
+    if let (JimpleValueKind::IntegerConstant { value }, JimpleValueKind::Local { name }) =
+        (&left.kind, &right.kind)
+    {
+        return Some((name.clone(), operator.trim().to_owned(), *value, false));
+    }
+    None
+}
+
+fn immediate_postdominator(
+    postdominators: &BTreeMap<usize, BTreeSet<usize>>,
+    statement_id: usize,
+) -> Option<usize> {
+    let strict: BTreeSet<_> = postdominators
+        .get(&statement_id)?
+        .iter()
+        .copied()
+        .filter(|candidate| *candidate != statement_id)
+        .collect();
+    strict.iter().copied().find(|candidate| {
+        strict.iter().all(|other| {
+            other == candidate
+                || !postdominators
+                    .get(other)
+                    .is_some_and(|set| set.contains(candidate))
+        })
+    })
 }
 
 fn natural_loop_nodes(
@@ -3224,6 +3403,109 @@ mod tests {
         assert_eq!(operator, "<=");
         assert!(matches!(*left, SymbolicValue::InstanceField { .. }));
         assert!(matches!(*right, SymbolicValue::Integer { value: 0, .. }));
+        Ok(())
+    }
+
+    fn loop_guard_regression_method() -> super::JimpleMethod {
+        let index = local("i", "int");
+        let count = local("count", "int");
+        let key = local("key", "int");
+        super::JimpleMethod {
+            signature: super::JimpleMethodSignature {
+                owner: String::from("demo.Window"),
+                name: String::from("scan"),
+                return_type: String::from("void"),
+                parameter_types: Vec::new(),
+            },
+            display_signature: String::from("<demo.Window: void scan()>"),
+            declaring_superclass: None,
+            declaring_interfaces: Vec::new(),
+            statements: vec![
+                statement(
+                    0,
+                    vec![1],
+                    super::JimpleOperation::Assign {
+                        left: index.clone(),
+                        right: integer(0),
+                    },
+                ),
+                statement(
+                    1,
+                    vec![2],
+                    super::JimpleOperation::Assign {
+                        left: count.clone(),
+                        right: integer(0),
+                    },
+                ),
+                statement(
+                    2,
+                    vec![3, 10],
+                    super::JimpleOperation::If {
+                        condition: binary(">=", index.clone(), integer(3)),
+                    },
+                ),
+                statement(
+                    3,
+                    vec![4, 7],
+                    super::JimpleOperation::If {
+                        condition: binary("!=", key, integer(0)),
+                    },
+                ),
+                statement(
+                    4,
+                    vec![5],
+                    super::JimpleOperation::Assign {
+                        left: count.clone(),
+                        right: binary("+", count.clone(), integer(1)),
+                    },
+                ),
+                statement(
+                    5,
+                    vec![10, 6],
+                    super::JimpleOperation::If {
+                        condition: binary("<", count, integer(8)),
+                    },
+                ),
+                statement(
+                    6,
+                    vec![9],
+                    super::JimpleOperation::Assign {
+                        left: index.clone(),
+                        right: binary("+", index.clone(), integer(1)),
+                    },
+                ),
+                statement(
+                    7,
+                    vec![8],
+                    super::JimpleOperation::Assign {
+                        left: index.clone(),
+                        right: binary("+", index.clone(), integer(1)),
+                    },
+                ),
+                statement(8, vec![2], super::JimpleOperation::Goto),
+                statement(9, vec![2], super::JimpleOperation::Goto),
+                statement(10, Vec::new(), super::JimpleOperation::ReturnVoid),
+            ],
+        }
+    }
+
+    #[test]
+    fn loop_control_guards_keep_same_iteration_predicates_only() -> anyhow::Result<()> {
+        let method = loop_guard_regression_method();
+        let counters = method.local_counter_candidates();
+        let counter = counters
+            .iter()
+            .find(|candidate| candidate.local == "count")
+            .ok_or_else(|| anyhow::anyhow!("count candidate missing"))?;
+        let [update] = counter.updates.as_slice() else {
+            return Err(anyhow::anyhow!("expected one count update"));
+        };
+        let guards: Vec<_> = update
+            .guards
+            .iter()
+            .map(|guard| (guard.branch_statement_id, guard.expected))
+            .collect();
+        assert_eq!(guards, vec![(2, false), (3, false)]);
         Ok(())
     }
 

@@ -77,7 +77,7 @@ These are reported as **possible structural effects**, not unconditional writes.
 
 ## CFG guards and predicate recovery
 
-Structural effects now carry branch guards recovered from the Jimple CFG. For each `if`, the false/true successor regions are separated using immediate post-dominators; an effect inherits a branch predicate only when it is reachable from exactly one arm before reconvergence. Guard expressions resolve locals through CFG **reaching definitions**, not textual proximity. If multiple definitions can reach a use, the local remains symbolic instead of choosing an arbitrary assignment.
+Structural effects now carry branch guards recovered from the Jimple CFG. Guard recovery uses post-dominator control dependence plus ordinary dominance, so an effect inherits the branch decisions that actually control its execution in the same iteration. This replaced an earlier arm-reachability approximation after the redstone-torch loop exposed a subtle bug: a backedge could make a branch occurring *after* an effect appear able to reach that effect on the next iteration, incorrectly attaching a future predicate as a current guard. A synthetic loop regression now requires nested same-iteration guards to survive while rejecting later-iteration leakage. Guard expressions resolve locals through CFG **reaching definitions**, not textual proximity. If multiple definitions can reach a use, the local remains symbolic instead of choosing an arbitrary assignment.
 
 Program-level composition substitutes `this`/arguments through both effects and their guards, simplifies boolean comparisons, inlines exact boolean-materialization helpers, normalizes negation into guard polarity, and deduplicates equivalent predicates inherited through nested calls. This is still structural: guards are conjunctions of necessary control predicates, not a claim that every opaque call inside them is already lowered.
 
@@ -135,15 +135,28 @@ Crop growth confirms a third execution family distinct from polling clocks and k
 
 This argues against per-crop stochastic clocks. The dense world selector should remain a specialized source that owns its RNG state/order and emits causal callback opportunities. Handler-local random draws remain explicit effects on the distinct RNG stream when those callbacks execute. The graph only needs an unkeyed external-event injection surface for emitted callbacks; it does not need to own or statistically approximate the legacy random-tick selector.
 
+## Bounded temporal-history evidence
+
+Redstone-torch burnout supplies the fourth temporal family: bounded history rather than a polling counter, one-shot callback, or stochastic source. The compiled vanilla code now recovers enough structure to state the mechanism without torch-specific analyzer rules:
+
+- JVM `cmp`-to-zero scaffolding is normalized back to ordinary comparisons. The real prune loop therefore exposes `world_time - oldest_timestamp > 60` directly rather than a synthetic `cmp` temporary.
+- `JimpleMethod::local_counter_candidates()` recovers the helper accumulator as `count = 0`, guarded `count += 1`, with a constant threshold observation at `8`.
+- After the loop-control-dependence fix, that increment carries exactly the same-iteration guards needed for a matching record: the list scan is still active and all three stored coordinate fields equal the requested `(x, y, z)`. It no longer inherits the later `count < 8` test or unrelated map/append control flow.
+- The record constructor call carries exactly `(x, y, z, current_world_time)` and is guarded by the helper's boolean "record this toggle" parameter.
+- The outer update lazily removes index `0` while age is greater than `60`; age exactly `60` remains in the window.
+
+The resulting source-backed semantic object is therefore a per-owner ordered event history keyed by `(x, y, z)`: lazily retain events with age `<= 60`, optionally append the current keyed event, and report burnout once the retained key count reaches `8`. No expiry callback is required because vanilla observes/prunes the history only when another torch callback occurs.
+
+Quiescence now mirrors that contract with graph-owned lazy event windows. A reaction can query the current keyed count and record a new event in the same transition as ordinary state writes. Window expiry is observational rather than scheduled: old records simply stop counting when queried and are physically pruned on later records. The torch-shaped runtime example reaches `toggle_count=8`, sets `burned_out=1`, has no pending expiry event, and later observes the count decay to zero solely because simulated time advanced.
+
 ## Missing pieces exposed by vanilla
 
 The current graph runtime proves the scheduling model but intentionally still has prototype numeric state. Exact Minecraft lowering needs:
 
-- richer typed/canonical value policy beyond the now-implemented exact atom/handle nodes when domain code needs more than immutable snapshot identity;
-- interprocedural effect summaries with parameter substitution, so a call like `setCooldown(8)` recovers as a concrete write even when the callee assigns a parameter to the field;
-- adapter lowering from bound source scheduler calls to world callback identity/revalidation, chunk policy, and source-time conversion;
-- explicit stochastic event/RNG semantics for random ticks and random outcomes;
-- bounded temporal-history/window primitives for behavior such as redstone-torch burnout;
-- transaction primitives for inventory/resource movement across graph-owned objects.
+- richer typed/canonical value policy beyond exact atom/handle nodes when domain code needs more than immutable snapshot identity;
+- adapter lowering from recovered source calls/effects into concrete world and inventory transactions, including block revalidation, chunk policy, and source-time conversion;
+- exact domain transaction semantics for inventory/resource movement across graph-owned objects rather than hand-written demonstration closures;
+- source/runtime-type evidence for polymorphic world objects and modded subclasses wherever static bytecode alone cannot prove dispatch;
+- preservation of source RNG state/order in dense adapters while bound random draws and emitted callbacks cross the semantic IR boundary.
 
 The important result of this spike is that none of these require reintroducing a global tick loop. They are additions to the causal graph interface.

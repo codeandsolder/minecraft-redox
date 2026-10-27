@@ -3166,11 +3166,58 @@ fn boolean_constant(value: bool) -> SymbolicValue {
     }
 }
 
+fn reverse_comparison_operator(operator: &str) -> Option<&'static str> {
+    match operator {
+        "<" => Some(">"),
+        "<=" => Some(">="),
+        ">" => Some("<"),
+        ">=" => Some("<="),
+        "==" => Some("=="),
+        "!=" => Some("!="),
+        _ => None,
+    }
+}
+
+fn simplify_cmp_zero(
+    operator: &str,
+    left: &SymbolicValue,
+    right: &SymbolicValue,
+) -> Option<SymbolicValue> {
+    let build = |outer: &str, cmp: &SymbolicValue| {
+        let SymbolicValue::Binary {
+            operator: cmp_operator,
+            left,
+            right,
+        } = cmp
+        else {
+            return None;
+        };
+        if cmp_operator != "cmp" {
+            return None;
+        }
+        Some(SymbolicValue::Binary {
+            operator: outer.to_owned(),
+            left: left.clone(),
+            right: right.clone(),
+        })
+    };
+    if matches!(right, SymbolicValue::Integer { value: 0, .. }) {
+        return build(operator, left);
+    }
+    if matches!(left, SymbolicValue::Integer { value: 0, .. }) {
+        return build(reverse_comparison_operator(operator)?, right);
+    }
+    None
+}
+
 fn simplify_boolean_comparison(
     operator: String,
     left: SymbolicValue,
     right: SymbolicValue,
 ) -> SymbolicValue {
+    if let Some(simplified) = simplify_cmp_zero(&operator, &left, &right) {
+        return simplified;
+    }
     if let (
         SymbolicValue::Integer {
             value: left_value, ..
