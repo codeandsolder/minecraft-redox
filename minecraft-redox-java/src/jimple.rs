@@ -14,12 +14,18 @@ pub use program::{
     AbstractMapEntry, AbstractMapSnapshot, AbstractOpaqueCallShape, AbstractStaticFieldValue,
     JimpleCallOperandBinding, JimpleClockedStateCandidate, JimpleEffectCallFrame,
     JimpleEffectGuard, JimpleIndexedStoreBinding, JimpleIndexedStoreOperation,
-    JimpleIndexedStoreOperationKind, JimpleIndexedStoreTransactionCoverage, JimpleProgram,
+    JimpleIndexedStoreOperationKind, JimpleIndexedStoreQueryBinding,
+    JimpleIndexedStoreQueryCandidate, JimpleIndexedStoreQueryKind,
+    JimpleIndexedStoreTransactionCoverage, JimpleIndexedStoreValueOrigin,
+    JimpleObjectStateWriteBinding, JimpleObjectStateWriteCandidate, JimpleProgram,
     JimpleProgramCall, JimpleProgramCallResolution, JimpleProgramEffectSummary,
-    JimpleProgramFieldWrite, JimpleScheduleOnceBinding, JimpleScheduleOnceCandidate,
-    JimpleSnapshotCloneBinding, JimpleSpeculativeTakeRollbackCandidate, JimpleUniformIntBinding,
-    JimpleUniformIntCandidate, JimpleUnresolvedEffectCall, JimpleUnresolvedEffectReason,
-    ProgramExecution,
+    JimpleProgramFieldWrite, JimpleProgramInductionLoop, JimplePureValueBinding,
+    JimplePureValueCandidate, JimplePureValueOperation, JimpleScheduleOnceBinding,
+    JimpleScheduleOnceCandidate, JimpleSnapshotCloneBinding,
+    JimpleSpeculativeTakeRollbackCandidate, JimpleTransactionBindings, JimpleTransactionLoopBound,
+    JimpleTransactionLoopCandidate, JimpleUniformIntBinding, JimpleUniformIntCandidate,
+    JimpleUnresolvedEffectCall, JimpleUnresolvedEffectReason, JimpleValueComponentBinding,
+    JimpleValueComponentUpdateCandidate, ProgramExecution,
 };
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
@@ -425,6 +431,20 @@ pub struct JimpleLocalCounterCandidate {
     pub comparisons: Vec<JimpleLocalCounterComparison>,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct JimpleInductionLoop {
+    pub header_statement_id: usize,
+    pub condition_statement_id: usize,
+    pub induction_local: String,
+    pub initial_value: i64,
+    pub step: i64,
+    pub comparison_operator: String,
+    pub bound: SymbolicValue,
+    pub continue_when_condition: bool,
+    pub iterations: Option<u64>,
+    pub statement_ids: Vec<usize>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct JimpleFixedTripLoop {
     pub header_statement_id: usize,
@@ -535,13 +555,13 @@ impl JimpleMethod {
         candidates
     }
 
-    /// Recover natural loops with a provable constant trip count.
+    /// Recover natural induction loops with constant initialization/step and a symbolic bound.
     ///
-    /// This recognizes ordinary compiler-lowered induction loops from CFG structure rather than
-    /// source syntax. Ambiguous induction, non-constant bounds, overflow, or multiple loop-body
-    /// successors are left unresolved.
+    /// The loop bound is resolved through CFG reaching definitions without requiring it to be a
+    /// literal. A constant bound additionally yields an exact trip count; dynamic bounds remain
+    /// explicit for later transaction/resource lowering.
     #[must_use]
-    pub fn fixed_trip_loops(&self) -> Vec<JimpleFixedTripLoop> {
+    pub fn induction_loops(&self) -> Vec<JimpleInductionLoop> {
         let predecessors = self.predecessors();
         let dominators = self.dominators(&predecessors);
         let mut loops = Vec::new();
@@ -556,14 +576,21 @@ impl JimpleMethod {
                 let Some(header) = self.statements.iter().find(|item| item.id == *header_id) else {
                     continue;
                 };
-                let JimpleOperation::If { condition } = &header.operation else {
-                    continue;
-                };
-                let Some((local, operator, bound)) = induction_comparison(condition) else {
-                    continue;
-                };
                 let loop_nodes = natural_loop_nodes(header.id, source.id, &predecessors);
-                let [when_false, when_true] = header.successors.as_slice() else {
+                let Some(condition_statement) =
+                    self.loop_condition_statement(header.id, &loop_nodes)
+                else {
+                    continue;
+                };
+                let JimpleOperation::If { condition } = &condition_statement.operation else {
+                    continue;
+                };
+                let Some((local, operator, bound)) =
+                    induction_comparison_symbolic(self, condition_statement.id, condition)
+                else {
+                    continue;
+                };
+                let [when_false, when_true] = condition_statement.successors.as_slice() else {
                     continue;
                 };
                 let false_in = loop_nodes.contains(when_false);
@@ -572,7 +599,7 @@ impl JimpleMethod {
                     continue;
                 }
                 let continue_when_condition = true_in;
-                let definitions = self.reaching_local_definitions(header.id, &local);
+                let definitions = self.reaching_local_definitions(condition_statement.id, &local);
                 let mut initial = None;
                 let mut step = None;
                 for definition in definitions {
@@ -593,17 +620,18 @@ impl JimpleMethod {
                 let (Some(initial_value), Some(step)) = (initial, step) else {
                     continue;
                 };
-                let Some(iterations) = fixed_trip_count(
-                    initial_value,
-                    step,
-                    &operator,
-                    bound,
-                    continue_when_condition,
-                ) else {
-                    continue;
-                };
-                loops.push(JimpleFixedTripLoop {
+                let iterations = symbolic_integer(&bound).and_then(|constant_bound| {
+                    fixed_trip_count(
+                        initial_value,
+                        step,
+                        &operator,
+                        constant_bound,
+                        continue_when_condition,
+                    )
+                });
+                loops.push(JimpleInductionLoop {
                     header_statement_id: header.id,
+                    condition_statement_id: condition_statement.id,
                     induction_local: local,
                     initial_value,
                     step,
@@ -618,6 +646,54 @@ impl JimpleMethod {
         loops.sort_by_key(|item| item.header_statement_id);
         loops.dedup_by_key(|item| item.header_statement_id);
         loops
+    }
+
+    /// Recover the subset of induction loops with a provable constant trip count.
+    #[must_use]
+    pub fn fixed_trip_loops(&self) -> Vec<JimpleFixedTripLoop> {
+        self.induction_loops()
+            .into_iter()
+            .filter_map(|item| {
+                let bound = symbolic_integer(&item.bound)?;
+                let iterations = item.iterations?;
+                Some(JimpleFixedTripLoop {
+                    header_statement_id: item.condition_statement_id,
+                    induction_local: item.induction_local,
+                    initial_value: item.initial_value,
+                    step: item.step,
+                    comparison_operator: item.comparison_operator,
+                    bound,
+                    continue_when_condition: item.continue_when_condition,
+                    iterations,
+                    statement_ids: item.statement_ids,
+                })
+            })
+            .collect()
+    }
+
+    fn loop_condition_statement(
+        &self,
+        header_id: usize,
+        loop_nodes: &BTreeSet<usize>,
+    ) -> Option<&JimpleStatement> {
+        let mut current = header_id;
+        let mut visited = BTreeSet::new();
+        loop {
+            if !visited.insert(current) {
+                return None;
+            }
+            let statement = self.statements.iter().find(|item| item.id == current)?;
+            if matches!(statement.operation, JimpleOperation::If { .. }) {
+                return Some(statement);
+            }
+            let [successor] = statement.successors.as_slice() else {
+                return None;
+            };
+            if !loop_nodes.contains(successor) {
+                return None;
+            }
+            current = *successor;
+        }
     }
 
     fn dominators(
@@ -1760,7 +1836,11 @@ fn natural_loop_nodes(
     nodes
 }
 
-fn induction_comparison(value: &JimpleValue) -> Option<(String, String, i64)> {
+fn induction_comparison_symbolic(
+    method: &JimpleMethod,
+    before_id: usize,
+    value: &JimpleValue,
+) -> Option<(String, String, SymbolicValue)> {
     let JimpleValueKind::Binary {
         operator,
         left,
@@ -1769,26 +1849,36 @@ fn induction_comparison(value: &JimpleValue) -> Option<(String, String, i64)> {
     else {
         return None;
     };
-    if let (JimpleValueKind::Local { name }, JimpleValueKind::IntegerConstant { value }) =
-        (&left.kind, &right.kind)
-    {
-        return Some((name.clone(), operator.trim().to_owned(), *value));
+    if let JimpleValueKind::Local { name } = &left.kind {
+        let mut visiting = BTreeSet::new();
+        return Some((
+            name.clone(),
+            operator.trim().to_owned(),
+            method.resolve_locals_only(before_id, right, &mut visiting),
+        ));
     }
-    let (JimpleValueKind::IntegerConstant { value }, JimpleValueKind::Local { name }) =
-        (&left.kind, &right.kind)
-    else {
+    let JimpleValueKind::Local { name } = &right.kind else {
         return None;
     };
-    let reversed = match operator.trim() {
-        "<" => ">",
-        "<=" => ">=",
-        ">" => "<",
-        ">=" => "<=",
-        "==" => "==",
-        "!=" => "!=",
-        _ => return None,
-    };
-    Some((name.clone(), reversed.to_owned(), *value))
+    let reversed = reverse_comparison_operator(operator.trim())?;
+    let mut visiting = BTreeSet::new();
+    Some((
+        name.clone(),
+        reversed.to_owned(),
+        method.resolve_locals_only(before_id, left, &mut visiting),
+    ))
+}
+
+fn reverse_comparison_operator(operator: &str) -> Option<&str> {
+    match operator {
+        "<" => Some(">"),
+        "<=" => Some(">="),
+        ">" => Some("<"),
+        ">=" => Some("<="),
+        "==" => Some("=="),
+        "!=" => Some("!="),
+        _ => None,
+    }
 }
 
 fn local_constant_definition(statement: &JimpleStatement, name: &str) -> Option<i64> {
@@ -3720,6 +3810,88 @@ mod tests {
         assert_eq!(recovered.bound, 3);
         assert!(!recovered.continue_when_condition);
         assert_eq!(recovered.iterations, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn induction_loop_preserves_symbolic_bound() -> anyhow::Result<()> {
+        let bound = local("bound", "int");
+        let index = local("i", "int");
+        let scratch = local("scratch", "int");
+        let method = super::JimpleMethod {
+            signature: super::JimpleMethodSignature {
+                owner: String::from("demo.DynamicLoop"),
+                name: String::from("run"),
+                return_type: String::from("void"),
+                parameter_types: vec![String::from("int")],
+            },
+            display_signature: String::from("<demo.DynamicLoop: void run(int)>"),
+            declaring_superclass: None,
+            declaring_interfaces: Vec::new(),
+            statements: vec![
+                statement(
+                    0,
+                    vec![1],
+                    super::JimpleOperation::Identity {
+                        left: bound.clone(),
+                        right: super::JimpleValue {
+                            jimple_kind: String::from("JParameterRef"),
+                            type_name: String::from("int"),
+                            text: String::from("@parameter0"),
+                            kind: super::JimpleValueKind::Parameter { index: 0 },
+                        },
+                    },
+                ),
+                statement(
+                    1,
+                    vec![2],
+                    super::JimpleOperation::Assign {
+                        left: index.clone(),
+                        right: integer(0),
+                    },
+                ),
+                statement(
+                    2,
+                    vec![3, 6],
+                    super::JimpleOperation::If {
+                        condition: binary(">=", index.clone(), bound),
+                    },
+                ),
+                statement(
+                    3,
+                    vec![4],
+                    super::JimpleOperation::Assign {
+                        left: scratch,
+                        right: index.clone(),
+                    },
+                ),
+                statement(
+                    4,
+                    vec![5],
+                    super::JimpleOperation::Assign {
+                        left: index.clone(),
+                        right: binary("+", index, integer(1)),
+                    },
+                ),
+                statement(5, vec![2], super::JimpleOperation::Goto),
+                statement(6, Vec::new(), super::JimpleOperation::ReturnVoid),
+            ],
+        };
+        let loops = method.induction_loops();
+        let [recovered] = loops.as_slice() else {
+            return Err(anyhow::anyhow!("expected one induction loop"));
+        };
+        assert_eq!(recovered.header_statement_id, 2);
+        assert_eq!(recovered.condition_statement_id, 2);
+        assert_eq!(recovered.induction_local, "i");
+        assert_eq!(recovered.initial_value, 0);
+        assert_eq!(recovered.step, 1);
+        assert!(matches!(
+            recovered.bound,
+            SymbolicValue::Parameter { index: 0, .. }
+        ));
+        assert_eq!(recovered.iterations, None);
+        assert_eq!(method.fixed_trip_loops().len(), 0);
         Ok(())
     }
 

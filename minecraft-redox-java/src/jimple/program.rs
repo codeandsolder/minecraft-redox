@@ -113,10 +113,106 @@ pub struct JimpleIndexedStoreOperation {
     pub amount: Option<SymbolicValue>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JimpleIndexedStoreQueryKind {
+    Extent,
+    Keys,
+    AllowsRead,
+    AllowsWrite,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct JimpleIndexedStoreQueryBinding {
+    pub callee: JimpleMethodSignature,
+    pub operation: JimpleIndexedStoreQueryKind,
+    pub store: JimpleCallOperandBinding,
+    #[serde(default)]
+    pub key: Vec<JimpleCallOperandBinding>,
+    pub value: Option<JimpleCallOperandBinding>,
+    #[serde(default)]
+    pub context: Vec<JimpleCallOperandBinding>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct JimpleIndexedStoreQueryCandidate {
+    pub call_path: Vec<JimpleEffectCallFrame>,
+    pub guards: Vec<JimpleEffectGuard>,
+    pub resolution: JimpleProgramCallResolution,
+    pub operation: JimpleIndexedStoreQueryKind,
+    pub store: SymbolicValue,
+    pub key: Vec<SymbolicValue>,
+    pub value: Option<SymbolicValue>,
+    pub context: Vec<SymbolicValue>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct JimpleObjectStateWriteBinding {
+    pub callee: JimpleMethodSignature,
+    pub target: JimpleCallOperandBinding,
+    pub state: String,
+    pub value: JimpleCallOperandBinding,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct JimpleObjectStateWriteCandidate {
+    pub call_path: Vec<JimpleEffectCallFrame>,
+    pub guards: Vec<JimpleEffectGuard>,
+    pub resolution: JimpleProgramCallResolution,
+    pub target: SymbolicValue,
+    pub state: String,
+    pub value: SymbolicValue,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct JimpleValueComponentBinding {
+    pub field: super::JimpleFieldSignature,
+    pub component: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct JimpleIndexedStoreValueOrigin {
+    pub operation: JimpleIndexedStoreOperationKind,
+    pub store: SymbolicValue,
+    pub key: Vec<SymbolicValue>,
+    pub amount: Option<SymbolicValue>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct JimpleValueComponentUpdateCandidate {
+    pub call_path: Vec<JimpleEffectCallFrame>,
+    pub guards: Vec<JimpleEffectGuard>,
+    pub statement_id: usize,
+    pub component: String,
+    pub origin: JimpleIndexedStoreValueOrigin,
+    pub value: SymbolicValue,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+pub struct JimpleTransactionBindings {
+    #[serde(default)]
+    pub indexed_stores: Vec<JimpleIndexedStoreBinding>,
+    #[serde(default)]
+    pub snapshot_clones: Vec<JimpleSnapshotCloneBinding>,
+    #[serde(default)]
+    pub value_components: Vec<JimpleValueComponentBinding>,
+    #[serde(default)]
+    pub pure_values: Vec<JimplePureValueBinding>,
+    #[serde(default)]
+    pub store_queries: Vec<JimpleIndexedStoreQueryBinding>,
+    #[serde(default)]
+    pub state_writes: Vec<JimpleObjectStateWriteBinding>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct JimpleIndexedStoreTransactionCoverage {
     pub operations: Vec<JimpleIndexedStoreOperation>,
     pub rollbacks: Vec<JimpleSpeculativeTakeRollbackCandidate>,
+    pub component_updates: Vec<JimpleValueComponentUpdateCandidate>,
+    pub value_operations: Vec<JimplePureValueCandidate>,
+    pub store_queries: Vec<JimpleIndexedStoreQueryCandidate>,
+    pub state_writes: Vec<JimpleObjectStateWriteCandidate>,
+    pub loops: Vec<JimpleTransactionLoopCandidate>,
     pub unaccounted_field_writes: Vec<JimpleProgramFieldWrite>,
     pub unaccounted_calls: Vec<JimpleProgramCall>,
     pub complete: bool,
@@ -137,6 +233,30 @@ pub struct JimpleSpeculativeTakeRollbackCandidate {
     pub restore_call_path: Vec<JimpleEffectCallFrame>,
     pub take_guards: Vec<JimpleEffectGuard>,
     pub restore_guards: Vec<JimpleEffectGuard>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum JimplePureValueOperation {
+    Component { component: String },
+    Equal,
+    Min,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct JimplePureValueBinding {
+    pub callee: JimpleMethodSignature,
+    pub operation: JimplePureValueOperation,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct JimplePureValueCandidate {
+    pub call_path: Vec<JimpleEffectCallFrame>,
+    pub guards: Vec<JimpleEffectGuard>,
+    pub resolution: JimpleProgramCallResolution,
+    pub operation: JimplePureValueOperation,
+    pub receiver: Option<SymbolicValue>,
+    pub arguments: Vec<SymbolicValue>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -182,10 +302,60 @@ pub struct JimpleUnresolvedEffectCall {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct JimpleProgramInductionLoop {
+    pub call_path: Vec<JimpleEffectCallFrame>,
+    pub guards: Vec<JimpleEffectGuard>,
+    pub method: JimpleMethodSignature,
+    pub header_statement_id: usize,
+    pub condition_statement_id: usize,
+    pub induction_local: String,
+    pub initial_value: i64,
+    pub step: i64,
+    pub comparison_operator: String,
+    pub bound: SymbolicValue,
+    pub continue_when_condition: bool,
+    pub iterations: Option<u64>,
+    pub statement_ids: Vec<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum JimpleTransactionLoopBound {
+    StoreExtent {
+        store: SymbolicValue,
+    },
+    StoreKeysLength {
+        store: SymbolicValue,
+        context: Vec<SymbolicValue>,
+    },
+    Symbolic {
+        value: SymbolicValue,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct JimpleTransactionLoopCandidate {
+    pub call_path: Vec<JimpleEffectCallFrame>,
+    pub guards: Vec<JimpleEffectGuard>,
+    pub method: JimpleMethodSignature,
+    pub header_statement_id: usize,
+    pub condition_statement_id: usize,
+    pub induction_local: String,
+    pub initial_value: i64,
+    pub step: i64,
+    pub comparison_operator: String,
+    pub bound: JimpleTransactionLoopBound,
+    pub continue_when_condition: bool,
+    pub iterations: Option<u64>,
+    pub statement_ids: Vec<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct JimpleProgramEffectSummary {
     pub entry: JimpleMethodSignature,
     pub possible_field_writes: Vec<JimpleProgramFieldWrite>,
     pub calls: Vec<JimpleProgramCall>,
+    pub induction_loops: Vec<JimpleProgramInductionLoop>,
     pub unresolved_calls: Vec<JimpleUnresolvedEffectCall>,
 }
 
@@ -238,6 +408,126 @@ impl JimpleProgramEffectSummary {
             }
         }
         Ok(operations)
+    }
+
+    /// Bind source calls to indexed-store policy/topology queries.
+    ///
+    /// Operand selectors define the store, key, optional value, and contextual dimensions such
+    /// as a side or capability view. The source method name itself carries no store semantics.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a matching call is missing a configured operand.
+    pub fn bind_indexed_store_queries(
+        &self,
+        bindings: &[JimpleIndexedStoreQueryBinding],
+    ) -> Result<Vec<JimpleIndexedStoreQueryCandidate>> {
+        let mut candidates = Vec::new();
+        for call in &self.calls {
+            let Some(callee) = call.call_path.last().map(|frame| &frame.callee) else {
+                continue;
+            };
+            let mut matching = bindings.iter().filter(|binding| &binding.callee == callee);
+            let Some(binding) = matching.next() else {
+                continue;
+            };
+            if matching.next().is_some() {
+                continue;
+            }
+            let store = select_call_operand(call, &binding.store, "store query store", callee)?;
+            let key = binding
+                .key
+                .iter()
+                .map(|selector| select_call_operand(call, selector, "store query key", callee))
+                .collect::<Result<Vec<_>>>()?;
+            let value = binding
+                .value
+                .as_ref()
+                .map(|selector| select_call_operand(call, selector, "store query value", callee))
+                .transpose()?;
+            let context = binding
+                .context
+                .iter()
+                .map(|selector| select_call_operand(call, selector, "store query context", callee))
+                .collect::<Result<Vec<_>>>()?;
+            candidates.push(JimpleIndexedStoreQueryCandidate {
+                call_path: call.call_path.clone(),
+                guards: call.guards.clone(),
+                resolution: call.resolution,
+                operation: binding.operation,
+                store,
+                key,
+                value,
+                context,
+            });
+        }
+        Ok(candidates)
+    }
+
+    /// Bind source setter-style calls to generic object-state writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a matching call is missing its configured target or value operand.
+    pub fn bind_object_state_writes(
+        &self,
+        bindings: &[JimpleObjectStateWriteBinding],
+    ) -> Result<Vec<JimpleObjectStateWriteCandidate>> {
+        let mut candidates = Vec::new();
+        for call in &self.calls {
+            let Some(callee) = call.call_path.last().map(|frame| &frame.callee) else {
+                continue;
+            };
+            let mut matching = bindings.iter().filter(|binding| &binding.callee == callee);
+            let Some(binding) = matching.next() else {
+                continue;
+            };
+            if matching.next().is_some() {
+                continue;
+            }
+            let target = select_call_operand(call, &binding.target, "state target", callee)?;
+            let value = select_call_operand(call, &binding.value, "state value", callee)?;
+            candidates.push(JimpleObjectStateWriteCandidate {
+                call_path: call.call_path.clone(),
+                guards: call.guards.clone(),
+                resolution: call.resolution,
+                target,
+                state: binding.state.clone(),
+                value,
+            });
+        }
+        Ok(candidates)
+    }
+
+    /// Bind field mutations on values obtained from indexed stores into transaction-local
+    /// immutable component updates.
+    ///
+    /// A matching field write is accepted only when its receiver is structurally the value
+    /// returned by exactly one configured read or take API. This keeps arbitrary heap-object
+    /// field writes graph-visible while allowing mutable source value objects to lower as private
+    /// transforms of a transaction snapshot.
+    #[must_use]
+    pub fn bind_indexed_value_component_updates(
+        &self,
+        store_bindings: &[JimpleIndexedStoreBinding],
+        component_bindings: &[JimpleValueComponentBinding],
+    ) -> Vec<JimpleValueComponentUpdateCandidate> {
+        self.possible_field_writes
+            .iter()
+            .filter_map(|write| {
+                let component = unique_value_component_name(&write.field, component_bindings)?;
+                let receiver = write.receiver.as_ref()?;
+                let origin = indexed_store_value_origin(receiver, store_bindings)?;
+                Some(JimpleValueComponentUpdateCandidate {
+                    call_path: write.call_path.clone(),
+                    guards: write.guards.clone(),
+                    statement_id: write.statement_id,
+                    component,
+                    origin,
+                    value: write.value.clone(),
+                })
+            })
+            .collect()
     }
 
     /// Recover speculative indexed-store takes that are explicitly rolled back from a snapshot.
@@ -316,22 +606,59 @@ impl JimpleProgramEffectSummary {
     /// Returns an error when indexed-store bindings reference missing call operands.
     pub fn indexed_store_transaction_coverage(
         &self,
-        store_bindings: &[JimpleIndexedStoreBinding],
-        clone_bindings: &[JimpleSnapshotCloneBinding],
+        bindings: &JimpleTransactionBindings,
     ) -> Result<JimpleIndexedStoreTransactionCoverage> {
-        let operations = self.bind_indexed_store(store_bindings)?;
-        let rollbacks = self.bind_speculative_take_rollbacks(store_bindings, clone_bindings)?;
-        let accounted_callees: Vec<_> = store_bindings
+        let operations = self.bind_indexed_store(&bindings.indexed_stores)?;
+        let rollbacks = self
+            .bind_speculative_take_rollbacks(&bindings.indexed_stores, &bindings.snapshot_clones)?;
+        let component_updates = self.bind_indexed_value_component_updates(
+            &bindings.indexed_stores,
+            &bindings.value_components,
+        );
+        let value_operations = self.bind_pure_value_operations(&bindings.pure_values);
+        let store_queries = self.bind_indexed_store_queries(&bindings.store_queries)?;
+        let state_writes = self.bind_object_state_writes(&bindings.state_writes)?;
+        let loops = self.bind_transaction_loops(bindings)?;
+        let accounted_callees: Vec<_> = bindings
+            .indexed_stores
             .iter()
             .map(|binding| binding.callee.clone())
-            .chain(clone_bindings.iter().map(|binding| binding.callee.clone()))
+            .chain(
+                bindings
+                    .snapshot_clones
+                    .iter()
+                    .map(|binding| binding.callee.clone()),
+            )
             .collect();
-        let unaccounted_field_writes = self.possible_field_writes.clone();
+        let unaccounted_field_writes: Vec<_> = self
+            .possible_field_writes
+            .iter()
+            .filter(|write| {
+                !component_updates.iter().any(|update| {
+                    update.statement_id == write.statement_id
+                        && update.call_path == write.call_path
+                        && bindings
+                            .value_components
+                            .iter()
+                            .any(|binding| binding.field == write.field)
+                })
+            })
+            .cloned()
+            .collect();
         let unaccounted_calls: Vec<_> = self
             .calls
             .iter()
             .filter(|call| {
                 call.resolution != JimpleProgramCallResolution::Expanded
+                    && !value_operations
+                        .iter()
+                        .any(|candidate| candidate.call_path == call.call_path)
+                    && !store_queries
+                        .iter()
+                        .any(|candidate| candidate.call_path == call.call_path)
+                    && !state_writes
+                        .iter()
+                        .any(|candidate| candidate.call_path == call.call_path)
                     && call
                         .call_path
                         .last()
@@ -343,10 +670,78 @@ impl JimpleProgramEffectSummary {
         Ok(JimpleIndexedStoreTransactionCoverage {
             operations,
             rollbacks,
+            component_updates,
+            value_operations,
+            store_queries,
+            state_writes,
+            loops,
             unaccounted_field_writes,
             unaccounted_calls,
             complete,
         })
+    }
+
+    /// Bind source calls to typed pure value operations.
+    ///
+    /// Bindings are semantic rather than permissive: receiver/argument shape must match the
+    /// configured operation, and ambiguous duplicate bindings fail closed for that call.
+    #[must_use]
+    pub fn bind_pure_value_operations(
+        &self,
+        bindings: &[JimplePureValueBinding],
+    ) -> Vec<JimplePureValueCandidate> {
+        self.calls
+            .iter()
+            .filter_map(|call| {
+                let callee = &call.call_path.last()?.callee;
+                let binding = unique_pure_value_binding(callee, bindings)?;
+                if !pure_value_shape_matches(&binding.operation, call) {
+                    return None;
+                }
+                Some(JimplePureValueCandidate {
+                    call_path: call.call_path.clone(),
+                    guards: call.guards.clone(),
+                    resolution: call.resolution,
+                    operation: binding.operation,
+                    receiver: call.receiver.clone(),
+                    arguments: call.arguments.clone(),
+                })
+            })
+            .collect()
+    }
+
+    /// Bind interprocedurally recovered induction loops to transaction-level loop bounds.
+    ///
+    /// Store extent and key-list length are recognized through the same declarative store-query
+    /// bindings as ordinary calls. Other bounds remain explicit symbolic expressions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a matching store-query binding references a missing operand.
+    pub fn bind_transaction_loops(
+        &self,
+        bindings: &JimpleTransactionBindings,
+    ) -> Result<Vec<JimpleTransactionLoopCandidate>> {
+        self.induction_loops
+            .iter()
+            .map(|item| {
+                Ok(JimpleTransactionLoopCandidate {
+                    call_path: item.call_path.clone(),
+                    guards: item.guards.clone(),
+                    method: item.method.clone(),
+                    header_statement_id: item.header_statement_id,
+                    condition_statement_id: item.condition_statement_id,
+                    induction_local: item.induction_local.clone(),
+                    initial_value: item.initial_value,
+                    step: item.step,
+                    comparison_operator: item.comparison_operator.clone(),
+                    bound: transaction_loop_bound(&item.bound, &bindings.store_queries)?,
+                    continue_when_condition: item.continue_when_condition,
+                    iterations: item.iterations,
+                    statement_ids: item.statement_ids.clone(),
+                })
+            })
+            .collect()
     }
 
     /// Bind calls to a source RNG API into uniform integer draws.
@@ -455,6 +850,70 @@ impl JimpleProgramEffectSummary {
     }
 }
 
+fn transaction_loop_bound(
+    value: &SymbolicValue,
+    bindings: &[JimpleIndexedStoreQueryBinding],
+) -> Result<JimpleTransactionLoopBound> {
+    if let Some((store, _context)) =
+        semantic_store_query_bound(value, bindings, JimpleIndexedStoreQueryKind::Extent)?
+    {
+        return Ok(JimpleTransactionLoopBound::StoreExtent { store });
+    }
+    if let SymbolicValue::ArrayLength { value } = value
+        && let Some((store, context)) =
+            semantic_store_query_bound(value, bindings, JimpleIndexedStoreQueryKind::Keys)?
+    {
+        return Ok(JimpleTransactionLoopBound::StoreKeysLength { store, context });
+    }
+    Ok(JimpleTransactionLoopBound::Symbolic {
+        value: value.clone(),
+    })
+}
+
+fn semantic_store_query_bound(
+    value: &SymbolicValue,
+    bindings: &[JimpleIndexedStoreQueryBinding],
+    expected: JimpleIndexedStoreQueryKind,
+) -> Result<Option<(SymbolicValue, Vec<SymbolicValue>)>> {
+    let SymbolicValue::Invoke {
+        method,
+        base,
+        arguments,
+    } = value
+    else {
+        return Ok(None);
+    };
+    let mut matching = bindings
+        .iter()
+        .filter(|binding| binding.callee == *method && binding.operation == expected);
+    let Some(binding) = matching.next() else {
+        return Ok(None);
+    };
+    if matching.next().is_some() {
+        return Ok(None);
+    }
+    let store =
+        select_symbolic_operand(base.as_deref(), arguments, &binding.store).with_context(|| {
+            format!(
+                "transaction loop store operand missing for {:?}",
+                binding.callee
+            )
+        })?;
+    let context = binding
+        .context
+        .iter()
+        .map(|selector| {
+            select_symbolic_operand(base.as_deref(), arguments, selector).with_context(|| {
+                format!(
+                    "transaction loop context operand missing for {:?}",
+                    binding.callee
+                )
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Some((store, context)))
+}
+
 fn select_call_operand(
     call: &JimpleProgramCall,
     selector: &JimpleCallOperandBinding,
@@ -470,6 +929,96 @@ fn select_call_operand(
                 format!("indexed-store {role} argument {index} missing from call to {callee:?}")
             })
         }
+    }
+}
+
+fn unique_pure_value_binding(
+    callee: &JimpleMethodSignature,
+    bindings: &[JimplePureValueBinding],
+) -> Option<JimplePureValueBinding> {
+    let mut matching = bindings.iter().filter(|binding| binding.callee == *callee);
+    let binding = matching.next()?.clone();
+    if matching.next().is_some() {
+        return None;
+    }
+    Some(binding)
+}
+
+fn pure_value_shape_matches(
+    operation: &JimplePureValueOperation,
+    call: &JimpleProgramCall,
+) -> bool {
+    match operation {
+        JimplePureValueOperation::Component { .. } => {
+            call.receiver.is_some() && call.arguments.is_empty()
+        }
+        JimplePureValueOperation::Equal | JimplePureValueOperation::Min => {
+            call.receiver.is_none() && call.arguments.len() == 2
+        }
+    }
+}
+
+fn unique_value_component_name(
+    field: &super::JimpleFieldSignature,
+    bindings: &[JimpleValueComponentBinding],
+) -> Option<String> {
+    let mut matching = bindings.iter().filter(|binding| binding.field == *field);
+    let binding = matching.next()?;
+    if matching.next().is_some() {
+        return None;
+    }
+    Some(binding.component.clone())
+}
+
+fn indexed_store_value_origin(
+    value: &SymbolicValue,
+    bindings: &[JimpleIndexedStoreBinding],
+) -> Option<JimpleIndexedStoreValueOrigin> {
+    let SymbolicValue::Invoke {
+        method,
+        base,
+        arguments,
+    } = value
+    else {
+        return None;
+    };
+    let mut matching = bindings.iter().filter(|binding| {
+        binding.callee == *method
+            && matches!(
+                binding.operation,
+                JimpleIndexedStoreOperationKind::Read | JimpleIndexedStoreOperationKind::Take
+            )
+    });
+    let binding = matching.next()?;
+    if matching.next().is_some() {
+        return None;
+    }
+    let store = select_symbolic_operand(base.as_deref(), arguments, &binding.store)?;
+    let key = binding
+        .key
+        .iter()
+        .map(|selector| select_symbolic_operand(base.as_deref(), arguments, selector))
+        .collect::<Option<Vec<_>>>()?;
+    let amount = binding
+        .amount
+        .as_ref()
+        .and_then(|selector| select_symbolic_operand(base.as_deref(), arguments, selector));
+    Some(JimpleIndexedStoreValueOrigin {
+        operation: binding.operation,
+        store,
+        key,
+        amount,
+    })
+}
+
+fn select_symbolic_operand(
+    receiver: Option<&SymbolicValue>,
+    arguments: &[SymbolicValue],
+    selector: &JimpleCallOperandBinding,
+) -> Option<SymbolicValue> {
+    match selector {
+        JimpleCallOperandBinding::Receiver => receiver.cloned(),
+        JimpleCallOperandBinding::Argument { index } => arguments.get(*index).cloned(),
     }
 }
 
@@ -713,6 +1262,7 @@ impl JimpleProgram {
             entry: entry.clone(),
             possible_field_writes: Vec::new(),
             calls: Vec::new(),
+            induction_loops: Vec::new(),
             unresolved_calls: Vec::new(),
         };
         let runtime_this = runtime_type.map(|type_name| SymbolicValue::This {
@@ -819,6 +1369,34 @@ impl JimpleProgram {
         active: &mut Vec<JimpleMethodSignature>,
         summary: &mut JimpleProgramEffectSummary,
     ) {
+        for induction in method.induction_loops() {
+            let mut guards = context.guards.to_vec();
+            guards.extend(self.substitute_guards(
+                &method.signature,
+                &method.control_guards(induction.header_statement_id),
+                context.this_value,
+                context.arguments,
+            ));
+            dedupe_guards(&mut guards);
+            summary.induction_loops.push(JimpleProgramInductionLoop {
+                call_path: context.call_path.to_vec(),
+                guards,
+                method: method.signature.clone(),
+                header_statement_id: induction.header_statement_id,
+                condition_statement_id: induction.condition_statement_id,
+                induction_local: induction.induction_local,
+                initial_value: induction.initial_value,
+                step: induction.step,
+                comparison_operator: induction.comparison_operator,
+                bound: self.simplify_symbolic_value(
+                    substitute_symbolic(&induction.bound, context.this_value, context.arguments),
+                    0,
+                ),
+                continue_when_condition: induction.continue_when_condition,
+                iterations: induction.iterations,
+                statement_ids: induction.statement_ids,
+            });
+        }
         for effect in method.effect_summary().effects {
             match effect {
                 JimpleDirectEffect::FieldWrite(write) => {
@@ -5299,9 +5877,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn speculative_take_rollback_requires_exact_snapshot_origin_and_guard_superset() -> Result<()> {
-        let (bindings, clones, read_sig, take_sig, write_sig) = rollback_test_bindings();
+    fn rollback_test_context() -> (
+        JimpleMethodSignature,
+        SymbolicValue,
+        SymbolicValue,
+        JimpleEffectGuard,
+    ) {
         let caller = JimpleMethodSignature {
             owner: String::from("demo.Transfer"),
             name: String::from("run"),
@@ -5325,6 +5906,13 @@ mod tests {
                 type_name: String::from("boolean"),
             },
         };
+        (caller, store, key, guard)
+    }
+
+    #[test]
+    fn speculative_take_rollback_requires_exact_snapshot_origin_and_guard_superset() -> Result<()> {
+        let (bindings, clones, read_sig, take_sig, write_sig) = rollback_test_bindings();
+        let (caller, store, key, guard) = rollback_test_context();
         let read_value = SymbolicValue::Invoke {
             method: read_sig.clone(),
             base: Some(Box::new(store.clone())),
@@ -5380,9 +5968,14 @@ mod tests {
                     Vec::new(),
                 ),
             ],
+            induction_loops: Vec::new(),
             unresolved_calls: Vec::new(),
         };
-        let coverage = summary.indexed_store_transaction_coverage(&bindings, &clones)?;
+        let coverage = summary.indexed_store_transaction_coverage(&JimpleTransactionBindings {
+            indexed_stores: bindings.clone(),
+            snapshot_clones: clones.clone(),
+            ..JimpleTransactionBindings::default()
+        })?;
         assert!(coverage.complete);
         assert_eq!(coverage.rollbacks.len(), 1);
         let candidates = summary.bind_speculative_take_rollbacks(&bindings, &clones)?;
@@ -5396,6 +5989,197 @@ mod tests {
             candidate.amount,
             SymbolicValue::Integer { value: 1, .. }
         ));
+        Ok(())
+    }
+
+    fn semantic_surface_signatures() -> (
+        JimpleMethodSignature,
+        JimpleMethodSignature,
+        JimpleMethodSignature,
+        JimpleMethodSignature,
+        JimpleMethodSignature,
+    ) {
+        (
+            JimpleMethodSignature {
+                owner: String::from("demo.Transfer"),
+                name: String::from("run"),
+                return_type: String::from("void"),
+                parameter_types: Vec::new(),
+            },
+            JimpleMethodSignature {
+                owner: String::from("demo.Store"),
+                name: String::from("read"),
+                return_type: String::from("demo.Value"),
+                parameter_types: vec![String::from("int")],
+            },
+            JimpleMethodSignature {
+                owner: String::from("demo.Value"),
+                name: String::from("capacity"),
+                return_type: String::from("int"),
+                parameter_types: Vec::new(),
+            },
+            JimpleMethodSignature {
+                owner: String::from("demo.Store"),
+                name: String::from("extent"),
+                return_type: String::from("int"),
+                parameter_types: Vec::new(),
+            },
+            JimpleMethodSignature {
+                owner: String::from("demo.Store"),
+                name: String::from("set_ready"),
+                return_type: String::from("void"),
+                parameter_types: vec![String::from("int")],
+            },
+        )
+    }
+
+    fn semantic_surface_summary(
+        signatures: &(
+            JimpleMethodSignature,
+            JimpleMethodSignature,
+            JimpleMethodSignature,
+            JimpleMethodSignature,
+            JimpleMethodSignature,
+        ),
+    ) -> (
+        JimpleProgramEffectSummary,
+        super::super::JimpleFieldSignature,
+    ) {
+        let (caller, read_sig, capacity_sig, extent_sig, state_sig) = signatures;
+        let store = SymbolicValue::Parameter {
+            index: 0,
+            type_name: String::from("demo.Store"),
+        };
+        let key = symbolic_test_integer(0);
+        let read_value = SymbolicValue::Invoke {
+            method: read_sig.clone(),
+            base: Some(Box::new(store.clone())),
+            arguments: vec![key.clone()],
+        };
+        let quantity = field("demo.Value", "quantity", "int");
+        let write = JimpleProgramFieldWrite {
+            call_path: Vec::new(),
+            guards: Vec::new(),
+            statement_id: 10,
+            field: quantity.clone(),
+            receiver: Some(read_value.clone()),
+            value: SymbolicValue::Binary {
+                operator: String::from("+"),
+                left: Box::new(SymbolicValue::InstanceField {
+                    base: Box::new(read_value.clone()),
+                    field: quantity.clone(),
+                }),
+                right: Box::new(symbolic_test_integer(1)),
+            },
+        };
+        let calls = vec![
+            rollback_test_call(
+                caller,
+                1,
+                read_sig.clone(),
+                store.clone(),
+                vec![key],
+                Vec::new(),
+            ),
+            rollback_test_call(
+                caller,
+                2,
+                capacity_sig.clone(),
+                read_value,
+                Vec::new(),
+                Vec::new(),
+            ),
+            rollback_test_call(
+                caller,
+                3,
+                extent_sig.clone(),
+                store.clone(),
+                Vec::new(),
+                Vec::new(),
+            ),
+            rollback_test_call(
+                caller,
+                4,
+                state_sig.clone(),
+                store,
+                vec![symbolic_test_integer(1)],
+                Vec::new(),
+            ),
+        ];
+        (
+            JimpleProgramEffectSummary {
+                entry: caller.clone(),
+                possible_field_writes: vec![write],
+                calls,
+                induction_loops: Vec::new(),
+                unresolved_calls: Vec::new(),
+            },
+            quantity,
+        )
+    }
+
+    fn semantic_surface_bindings(
+        signatures: &(
+            JimpleMethodSignature,
+            JimpleMethodSignature,
+            JimpleMethodSignature,
+            JimpleMethodSignature,
+            JimpleMethodSignature,
+        ),
+        quantity: super::super::JimpleFieldSignature,
+    ) -> JimpleTransactionBindings {
+        let (_, read_sig, capacity_sig, extent_sig, state_sig) = signatures;
+        JimpleTransactionBindings {
+            indexed_stores: vec![JimpleIndexedStoreBinding {
+                callee: read_sig.clone(),
+                operation: JimpleIndexedStoreOperationKind::Read,
+                store: JimpleCallOperandBinding::Receiver,
+                key: vec![JimpleCallOperandBinding::Argument { index: 0 }],
+                value: None,
+                amount: None,
+            }],
+            value_components: vec![JimpleValueComponentBinding {
+                field: quantity,
+                component: String::from("quantity"),
+            }],
+            pure_values: vec![JimplePureValueBinding {
+                callee: capacity_sig.clone(),
+                operation: JimplePureValueOperation::Component {
+                    component: String::from("capacity"),
+                },
+            }],
+            store_queries: vec![JimpleIndexedStoreQueryBinding {
+                callee: extent_sig.clone(),
+                operation: JimpleIndexedStoreQueryKind::Extent,
+                store: JimpleCallOperandBinding::Receiver,
+                key: Vec::new(),
+                value: None,
+                context: Vec::new(),
+            }],
+            state_writes: vec![JimpleObjectStateWriteBinding {
+                callee: state_sig.clone(),
+                target: JimpleCallOperandBinding::Receiver,
+                state: String::from("ready"),
+                value: JimpleCallOperandBinding::Argument { index: 0 },
+            }],
+            ..JimpleTransactionBindings::default()
+        }
+    }
+
+    #[test]
+    fn transaction_coverage_accounts_bound_semantic_surface() -> Result<()> {
+        let signatures = semantic_surface_signatures();
+        let (summary, quantity) = semantic_surface_summary(&signatures);
+        let bindings = semantic_surface_bindings(&signatures, quantity);
+        let coverage = summary.indexed_store_transaction_coverage(&bindings)?;
+        assert!(coverage.complete);
+        assert_eq!(coverage.operations.len(), 1);
+        assert_eq!(coverage.component_updates.len(), 1);
+        assert_eq!(coverage.value_operations.len(), 1);
+        assert_eq!(coverage.store_queries.len(), 1);
+        assert_eq!(coverage.state_writes.len(), 1);
+        assert_eq!(coverage.unaccounted_field_writes.len(), 0);
+        assert_eq!(coverage.unaccounted_calls.len(), 0);
         Ok(())
     }
 
@@ -5439,6 +6223,7 @@ mod tests {
                 }],
                 resolution: JimpleProgramCallResolution::DynamicDispatch,
             }],
+            induction_loops: Vec::new(),
             unresolved_calls: Vec::new(),
         };
         let candidates = summary.bind_uniform_int(&JimpleUniformIntBinding {

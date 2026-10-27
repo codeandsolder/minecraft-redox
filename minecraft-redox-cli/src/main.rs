@@ -10,8 +10,8 @@ use minecraft_redox_java::{
     JavaProjectIndex, analyze_source, inventory_source,
     jimple::{
         AbstractValue, JimpleIndexedStoreBinding, JimpleMethodSignature, JimpleProgram,
-        JimpleScheduleOnceBinding, JimpleSnapshotCloneBinding, JimpleUniformIntBinding,
-        ProgramExecution, parse_methods,
+        JimpleScheduleOnceBinding, JimpleSnapshotCloneBinding, JimpleTransactionBindings,
+        JimpleUniformIntBinding, ProgramExecution, parse_methods,
     },
 };
 use rayon::prelude::*;
@@ -122,24 +122,14 @@ fn main() -> Result<()> {
             store_bindings,
             clone_bindings,
         ),
-        [
-            _,
-            command,
-            path,
-            method,
-            runtime_type,
-            store_bindings,
-            clone_bindings,
-        ] if command == "jimple-transaction-coverage" => print_jimple_transaction_coverage(
-            path,
-            method,
-            runtime_type,
-            store_bindings,
-            clone_bindings,
-        ),
+        [_, command, path, method, runtime_type, bindings]
+            if command == "jimple-transaction-coverage" =>
+        {
+            print_jimple_transaction_coverage(path, method, runtime_type, bindings)
+        }
         [_, command, path, request] if command == "jimple-call" => print_jimple_call(path, request),
         _ => bail!(
-            "usage: minecraft-redox [inventory|chains] <java-file> | gtnh [--summary|--blockers] <file-or-dir> | jimple-slice <json> <method-substring> <sink-substring> | jimple-execute-array <json> <method-substring> <field-owner> <field-name> | jimple-program <json> <owner::method,...> | jimple-program-call <json> <owner::method,...> <request-json> | jimple-call <json> <request-json> | jimple-temporal <json> | jimple-loops <json> <method-substring> | jimple-local-counters <json> <method-substring> | jimple-effects <json> <method-substring> | jimple-clocked <json> <method-substring> | jimple-calls <json> <method-substring> <callee-substring> | jimple-calls-runtime <json> <method-substring> <callee-substring> <runtime-type> | jimple-bind-schedule <json> <method-substring> <runtime-type-or--> <binding-json> | jimple-bind-uniform-int <json> <method-substring> <runtime-type-or--> <binding-json> | jimple-bind-indexed-store <json> <method-substring> <runtime-type-or--> <bindings-json> | jimple-bind-rollbacks <json> <method-substring> <runtime-type-or--> <store-bindings-json> <clone-bindings-json> | jimple-transaction-coverage <json> <method-substring> <runtime-type-or--> <store-bindings-json> <clone-bindings-json>"
+            "usage: minecraft-redox [inventory|chains] <java-file> | gtnh [--summary|--blockers] <file-or-dir> | jimple-slice <json> <method-substring> <sink-substring> | jimple-execute-array <json> <method-substring> <field-owner> <field-name> | jimple-program <json> <owner::method,...> | jimple-program-call <json> <owner::method,...> <request-json> | jimple-call <json> <request-json> | jimple-temporal <json> | jimple-loops <json> <method-substring> | jimple-local-counters <json> <method-substring> | jimple-effects <json> <method-substring> | jimple-clocked <json> <method-substring> | jimple-calls <json> <method-substring> <callee-substring> | jimple-calls-runtime <json> <method-substring> <callee-substring> <runtime-type> | jimple-bind-schedule <json> <method-substring> <runtime-type-or--> <binding-json> | jimple-bind-uniform-int <json> <method-substring> <runtime-type-or--> <binding-json> | jimple-bind-indexed-store <json> <method-substring> <runtime-type-or--> <bindings-json> | jimple-bind-rollbacks <json> <method-substring> <runtime-type-or--> <store-bindings-json> <clone-bindings-json> | jimple-transaction-coverage <json> <method-substring> <runtime-type-or--> <bindings-json>"
         ),
     }
 }
@@ -148,8 +138,7 @@ fn print_jimple_transaction_coverage(
     path: &str,
     method_filter: &str,
     runtime_type: &str,
-    store_bindings_path: &str,
-    clone_bindings_path: &str,
+    bindings_path: &str,
 ) -> Result<()> {
     let json = fs::read_to_string(path).with_context(|| format!("failed to read {path}"))?;
     let methods = parse_methods(&json)?;
@@ -167,14 +156,10 @@ fn print_jimple_transaction_coverage(
         );
     };
     let entry = method.signature.clone();
-    let store_json = fs::read_to_string(store_bindings_path)
-        .with_context(|| format!("failed to read {store_bindings_path}"))?;
-    let store_bindings: Vec<JimpleIndexedStoreBinding> = serde_json::from_str(&store_json)
-        .with_context(|| format!("failed to parse {store_bindings_path}"))?;
-    let clone_json = fs::read_to_string(clone_bindings_path)
-        .with_context(|| format!("failed to read {clone_bindings_path}"))?;
-    let clone_bindings: Vec<JimpleSnapshotCloneBinding> = serde_json::from_str(&clone_json)
-        .with_context(|| format!("failed to parse {clone_bindings_path}"))?;
+    let bindings_json = fs::read_to_string(bindings_path)
+        .with_context(|| format!("failed to read {bindings_path}"))?;
+    let bindings: JimpleTransactionBindings = serde_json::from_str(&bindings_json)
+        .with_context(|| format!("failed to parse {bindings_path}"))?;
     let program = JimpleProgram::new(methods);
     let summary = if runtime_type == "-" {
         program.structural_effects(&entry)?
@@ -183,9 +168,7 @@ fn print_jimple_transaction_coverage(
     };
     println!(
         "{}",
-        serde_json::to_string_pretty(
-            &summary.indexed_store_transaction_coverage(&store_bindings, &clone_bindings)?
-        )?
+        serde_json::to_string_pretty(&summary.indexed_store_transaction_coverage(&bindings)?)?
     );
     Ok(())
 }
@@ -483,7 +466,7 @@ fn print_jimple_loops(path: &str, method_filter: &str) -> Result<()> {
     };
     println!(
         "{}",
-        serde_json::to_string_pretty(&method.fixed_trip_loops())?
+        serde_json::to_string_pretty(&method.induction_loops())?
     );
     Ok(())
 }
