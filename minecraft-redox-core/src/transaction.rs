@@ -6,6 +6,16 @@
 
 use serde::{Deserialize, Serialize};
 
+mod memory;
+mod runtime;
+pub use memory::{
+    MemoryTransactionHost, MemoryTransactionObject, MemoryTransactionState, MemoryTransactionStore,
+};
+pub use runtime::{
+    TransactionDatum, TransactionDraft, TransactionExecution, TransactionExecutionError,
+    TransactionExecutionLimits, TransactionHost, execute_transaction,
+};
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct TransactionFunctionId(pub u32);
 

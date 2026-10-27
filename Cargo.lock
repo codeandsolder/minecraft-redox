@@ -115,6 +115,7 @@ name = "minecraft-redox"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "minecraft-redox-core",
  "minecraft-redox-gtnh",
  "minecraft-redox-java",
  "rayon",

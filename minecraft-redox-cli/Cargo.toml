@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+minecraft-redox-core = { path = "../minecraft-redox-core" }
 minecraft-redox-gtnh = { path = "../minecraft-redox-gtnh" }
 minecraft-redox-java = { path = "../minecraft-redox-java" }
 serde.workspace = true

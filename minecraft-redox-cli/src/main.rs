@@ -5,6 +5,10 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use minecraft_redox_core::transaction::{
+    MemoryTransactionHost, TransactionDatum, TransactionExecution, TransactionExecutionLimits,
+    TransactionProgram, execute_transaction,
+};
 use minecraft_redox_gtnh::{GtnhSummary, lower_recipe_with_project, recover_with_project};
 use minecraft_redox_java::{
     JavaProjectIndex, analyze_source, inventory_source,
@@ -29,6 +33,19 @@ struct JimpleCallRequest {
 struct JimpleCallResult {
     return_value: Option<AbstractValue>,
     execution: ProgramExecution,
+}
+
+#[derive(Deserialize)]
+struct MemoryTransactionRequest {
+    receiver: Option<TransactionDatum>,
+    #[serde(default)]
+    arguments: Vec<TransactionDatum>,
+}
+
+#[derive(Serialize)]
+struct MemoryTransactionResult {
+    execution: TransactionExecution,
+    host: MemoryTransactionHost,
 }
 
 #[derive(Serialize)]
@@ -130,11 +147,42 @@ fn main() -> Result<()> {
         [_, command, path, method, bindings] if command == "jimple-lower-transaction" => {
             print_jimple_transaction_program(path, method, bindings)
         }
+        [_, command, program, host, request] if command == "transaction-run-memory" => {
+            run_memory_transaction(program, host, request)
+        }
         [_, command, path, request] if command == "jimple-call" => print_jimple_call(path, request),
         _ => bail!(
-            "usage: minecraft-redox [inventory|chains] <java-file> | gtnh [--summary|--blockers] <file-or-dir> | jimple-slice <json> <method-substring> <sink-substring> | jimple-execute-array <json> <method-substring> <field-owner> <field-name> | jimple-program <json> <owner::method,...> | jimple-program-call <json> <owner::method,...> <request-json> | jimple-call <json> <request-json> | jimple-temporal <json> | jimple-loops <json> <method-substring> | jimple-local-counters <json> <method-substring> | jimple-effects <json> <method-substring> | jimple-clocked <json> <method-substring> | jimple-calls <json> <method-substring> <callee-substring> | jimple-calls-runtime <json> <method-substring> <callee-substring> <runtime-type> | jimple-bind-schedule <json> <method-substring> <runtime-type-or--> <binding-json> | jimple-bind-uniform-int <json> <method-substring> <runtime-type-or--> <binding-json> | jimple-bind-indexed-store <json> <method-substring> <runtime-type-or--> <bindings-json> | jimple-bind-rollbacks <json> <method-substring> <runtime-type-or--> <store-bindings-json> <clone-bindings-json> | jimple-transaction-coverage <json> <method-substring> <runtime-type-or--> <bindings-json> | jimple-lower-transaction <json> <method-substring> <bindings-json>"
+            "usage: minecraft-redox [inventory|chains] <java-file> | gtnh [--summary|--blockers] <file-or-dir> | jimple-slice <json> <method-substring> <sink-substring> | jimple-execute-array <json> <method-substring> <field-owner> <field-name> | jimple-program <json> <owner::method,...> | jimple-program-call <json> <owner::method,...> <request-json> | jimple-call <json> <request-json> | jimple-temporal <json> | jimple-loops <json> <method-substring> | jimple-local-counters <json> <method-substring> | jimple-effects <json> <method-substring> | jimple-clocked <json> <method-substring> | jimple-calls <json> <method-substring> <callee-substring> | jimple-calls-runtime <json> <method-substring> <callee-substring> <runtime-type> | jimple-bind-schedule <json> <method-substring> <runtime-type-or--> <binding-json> | jimple-bind-uniform-int <json> <method-substring> <runtime-type-or--> <binding-json> | jimple-bind-indexed-store <json> <method-substring> <runtime-type-or--> <bindings-json> | jimple-bind-rollbacks <json> <method-substring> <runtime-type-or--> <store-bindings-json> <clone-bindings-json> | jimple-transaction-coverage <json> <method-substring> <runtime-type-or--> <bindings-json> | jimple-lower-transaction <json> <method-substring> <bindings-json> | transaction-run-memory <program-json> <host-json> <request-json>"
         ),
     }
+}
+
+fn run_memory_transaction(program_path: &str, host_path: &str, request_path: &str) -> Result<()> {
+    let program_json = fs::read_to_string(program_path)
+        .with_context(|| format!("failed to read {program_path}"))?;
+    let program: TransactionProgram = serde_json::from_str(&program_json)
+        .with_context(|| format!("failed to parse {program_path}"))?;
+    let host_json =
+        fs::read_to_string(host_path).with_context(|| format!("failed to read {host_path}"))?;
+    let mut host: MemoryTransactionHost =
+        serde_json::from_str(&host_json).with_context(|| format!("failed to parse {host_path}"))?;
+    let request_json = fs::read_to_string(request_path)
+        .with_context(|| format!("failed to read {request_path}"))?;
+    let request: MemoryTransactionRequest = serde_json::from_str(&request_json)
+        .with_context(|| format!("failed to parse {request_path}"))?;
+    let execution = execute_transaction(
+        &program,
+        &mut host,
+        request.receiver,
+        request.arguments,
+        TransactionExecutionLimits::default(),
+    )
+    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&MemoryTransactionResult { execution, host })?
+    );
+    Ok(())
 }
 
 fn print_jimple_transaction_program(
