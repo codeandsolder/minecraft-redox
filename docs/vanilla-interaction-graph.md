@@ -149,6 +149,22 @@ The resulting source-backed semantic object is therefore a per-owner ordered eve
 
 Quiescence now mirrors that contract with graph-owned lazy event windows. A reaction can query the current keyed count and record a new event in the same transition as ordinary state writes. Window expiry is observational rather than scheduled: old records simply stop counting when queried and are physically pruned on later records. The torch-shaped runtime example reaches `toggle_count=8`, sets `burned_out=1`, has no pending expiry event, and later observes the count decay to zero solely because simulated time advanced.
 
+## Indexed resource transaction surface
+
+Hopper pull/extraction exposes why graph-visible field-by-field mutation would be the wrong abstraction. Vanilla speculatively removes one item from a source inventory, passes that mutable value through nested insertion logic, and restores the original source slot if insertion is incomplete. Intermediate `ItemStack.stackSize` mutations are implementation detail, not committed world state.
+
+The structural bridge is therefore source-API driven and domain-neutral:
+
+- `JimpleIndexedStoreBinding` maps source calls onto generic indexed-store operations (`read`, `take`, `write`, `touch`) by declaratively selecting the store operand, key operands, optional value, and optional amount. The analyzer contains no `IInventory` or `ItemStack` names.
+- Applied to real `TileEntityHopper.func_145892_a`, the vanilla descriptor yields **12** operations: 3 reads, 1 take, 3 writes, and 5 touches. Symbolic participants separate cleanly into source inventory parameter 1 and destination hopper/store parameter 0.
+- `JimpleSnapshotCloneBinding` describes source value-clone APIs. A conservative rollback detector requires the take and restore to target the exact same symbolic store/key in the same method scope, the restore to occur later and include every take guard, and the restore value to be a configured clone of a configured pre-take read from that exact location.
+- On the real helper this produces exactly **one** speculative rollback: source parameter 1, slot parameter 2, amount literal `1`, take statement 9, restore statement 16, with the restore value mechanically proven as `copy(read(source, slot))`. The restore path has a strict guard superset (2 guards on take, 4 on restore).
+- Synthetic regression coverage rejects a restore to the wrong key and a restore missing the take guard.
+
+`indexed_store_transaction_coverage()` keeps the next step fail-closed. For this real helper the current report is `complete=false`: the bound store surface and rollback are accounted for, but 4 direct `ItemStack.stackSize` field writes and 25 non-expanded/unbound calls remain. The largest groups are stack item/meta/max-size queries, sided-inventory admission/extraction policy, inventory size/capacity, `Math.min`, stack cloning, and one destination-cooldown edge. These are now an explicit semantic backlog rather than hidden inside an allegedly atomic transaction.
+
+The intended native lowering remains coarse: execute bound value/store semantics against immutable or transactional canonical snapshots, then publish only committed resource snapshots plus success/cooldown at the graph boundary. The graph should never observe the speculative mutable `ItemStack` implementation sequence.
+
 ## Missing pieces exposed by vanilla
 
 The current graph runtime proves the scheduling model but intentionally still has prototype numeric state. Exact Minecraft lowering needs:
