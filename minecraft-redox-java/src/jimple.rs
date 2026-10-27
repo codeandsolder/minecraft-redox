@@ -10,11 +10,12 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 mod program;
+mod transaction;
 pub use program::{
     AbstractMapEntry, AbstractMapSnapshot, AbstractOpaqueCallShape, AbstractStaticFieldValue,
-    JimpleCallOperandBinding, JimpleClockedStateCandidate, JimpleEffectCallFrame,
-    JimpleEffectGuard, JimpleIndexedStoreBinding, JimpleIndexedStoreOperation,
-    JimpleIndexedStoreOperationKind, JimpleIndexedStoreQueryBinding,
+    JimpleCallOperandBinding, JimpleCapabilityBinding, JimpleClockedStateCandidate,
+    JimpleEffectCallFrame, JimpleEffectGuard, JimpleIndexedStoreBinding,
+    JimpleIndexedStoreOperation, JimpleIndexedStoreOperationKind, JimpleIndexedStoreQueryBinding,
     JimpleIndexedStoreQueryCandidate, JimpleIndexedStoreQueryKind,
     JimpleIndexedStoreTransactionCoverage, JimpleIndexedStoreValueOrigin,
     JimpleObjectStateWriteBinding, JimpleObjectStateWriteCandidate, JimpleProgram,
@@ -134,6 +135,10 @@ pub enum JimpleValueKind {
     Cast {
         cast_type: String,
         value: Box<JimpleValue>,
+    },
+    InstanceOf {
+        value: Box<JimpleValue>,
+        check_type: String,
     },
     Unary {
         operator: String,
@@ -267,6 +272,10 @@ pub enum SymbolicValue {
     Cast {
         type_name: String,
         value: Box<SymbolicValue>,
+    },
+    InstanceOf {
+        value: Box<SymbolicValue>,
+        check_type: String,
     },
     Unary {
         operator: String,
@@ -1009,6 +1018,15 @@ impl JimpleMethod {
                     allow_piecewise,
                 )),
             },
+            JimpleValueKind::InstanceOf { value, check_type } => SymbolicValue::InstanceOf {
+                value: Box::new(self.resolve_locals_impl(
+                    before_id,
+                    value,
+                    visiting,
+                    allow_piecewise,
+                )),
+                check_type: check_type.clone(),
+            },
             JimpleValueKind::Unary { operator, value } => SymbolicValue::Unary {
                 operator: operator.clone(),
                 value: Box::new(self.resolve_locals_impl(
@@ -1085,6 +1103,7 @@ impl JimpleMethod {
             | JimpleValueKind::InstanceField { .. }
             | JimpleValueKind::Binary { .. }
             | JimpleValueKind::Cast { .. }
+            | JimpleValueKind::InstanceOf { .. }
             | JimpleValueKind::Unary { .. }
             | JimpleValueKind::ArrayLength { .. } => {
                 unreachable!("composite value handled earlier")
@@ -1613,6 +1632,10 @@ impl JimpleMethod {
                 type_name: cast_type.clone(),
                 value: Box::new(self.resolve_value(before_id, value, visiting)),
             },
+            JimpleValueKind::InstanceOf { value, check_type } => SymbolicValue::InstanceOf {
+                value: Box::new(self.resolve_value(before_id, value, visiting)),
+                check_type: check_type.clone(),
+            },
             JimpleValueKind::Unary { operator, value } => SymbolicValue::Unary {
                 operator: operator.clone(),
                 value: Box::new(self.resolve_value(before_id, value, visiting)),
@@ -2050,6 +2073,18 @@ fn normalize_piecewise_arms(arms: &mut Vec<SymbolicPiecewiseArm>) {
     }
 }
 
+fn substitute_local_instance_of(
+    value: &SymbolicValue,
+    check_type: &str,
+    local_name: &str,
+    replacement: Option<&SymbolicValue>,
+) -> SymbolicValue {
+    SymbolicValue::InstanceOf {
+        value: Box::new(substitute_local_symbolic(value, local_name, replacement)),
+        check_type: check_type.to_owned(),
+    }
+}
+
 fn substitute_local_symbolic(
     value: &SymbolicValue,
     local_name: &str,
@@ -2082,6 +2117,9 @@ fn substitute_local_symbolic(
             type_name: type_name.clone(),
             value: Box::new(substitute_local_symbolic(value, local_name, replacement)),
         },
+        SymbolicValue::InstanceOf { value, check_type } => {
+            substitute_local_instance_of(value, check_type, local_name, replacement)
+        }
         SymbolicValue::Unary { operator, value } => SymbolicValue::Unary {
             operator: operator.clone(),
             value: Box::new(substitute_local_symbolic(value, local_name, replacement)),
@@ -2185,6 +2223,10 @@ pub(super) fn substitute_symbolic(
         SymbolicValue::Cast { type_name, value } => SymbolicValue::Cast {
             type_name: type_name.clone(),
             value: Box::new(substitute_symbolic(value, this_value, arguments)),
+        },
+        SymbolicValue::InstanceOf { value, check_type } => SymbolicValue::InstanceOf {
+            value: Box::new(substitute_symbolic(value, this_value, arguments)),
+            check_type: check_type.clone(),
         },
         SymbolicValue::Unary { operator, value } => SymbolicValue::Unary {
             operator: operator.clone(),
@@ -2318,6 +2360,7 @@ fn value_children(value: &JimpleValue) -> Vec<&JimpleValue> {
         }
         JimpleValueKind::InstanceField { base, .. }
         | JimpleValueKind::Cast { value: base, .. }
+        | JimpleValueKind::InstanceOf { value: base, .. }
         | JimpleValueKind::Unary { value: base, .. }
         | JimpleValueKind::ArrayLength { value: base }
         | JimpleValueKind::NewArray { size: base, .. } => children.push(base.as_ref()),
@@ -2770,6 +2813,10 @@ impl ExecutionState {
                 let value = self.evaluate(value);
                 abstract_cast(cast_type, value)
             }
+            JimpleValueKind::InstanceOf { .. } => AbstractValue::Unknown {
+                type_name: String::from("boolean"),
+                text: value.text.clone(),
+            },
             JimpleValueKind::Unary {
                 operator,
                 value: operand,

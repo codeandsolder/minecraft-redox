@@ -127,11 +127,47 @@ fn main() -> Result<()> {
         {
             print_jimple_transaction_coverage(path, method, runtime_type, bindings)
         }
+        [_, command, path, method, bindings] if command == "jimple-lower-transaction" => {
+            print_jimple_transaction_program(path, method, bindings)
+        }
         [_, command, path, request] if command == "jimple-call" => print_jimple_call(path, request),
         _ => bail!(
-            "usage: minecraft-redox [inventory|chains] <java-file> | gtnh [--summary|--blockers] <file-or-dir> | jimple-slice <json> <method-substring> <sink-substring> | jimple-execute-array <json> <method-substring> <field-owner> <field-name> | jimple-program <json> <owner::method,...> | jimple-program-call <json> <owner::method,...> <request-json> | jimple-call <json> <request-json> | jimple-temporal <json> | jimple-loops <json> <method-substring> | jimple-local-counters <json> <method-substring> | jimple-effects <json> <method-substring> | jimple-clocked <json> <method-substring> | jimple-calls <json> <method-substring> <callee-substring> | jimple-calls-runtime <json> <method-substring> <callee-substring> <runtime-type> | jimple-bind-schedule <json> <method-substring> <runtime-type-or--> <binding-json> | jimple-bind-uniform-int <json> <method-substring> <runtime-type-or--> <binding-json> | jimple-bind-indexed-store <json> <method-substring> <runtime-type-or--> <bindings-json> | jimple-bind-rollbacks <json> <method-substring> <runtime-type-or--> <store-bindings-json> <clone-bindings-json> | jimple-transaction-coverage <json> <method-substring> <runtime-type-or--> <bindings-json>"
+            "usage: minecraft-redox [inventory|chains] <java-file> | gtnh [--summary|--blockers] <file-or-dir> | jimple-slice <json> <method-substring> <sink-substring> | jimple-execute-array <json> <method-substring> <field-owner> <field-name> | jimple-program <json> <owner::method,...> | jimple-program-call <json> <owner::method,...> <request-json> | jimple-call <json> <request-json> | jimple-temporal <json> | jimple-loops <json> <method-substring> | jimple-local-counters <json> <method-substring> | jimple-effects <json> <method-substring> | jimple-clocked <json> <method-substring> | jimple-calls <json> <method-substring> <callee-substring> | jimple-calls-runtime <json> <method-substring> <callee-substring> <runtime-type> | jimple-bind-schedule <json> <method-substring> <runtime-type-or--> <binding-json> | jimple-bind-uniform-int <json> <method-substring> <runtime-type-or--> <binding-json> | jimple-bind-indexed-store <json> <method-substring> <runtime-type-or--> <bindings-json> | jimple-bind-rollbacks <json> <method-substring> <runtime-type-or--> <store-bindings-json> <clone-bindings-json> | jimple-transaction-coverage <json> <method-substring> <runtime-type-or--> <bindings-json> | jimple-lower-transaction <json> <method-substring> <bindings-json>"
         ),
     }
+}
+
+fn print_jimple_transaction_program(
+    path: &str,
+    method_filter: &str,
+    bindings_path: &str,
+) -> Result<()> {
+    let json = fs::read_to_string(path).with_context(|| format!("failed to read {path}"))?;
+    let methods = parse_methods(&json)?;
+    let matching: Vec<_> = methods
+        .iter()
+        .filter(|method| {
+            method.signature.name == method_filter
+                || method.display_signature.contains(method_filter)
+        })
+        .collect();
+    let [method] = matching.as_slice() else {
+        bail!(
+            "method filter {method_filter:?} matched {} methods; expected exactly one",
+            matching.len()
+        );
+    };
+    let entry = method.signature.clone();
+    let bindings_json = fs::read_to_string(bindings_path)
+        .with_context(|| format!("failed to read {bindings_path}"))?;
+    let bindings: JimpleTransactionBindings = serde_json::from_str(&bindings_json)
+        .with_context(|| format!("failed to parse {bindings_path}"))?;
+    let program = JimpleProgram::new(methods);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&program.lower_transaction_program(&entry, &bindings)?)?
+    );
+    Ok(())
 }
 
 fn print_jimple_transaction_coverage(

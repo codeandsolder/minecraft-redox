@@ -169,13 +169,17 @@ The four raw `ItemStack.stackSize` writes are bound as updates to an immutable `
 
 That control flow is now recovered as well. `JimpleMethod::induction_loops()` generalizes the earlier fixed-trip loop analysis to constant initialization/step with a symbolic bound; `fixed_trip_loops()` is the strict constant-bound subset. It also handles compiler layouts where a loop backedge lands on a straight-line bound-recompute block before the controlling `if`. On the real insertion helper this recovers both scans: the sided path is `i = 0; ++i` over `accessible_slots(side).length`, while the ordinary path is `i = 0; ++i` over `inventory.extent`. Interprocedural composition substitutes the root Hopper arguments and guards, and the transaction binder normalizes those bounds to `store_keys_length(store, side)` and `store_extent(store)`.
 
-The intended native lowering remains coarse: execute the bound branch/loop/value/store semantics against immutable or transactional canonical snapshots, then publish only committed resource snapshots plus success/cooldown at the graph boundary. The graph should never observe the speculative mutable `ItemStack` implementation sequence. The next frontier is therefore an executable control-flow-preserving transaction IR/codegen/native-store adapter, not more source-API archaeology.
+The control-flow lowering is now executable-shaped and source-neutral. The Jimple exporter preserves `instanceof` structurally; declarative capability bindings map source runtime types onto target capability IDs such as `sided_access` and `transfer_cooldown`. `minecraft-redox-core::transaction` defines a compact CFG of anonymous numeric function/statement/local IDs, generic arithmetic/control flow, semantic store/value/state operations, and capability tests. Exact in-program static/special helpers compile into anonymous transaction functions instead of being flattened or retaining source method identities.
+
+Applied to the real Hopper pull path, `jimple-lower-transaction` produces **6 anonymous functions / 132 CFG statements** while retaining the source branches, returns, speculative take/restore path, and both dynamic insertion scans. The serialized transaction program contains **zero** `net.minecraft`, SRG `func_*`/`field_*`, JVM invoke-kind, `ItemStack`, `IInventory`, `ISidedInventory`, or `TileEntityHopper` names. A synthetic regression separately requires an `instanceof` source type to become a semantic capability check and requires exact helper names/types to disappear from serialization.
+
+The intended native execution remains coarse: run this transaction CFG against staged immutable/transactional canonical snapshots, then publish only committed resource snapshots plus success/cooldown at the graph boundary. The graph must never observe speculative source-object mutation. The next frontier is therefore the native transaction executor/host and atomic publication path, not more source-API or control-flow archaeology.
 
 ## Missing pieces exposed by vanilla
 
 The current graph runtime proves the scheduling model but intentionally still has prototype numeric state. Exact Minecraft lowering needs:
 
-- a control-flow-preserving executable transaction IR/codegen path that consumes the now-complete store/value/query/state bindings and runs them against native immutable snapshots;
+- a native transaction executor/host for the recovered source-neutral CFG, with staged store/value/state mutation and atomic publication into graph-owned canonical handles;
 - adapter lowering from recovered source calls/effects into concrete world transactions, including block revalidation, chunk policy, and source-time conversion;
 - native store implementations for indexed resource reads/writes, policy queries, and atomic commit publication into graph-owned canonical handles;
 - source/runtime-type evidence for polymorphic world objects and modded subclasses wherever static bytecode alone cannot prove dispatch;

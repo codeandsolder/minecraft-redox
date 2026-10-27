@@ -27,6 +27,7 @@ import sootup.core.jimple.common.expr.AbstractInvokeExpr;
 import sootup.core.jimple.common.expr.AbstractUnopExpr;
 import sootup.core.jimple.common.expr.JCastExpr;
 import sootup.core.jimple.common.expr.JDynamicInvokeExpr;
+import sootup.core.jimple.common.expr.JInstanceOfExpr;
 import sootup.core.jimple.common.expr.JLengthExpr;
 import sootup.core.jimple.common.expr.JNegExpr;
 import sootup.core.jimple.common.expr.JNewArrayExpr;
@@ -236,6 +237,10 @@ public final class DumpJson {
             result.put("kind", "cast");
             result.put("cast_type", cast.getType().toString());
             result.put("value", value(cast.getOp()));
+        } else if (value instanceof JInstanceOfExpr instanceOf) {
+            result.put("kind", "instance_of");
+            result.put("value", value(instanceOf.getOp()));
+            result.put("check_type", instanceOf.getCheckType().toString());
         } else if (value instanceof JNegExpr negated) {
             result.put("kind", "unary");
             result.put("operator", "-");

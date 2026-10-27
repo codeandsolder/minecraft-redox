@@ -165,6 +165,12 @@ pub struct JimpleObjectStateWriteCandidate {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct JimpleCapabilityBinding {
+    pub source_type: String,
+    pub capability: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub struct JimpleValueComponentBinding {
     pub field: super::JimpleFieldSignature,
     pub component: String,
@@ -202,6 +208,8 @@ pub struct JimpleTransactionBindings {
     pub store_queries: Vec<JimpleIndexedStoreQueryBinding>,
     #[serde(default)]
     pub state_writes: Vec<JimpleObjectStateWriteBinding>,
+    #[serde(default)]
+    pub capabilities: Vec<JimpleCapabilityBinding>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -3860,6 +3868,7 @@ fn symbolic_references_field(
                 || symbolic_references_field(index, field, receiver)
         }
         SymbolicValue::Cast { value, .. }
+        | SymbolicValue::InstanceOf { value, .. }
         | SymbolicValue::Unary { value, .. }
         | SymbolicValue::ArrayLength { value }
         | SymbolicValue::NewArray { size: value, .. } => {
