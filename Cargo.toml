@@ -1,5 +1,5 @@
 [workspace]
-members = ["minecraft-redox-core", "minecraft-redox-java", "minecraft-redox-gtnh", "minecraft-redox-cli"]
+members = ["minecraft-redox-core", "minecraft-redox-java", "minecraft-redox-gtnh", "minecraft-redox-cli", "minecraft-redox-quiescence"]
 resolver = "3"
 
 [workspace.package]

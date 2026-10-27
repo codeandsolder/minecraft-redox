@@ -1,0 +1,19 @@
+[package]
+name = "minecraft-redox-quiescence"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+minecraft-redox-core = { path = "../minecraft-redox-core" }
+quiescence-core = { git = "https://github.com/codeandsolder/quiescence.git", rev = "c18760d" }
+quiescence-runtime = { git = "https://github.com/codeandsolder/quiescence.git", rev = "c18760d" }
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

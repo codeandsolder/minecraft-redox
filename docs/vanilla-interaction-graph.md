@@ -177,15 +177,21 @@ The native execution boundary now exists as well. `TransactionHost::begin()` cre
 
 A serializable source-neutral `MemoryTransactionHost` provides a differential/reference implementation with component-map objects, indexed stores, capabilities, semantic equality tags, state writes, and configurable quantity semantics. The generic `transaction-run-memory` CLI has no Jimple/source dependency once it receives a `TransactionProgram`. Running the real 6-function/132-statement Hopper program against this host now gives two end-to-end acceptance cases: with five source items and an empty destination it returns `1` after **76** CFG statements, leaves source quantity `4`, publishes destination quantity `1`, touches both stores, and writes cooldown `8`; with every destination slot full/incompatible it returns `0` after **229** CFG statements, leaves the destination unchanged, performs no cooldown/touch effects, and restores the source to quantity `5` using the independent pre-take snapshot rather than the speculatively decremented object.
 
-The graph must still never observe the draft arena. The next frontier is therefore the adapter that takes graph-owned canonical store handles, runs one transaction draft, interns the committed snapshots, and atomically publishes only those new handles/state facts back through a Quiescence reaction.
+The graph publication boundary is now implemented in the separate `minecraft-redox-quiescence` adapter crate, pinned to `quiescence@c18760d` so Quiescence itself remains domain-agnostic. Graph atom IDs name immutable canonical store snapshots. The adapter materializes only transaction-local handles inside a private draft, runs the source-neutral program, re-canonicalizes committed stores, interns them, and returns ordinary `StateWrite::atom` updates. A surrounding reaction can still check its deadline before calling the adapter, so store atoms are not read—and therefore do not become dependencies—during cooldown.
+
+The canonical snapshot interner uses a structural ordered key rather than a linear historical scan. Canonical components reject ephemeral transaction handles at the boundary; floating-point components, if present, use exact IEEE bit identity. Re-interning an unchanged take→restore store therefore returns the original atom ID and emits no graph write. Regression tests prove both that unchanged canonical stores are elided and that store dependencies appear only after the deadline-gated transaction actually runs.
+
+The real 6-function/132-statement Hopper pull program now crosses the complete path into Quiescence. Starting with source quantity `5`, an empty five-slot destination, and `ready_at=400 ms`, the recovered reaction reaches the causal boundary, executes the source-derived transaction, interns source quantity `4` and destination quantity `1` snapshots, and publishes those two atom handles plus exact next deadline `800 ms` in one reaction transition. No transaction-local object handle escapes into canonical state.
+
+The next hard frontier is therefore **resource discovery/topology**, not transaction execution or publication. The current acceptance feeds the pull helper its source/destination stores explicitly. Vanilla's outer Hopper logic discovers neighboring inventories/world objects and chooses push/pull paths. Those world/topology queries should become typed semantic bindings that resolve to graph-owned topology/resource handles while preserving the same dynamic-dependency discipline.
 
 ## Missing pieces exposed by vanilla
 
 The current graph runtime proves the scheduling model but intentionally still has prototype numeric state. Exact Minecraft lowering needs:
 
-- an adapter from the now-executable transaction drafts to graph-owned canonical store handles, including interning/persistent snapshot publication as one atomic reaction transition;
-- adapter lowering from recovered source calls/effects into concrete world transactions, including block revalidation, chunk policy, and source-time conversion;
-- native store implementations for indexed resource reads/writes, policy queries, and atomic commit publication into graph-owned canonical handles;
+- semantic world/topology query bindings for resource discovery (neighbor stores, sided access, block/object identity) so outer machine orchestration can feed transactions without hand-wired store arguments;
+- adapter lowering for block/chunk revalidation, chunk policy, and source-time conversion around already-bound transaction/scheduler primitives;
+- production persistent/native store implementations behind the source-neutral transaction host interface; the current memory host is a reference/differential implementation;
 - source/runtime-type evidence for polymorphic world objects and modded subclasses wherever static bytecode alone cannot prove dispatch;
 - preservation of source RNG state/order in dense adapters while bound random draws and emitted callbacks cross the semantic IR boundary.
 
