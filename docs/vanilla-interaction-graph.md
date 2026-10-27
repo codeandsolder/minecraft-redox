@@ -103,6 +103,27 @@ The three vanilla samples expose why that distinction matters:
 
 Activation cadence remains external semantic evidence. Once a caller knows that one entry activation is 50 ms, Hopper's recovered `-1`, readiness-at-`<=0`, and successful reset-to-`8` can be represented as a 400 ms absolute deadline. Without that cadence evidence the IR remains per-activation rather than inventing time.
 
+
+## Scheduled callback evidence
+
+The repeater/torch family is deliberately different from the polling-counter cases. The recovered block code already calls the legacy world scheduler, so the target should preserve that callback contract rather than inventing a deadline field on the block.
+
+Inspection of the patched vanilla 1.7.10 `WorldServer` / `NextTickListEntry` sources gives the exact queue semantics:
+
+- pending identity is `(x, y, z, block)`; scheduled time and priority are **not** part of equality;
+- if that key is already pending, a second scheduling request is ignored rather than replacing or moving it;
+- ordering is scheduled time, then lower numeric priority, then insertion ID;
+- `BlockRedstoneDiode.updateTick` makes a guarded `scheduleBlockUpdateWithPriority(...)` call with priority `-1`; its delay remains a symbolic call of current metadata/state and can be lowered separately;
+- the world removes an entry from the pending set before invoking the callback, so the callback can schedule the same key again;
+- callback execution revalidates that the expected block still occupies the position;
+- unloaded positions are rescheduled, and vanilla drains at most 1000 pending block ticks per world tick.
+
+The Jimple effect IR now preserves **all** composed calls as first-class call sites with substituted guards/receiver/arguments and a resolution status (`expanded`, `missing_method`, `dynamic_dispatch`, or `recursive_cycle`). `jimple-calls` can filter this surface without parsing a giant effect dump. The diode scheduler appears as exactly one `dynamic_dispatch` boundary on `World`, with four guards, priority `-1`, and its delay expression intact. Refusing to guess `WorldServer` dispatch is useful here because the call is exactly where a source-API → engine-primitive binding belongs.
+
+The remaining diode delay is also correctly polymorphic rather than merely unsimplified: base `BlockRedstoneDiode.func_149899_k(meta)` delegates to abstract `func_149901_b(meta)`. `BlockRedstoneRepeater` implements metadata-dependent `repeaterState[(meta & 12) >> 2] * 2`, while `BlockRedstoneComparator` returns constant `2`. A later concrete-type binding can specialize this; the abstract diode analysis must not.
+
+Quiescence now has the corresponding domain-neutral primitive: keyed schedule-once reaction reevaluations survive ordinary dependency invalidation, preserve the first accepted deadline for duplicate keys, and order same-time callbacks by priority then insertion sequence. Minecraft-specific key construction, block revalidation, chunk policy, and the legacy 1000-per-world-tick budget remain adapter policy rather than generic graph semantics.
+
 ## Missing pieces exposed by vanilla
 
 The current graph runtime proves the scheduling model but intentionally still has prototype numeric state. Exact Minecraft lowering needs:

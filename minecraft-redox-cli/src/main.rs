@@ -82,11 +82,48 @@ fn main() -> Result<()> {
         [_, command, path, method] if command == "jimple-clocked" => {
             print_jimple_clocked(path, method)
         }
+        [_, command, path, method, callee] if command == "jimple-calls" => {
+            print_jimple_calls(path, method, callee)
+        }
         [_, command, path, request] if command == "jimple-call" => print_jimple_call(path, request),
         _ => bail!(
-            "usage: minecraft-redox [inventory|chains] <java-file> | gtnh [--summary|--blockers] <file-or-dir> | jimple-slice <json> <method-substring> <sink-substring> | jimple-execute-array <json> <method-substring> <field-owner> <field-name> | jimple-program <json> <owner::method,...> | jimple-program-call <json> <owner::method,...> <request-json> | jimple-call <json> <request-json> | jimple-temporal <json> | jimple-effects <json> <method-substring> | jimple-clocked <json> <method-substring>"
+            "usage: minecraft-redox [inventory|chains] <java-file> | gtnh [--summary|--blockers] <file-or-dir> | jimple-slice <json> <method-substring> <sink-substring> | jimple-execute-array <json> <method-substring> <field-owner> <field-name> | jimple-program <json> <owner::method,...> | jimple-program-call <json> <owner::method,...> <request-json> | jimple-call <json> <request-json> | jimple-temporal <json> | jimple-effects <json> <method-substring> | jimple-clocked <json> <method-substring> | jimple-calls <json> <method-substring> <callee-substring>"
         ),
     }
+}
+
+fn print_jimple_calls(path: &str, method_filter: &str, callee_filter: &str) -> Result<()> {
+    let json = fs::read_to_string(path).with_context(|| format!("failed to read {path}"))?;
+    let methods = parse_methods(&json)?;
+    let matching: Vec<_> = methods
+        .iter()
+        .filter(|method| {
+            method.signature.name == method_filter
+                || method.display_signature.contains(method_filter)
+        })
+        .collect();
+    let [method] = matching.as_slice() else {
+        bail!(
+            "method filter {method_filter:?} matched {} methods; expected exactly one",
+            matching.len()
+        );
+    };
+    let entry = method.signature.clone();
+    let summary = JimpleProgram::new(methods).structural_effects(&entry)?;
+    let calls: Vec<_> = summary
+        .calls
+        .into_iter()
+        .filter(|call| {
+            call.call_path.last().is_some_and(|frame| {
+                frame.callee.name.contains(callee_filter)
+                    || frame.callee.owner.contains(callee_filter)
+                    || format!("{}::{}", frame.callee.owner, frame.callee.name)
+                        .contains(callee_filter)
+            })
+        })
+        .collect();
+    println!("{}", serde_json::to_string_pretty(&calls)?);
+    Ok(())
 }
 
 fn print_jimple_clocked(path: &str, method_filter: &str) -> Result<()> {

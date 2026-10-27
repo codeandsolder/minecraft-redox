@@ -13,8 +13,9 @@ mod program;
 pub use program::{
     AbstractMapEntry, AbstractMapSnapshot, AbstractOpaqueCallShape, AbstractStaticFieldValue,
     JimpleClockedStateCandidate, JimpleEffectCallFrame, JimpleEffectGuard, JimpleProgram,
-    JimpleProgramEffectSummary, JimpleProgramFieldWrite, JimpleUnresolvedEffectCall,
-    JimpleUnresolvedEffectReason, ProgramExecution,
+    JimpleProgramCall, JimpleProgramCallResolution, JimpleProgramEffectSummary,
+    JimpleProgramFieldWrite, JimpleUnresolvedEffectCall, JimpleUnresolvedEffectReason,
+    ProgramExecution,
 };
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]

@@ -56,6 +56,24 @@ pub enum JimpleUnresolvedEffectReason {
     RecursiveCycle,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JimpleProgramCallResolution {
+    Expanded,
+    MissingMethod,
+    DynamicDispatch,
+    RecursiveCycle,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct JimpleProgramCall {
+    pub call_path: Vec<JimpleEffectCallFrame>,
+    pub guards: Vec<JimpleEffectGuard>,
+    pub receiver: Option<SymbolicValue>,
+    pub arguments: Vec<SymbolicValue>,
+    pub resolution: JimpleProgramCallResolution,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct JimpleUnresolvedEffectCall {
     pub call_path: Vec<JimpleEffectCallFrame>,
@@ -69,6 +87,7 @@ pub struct JimpleUnresolvedEffectCall {
 pub struct JimpleProgramEffectSummary {
     pub entry: JimpleMethodSignature,
     pub possible_field_writes: Vec<JimpleProgramFieldWrite>,
+    pub calls: Vec<JimpleProgramCall>,
     pub unresolved_calls: Vec<JimpleUnresolvedEffectCall>,
 }
 
@@ -198,6 +217,7 @@ impl JimpleProgram {
         let mut summary = JimpleProgramEffectSummary {
             entry: entry.clone(),
             possible_field_writes: Vec::new(),
+            calls: Vec::new(),
             unresolved_calls: Vec::new(),
         };
         let mut active = vec![entry.clone()];
@@ -340,6 +360,59 @@ impl JimpleProgram {
         }
     }
 
+    fn record_program_call(
+        summary: &mut JimpleProgramEffectSummary,
+        call_path: &[JimpleEffectCallFrame],
+        guards: &[JimpleEffectGuard],
+        receiver: Option<&SymbolicValue>,
+        arguments: &[SymbolicValue],
+        resolution: JimpleProgramCallResolution,
+    ) {
+        summary.calls.push(JimpleProgramCall {
+            call_path: call_path.to_vec(),
+            guards: guards.to_vec(),
+            receiver: receiver.cloned(),
+            arguments: arguments.to_vec(),
+            resolution,
+        });
+    }
+
+    fn record_unresolved_call(
+        summary: &mut JimpleProgramEffectSummary,
+        call_path: Vec<JimpleEffectCallFrame>,
+        guards: Vec<JimpleEffectGuard>,
+        receiver: Option<SymbolicValue>,
+        arguments: Vec<SymbolicValue>,
+        reason: JimpleUnresolvedEffectReason,
+    ) {
+        let resolution = match reason {
+            JimpleUnresolvedEffectReason::MissingMethod => {
+                JimpleProgramCallResolution::MissingMethod
+            }
+            JimpleUnresolvedEffectReason::DynamicDispatch => {
+                JimpleProgramCallResolution::DynamicDispatch
+            }
+            JimpleUnresolvedEffectReason::RecursiveCycle => {
+                JimpleProgramCallResolution::RecursiveCycle
+            }
+        };
+        Self::record_program_call(
+            summary,
+            &call_path,
+            &guards,
+            receiver.as_ref(),
+            &arguments,
+            resolution,
+        );
+        summary.unresolved_calls.push(JimpleUnresolvedEffectCall {
+            call_path,
+            guards,
+            receiver,
+            arguments,
+            reason,
+        });
+    }
+
     fn expand_structural_invocation(
         &self,
         current_method: &JimpleMethod,
@@ -375,13 +448,14 @@ impl JimpleProgram {
         next_path.push(frame);
 
         let Some(target_method) = self.method(&invocation.method) else {
-            summary.unresolved_calls.push(JimpleUnresolvedEffectCall {
-                call_path: next_path,
-                guards: invocation_guards,
+            Self::record_unresolved_call(
+                summary,
+                next_path,
+                invocation_guards,
                 receiver,
-                arguments: call_arguments,
-                reason: JimpleUnresolvedEffectReason::MissingMethod,
-            });
+                call_arguments,
+                JimpleUnresolvedEffectReason::MissingMethod,
+            );
             return;
         };
 
@@ -390,27 +464,37 @@ impl JimpleProgram {
             receiver.as_ref(),
             &invocation.method,
         ) {
-            summary.unresolved_calls.push(JimpleUnresolvedEffectCall {
-                call_path: next_path,
-                guards: invocation_guards,
+            Self::record_unresolved_call(
+                summary,
+                next_path,
+                invocation_guards,
                 receiver,
-                arguments: call_arguments,
-                reason: JimpleUnresolvedEffectReason::DynamicDispatch,
-            });
+                call_arguments,
+                JimpleUnresolvedEffectReason::DynamicDispatch,
+            );
             return;
         }
 
         if active.contains(&target_method.signature) {
-            summary.unresolved_calls.push(JimpleUnresolvedEffectCall {
-                call_path: next_path,
-                guards: invocation_guards,
+            Self::record_unresolved_call(
+                summary,
+                next_path,
+                invocation_guards,
                 receiver,
-                arguments: call_arguments,
-                reason: JimpleUnresolvedEffectReason::RecursiveCycle,
-            });
+                call_arguments,
+                JimpleUnresolvedEffectReason::RecursiveCycle,
+            );
             return;
         }
 
+        Self::record_program_call(
+            summary,
+            &next_path,
+            &invocation_guards,
+            receiver.as_ref(),
+            &call_arguments,
+            JimpleProgramCallResolution::Expanded,
+        );
         active.push(target_method.signature.clone());
         self.expand_structural_effects(
             target_method,
@@ -4071,6 +4155,13 @@ mod tests {
             .collect();
         assert_eq!(values, vec![(0, 1), (8, 2)]);
         assert_eq!(effects.unresolved_calls, Vec::new());
+        assert_eq!(effects.calls.len(), 3);
+        assert!(
+            effects
+                .calls
+                .iter()
+                .all(|call| call.resolution == JimpleProgramCallResolution::Expanded)
+        );
         assert!(
             effects
                 .possible_field_writes
@@ -4130,6 +4221,11 @@ mod tests {
         let entry = caller.signature.clone();
         let effects = JimpleProgram::new(vec![caller, base_method]).structural_effects(&entry)?;
         assert_eq!(effects.unresolved_calls.len(), 1);
+        assert_eq!(effects.calls.len(), 1);
+        assert_eq!(
+            effects.calls[0].resolution,
+            JimpleProgramCallResolution::DynamicDispatch
+        );
         assert_eq!(
             effects.unresolved_calls[0].reason,
             JimpleUnresolvedEffectReason::DynamicDispatch
