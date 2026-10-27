@@ -12,8 +12,9 @@ use serde::{Deserialize, Serialize};
 mod program;
 pub use program::{
     AbstractMapEntry, AbstractMapSnapshot, AbstractOpaqueCallShape, AbstractStaticFieldValue,
-    JimpleEffectCallFrame, JimpleProgram, JimpleProgramEffectSummary, JimpleProgramFieldWrite,
-    JimpleUnresolvedEffectCall, JimpleUnresolvedEffectReason, ProgramExecution,
+    JimpleEffectCallFrame, JimpleEffectGuard, JimpleProgram, JimpleProgramEffectSummary,
+    JimpleProgramFieldWrite, JimpleUnresolvedEffectCall, JimpleUnresolvedEffectReason,
+    ProgramExecution,
 };
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
@@ -288,8 +289,16 @@ pub struct SymbolicAssignment {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct JimpleGuard {
+    pub branch_statement_id: usize,
+    pub expected: bool,
+    pub condition: SymbolicValue,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct JimpleFieldWrite {
     pub statement_id: usize,
+    pub guards: Vec<JimpleGuard>,
     pub field: JimpleFieldSignature,
     pub receiver: Option<SymbolicValue>,
     pub value: SymbolicValue,
@@ -298,6 +307,7 @@ pub struct JimpleFieldWrite {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct JimpleInvocation {
     pub statement_id: usize,
+    pub guards: Vec<JimpleGuard>,
     pub invoke_kind: String,
     pub method: JimpleMethodSignature,
     pub receiver: Option<SymbolicValue>,
@@ -409,6 +419,7 @@ impl JimpleMethod {
                         .collect();
                     effects.push(JimpleDirectEffect::Invocation(JimpleInvocation {
                         statement_id: statement.id,
+                        guards: self.control_guards(statement.id),
                         invoke_kind: invoke_kind.to_owned(),
                         method: method.clone(),
                         receiver,
@@ -423,6 +434,7 @@ impl JimpleMethod {
                 let mut visiting = BTreeSet::new();
                 effects.push(JimpleDirectEffect::FieldWrite(JimpleFieldWrite {
                     statement_id: statement.id,
+                    guards: self.control_guards(statement.id),
                     field,
                     receiver,
                     value: self.resolve_locals_only(statement.id, right, &mut visiting),
@@ -537,8 +549,7 @@ impl JimpleMethod {
         visiting: &mut BTreeSet<(usize, String)>,
     ) -> SymbolicValue {
         if let JimpleValueKind::Local { name } = &value.kind
-            && let Some(definition) =
-                self.latest_definition_before(before_id, &StorageLocation::Local(name.clone()))
+            && let Some(definition) = self.unique_reaching_local_definition(before_id, name)
         {
             let visit = (definition.id, name.clone());
             if visiting.insert(visit.clone()) {
@@ -628,6 +639,236 @@ impl JimpleMethod {
             | JimpleValueKind::New { .. }
             | JimpleValueKind::Opaque => symbolic_leaf(value),
         }
+    }
+
+    fn control_guards(&self, statement_id: usize) -> Vec<JimpleGuard> {
+        let mut guards = Vec::new();
+        for branch in &self.statements {
+            let JimpleOperation::If { condition } = &branch.operation else {
+                continue;
+            };
+            let [when_false, when_true] = branch.successors.as_slice() else {
+                continue;
+            };
+            let merge = self.immediate_postdominator(branch.id);
+            let false_region = self.reachable_until(*when_false, merge);
+            let true_region = self.reachable_until(*when_true, merge);
+            let in_false = false_region.contains(&statement_id);
+            let in_true = true_region.contains(&statement_id);
+            if in_false == in_true {
+                continue;
+            }
+            let mut visiting = BTreeSet::new();
+            guards.push(JimpleGuard {
+                branch_statement_id: branch.id,
+                expected: in_true,
+                condition: self.resolve_locals_only(branch.id, condition, &mut visiting),
+            });
+        }
+        guards.sort_by_key(|guard| guard.branch_statement_id);
+        guards
+    }
+
+    fn reaching_local_definitions(&self, before_id: usize, name: &str) -> Vec<&JimpleStatement> {
+        let predecessors = self.predecessors();
+        let mut pending: Vec<_> = predecessors
+            .get(&before_id)
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect();
+        let mut visited = BTreeSet::new();
+        let mut definition_ids = BTreeSet::new();
+        while let Some(statement_id) = pending.pop() {
+            if !visited.insert(statement_id) {
+                continue;
+            }
+            let Some(statement) = self
+                .statements
+                .iter()
+                .find(|statement| statement.id == statement_id)
+            else {
+                continue;
+            };
+            let defines_name = operation_definition(&statement.operation)
+                .is_some_and(|value| matches!(&value.kind, JimpleValueKind::Local { name: defined } if defined == name));
+            if defines_name {
+                definition_ids.insert(statement_id);
+                continue;
+            }
+            if let Some(previous) = predecessors.get(&statement_id) {
+                pending.extend(previous.iter().copied());
+            }
+        }
+        definition_ids
+            .into_iter()
+            .filter_map(|id| self.statements.iter().find(|statement| statement.id == id))
+            .collect()
+    }
+
+    fn unique_reaching_local_definition(
+        &self,
+        before_id: usize,
+        name: &str,
+    ) -> Option<&JimpleStatement> {
+        let definitions = self.reaching_local_definitions(before_id, name);
+        let [definition] = definitions.as_slice() else {
+            return None;
+        };
+        Some(*definition)
+    }
+
+    pub(super) fn boolean_materialized_return(&self) -> Option<SymbolicValue> {
+        if self.signature.return_type != "boolean" {
+            return None;
+        }
+        let returns: Vec<_> = self
+            .statements
+            .iter()
+            .filter_map(|statement| match &statement.operation {
+                JimpleOperation::Return { value } => Some((statement, value)),
+                _ => None,
+            })
+            .collect();
+        let [(return_statement, return_value)] = returns.as_slice() else {
+            return None;
+        };
+        let JimpleValueKind::Local { name } = &return_value.kind else {
+            return None;
+        };
+        let definitions = self.reaching_local_definitions(return_statement.id, name);
+        let [left, right] = definitions.as_slice() else {
+            return None;
+        };
+        let arm = |definition: &JimpleStatement| -> Option<(i64, JimpleGuard)> {
+            let (JimpleOperation::Assign { right, .. } | JimpleOperation::Identity { right, .. }) =
+                &definition.operation
+            else {
+                return None;
+            };
+            let mut visiting = BTreeSet::new();
+            let value =
+                symbolic_integer(&self.resolve_locals_only(definition.id, right, &mut visiting))?;
+            if !matches!(value, 0 | 1) {
+                return None;
+            }
+            let guards = self.control_guards(definition.id);
+            let [guard] = guards.as_slice() else {
+                return None;
+            };
+            Some((value, guard.clone()))
+        };
+        let left = arm(left)?;
+        let right = arm(right)?;
+        if left.0 == right.0
+            || left.1.branch_statement_id != right.1.branch_statement_id
+            || left.1.expected == right.1.expected
+            || left.1.condition != right.1.condition
+        {
+            return None;
+        }
+        let one_guard = if left.0 == 1 { &left.1 } else { &right.1 };
+        if one_guard.expected {
+            Some(one_guard.condition.clone())
+        } else {
+            Some(SymbolicValue::Unary {
+                operator: String::from("!"),
+                value: Box::new(one_guard.condition.clone()),
+            })
+        }
+    }
+
+    fn predecessors(&self) -> BTreeMap<usize, Vec<usize>> {
+        let mut predecessors: BTreeMap<usize, Vec<usize>> = self
+            .statements
+            .iter()
+            .map(|statement| (statement.id, Vec::new()))
+            .collect();
+        for statement in &self.statements {
+            for successor in &statement.successors {
+                if let Some(entries) = predecessors.get_mut(successor) {
+                    entries.push(statement.id);
+                }
+            }
+        }
+        predecessors
+    }
+
+    fn reachable_until(&self, start: usize, stop: Option<usize>) -> BTreeSet<usize> {
+        let mut reached = BTreeSet::new();
+        let mut pending = vec![start];
+        while let Some(statement_id) = pending.pop() {
+            if Some(statement_id) == stop || !reached.insert(statement_id) {
+                continue;
+            }
+            if let Some(statement) = self
+                .statements
+                .iter()
+                .find(|statement| statement.id == statement_id)
+            {
+                pending.extend(statement.successors.iter().copied());
+            }
+        }
+        reached
+    }
+
+    fn immediate_postdominator(&self, statement_id: usize) -> Option<usize> {
+        const EXIT: usize = usize::MAX;
+        let ids: BTreeSet<_> = self
+            .statements
+            .iter()
+            .map(|statement| statement.id)
+            .collect();
+        if !ids.contains(&statement_id) {
+            return None;
+        }
+        let mut universe = ids.clone();
+        universe.insert(EXIT);
+        let mut postdominators: BTreeMap<usize, BTreeSet<usize>> = ids
+            .iter()
+            .copied()
+            .map(|id| (id, universe.clone()))
+            .collect();
+        postdominators.insert(EXIT, BTreeSet::from([EXIT]));
+        loop {
+            let mut changed = false;
+            for statement in self.statements.iter().rev() {
+                let successors: Vec<_> = if statement.successors.is_empty() {
+                    vec![EXIT]
+                } else {
+                    statement.successors.clone()
+                };
+                let mut intersection = universe.clone();
+                for successor in successors {
+                    let Some(successor_set) = postdominators.get(&successor) else {
+                        continue;
+                    };
+                    intersection.retain(|candidate| successor_set.contains(candidate));
+                }
+                intersection.insert(statement.id);
+                if postdominators.get(&statement.id) != Some(&intersection) {
+                    postdominators.insert(statement.id, intersection);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let strict: BTreeSet<_> = postdominators
+            .get(&statement_id)?
+            .iter()
+            .copied()
+            .filter(|candidate| *candidate != statement_id && *candidate != EXIT)
+            .collect();
+        strict.iter().copied().find(|candidate| {
+            strict.iter().all(|other| {
+                other == candidate
+                    || !postdominators
+                        .get(other)
+                        .is_some_and(|set| set.contains(candidate))
+            })
+        })
     }
 
     fn add_value_dependencies<'a>(
@@ -2118,6 +2359,173 @@ mod tests {
         assert_eq!(summary.comparisons[0].constant, 0);
         assert_eq!(summary.constant_writes.len(), 1);
         assert_eq!(summary.constant_writes[0].value, 400);
+    }
+
+    #[test]
+    fn recovers_boolean_materialization_as_a_predicate() -> anyhow::Result<()> {
+        let this_local = local("this", "demo.Timer");
+        let counter = instance_field(this_local.clone(), "demo.Timer", "counter");
+        let loaded = local("loaded", "int");
+        let result = local("result", "boolean");
+        let mut method = super::JimpleMethod {
+            signature: super::JimpleMethodSignature {
+                owner: String::from("demo.Timer"),
+                name: String::from("ready"),
+                return_type: String::from("boolean"),
+                parameter_types: Vec::new(),
+            },
+            display_signature: String::from("<demo.Timer: boolean ready()>"),
+            statements: vec![
+                statement(
+                    0,
+                    vec![1],
+                    super::JimpleOperation::Identity {
+                        left: this_local,
+                        right: this_value("demo.Timer"),
+                    },
+                ),
+                statement(
+                    1,
+                    vec![2],
+                    super::JimpleOperation::Assign {
+                        left: loaded.clone(),
+                        right: counter,
+                    },
+                ),
+                statement(
+                    2,
+                    vec![3, 5],
+                    super::JimpleOperation::If {
+                        condition: binary("<=", loaded, integer(0)),
+                    },
+                ),
+                statement(
+                    3,
+                    vec![4],
+                    super::JimpleOperation::Assign {
+                        left: result.clone(),
+                        right: integer(1),
+                    },
+                ),
+                statement(4, vec![6], super::JimpleOperation::Goto),
+                statement(
+                    5,
+                    vec![6],
+                    super::JimpleOperation::Assign {
+                        left: result.clone(),
+                        right: integer(0),
+                    },
+                ),
+                statement(
+                    6,
+                    Vec::new(),
+                    super::JimpleOperation::Return { value: result },
+                ),
+            ],
+        };
+        method.signature.return_type = String::from("boolean");
+
+        let Some(SymbolicValue::Unary { operator, value }) = method.boolean_materialized_return()
+        else {
+            return Err(anyhow::anyhow!("expected recovered boolean predicate"));
+        };
+        assert_eq!(operator, "!");
+        let SymbolicValue::Binary {
+            operator,
+            left,
+            right,
+        } = *value
+        else {
+            return Err(anyhow::anyhow!("expected comparison under negation"));
+        };
+        assert_eq!(operator, "<=");
+        assert!(matches!(*left, SymbolicValue::InstanceField { .. }));
+        assert!(matches!(*right, SymbolicValue::Integer { value: 0, .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn guards_use_cfg_reaching_definitions_and_keep_merged_locals_symbolic() {
+        let this_local = local("this", "demo.Timer");
+        let counter = instance_field(this_local.clone(), "demo.Timer", "counter");
+        let gate = instance_field(this_local.clone(), "demo.Timer", "gate");
+        let output = instance_field(this_local.clone(), "demo.Timer", "output");
+        let merged = local("merged", "int");
+        let method = super::JimpleMethod {
+            signature: super::JimpleMethodSignature {
+                owner: String::from("demo.Timer"),
+                name: String::from("tick"),
+                return_type: String::from("void"),
+                parameter_types: Vec::new(),
+            },
+            display_signature: String::from("<demo.Timer: void tick()>"),
+            statements: vec![
+                statement(
+                    0,
+                    vec![1],
+                    super::JimpleOperation::Identity {
+                        left: this_local,
+                        right: this_value("demo.Timer"),
+                    },
+                ),
+                statement(
+                    1,
+                    vec![2, 4],
+                    super::JimpleOperation::If {
+                        condition: binary("<=", counter, integer(0)),
+                    },
+                ),
+                statement(
+                    2,
+                    vec![3],
+                    super::JimpleOperation::Assign {
+                        left: gate,
+                        right: integer(1),
+                    },
+                ),
+                statement(
+                    3,
+                    vec![5],
+                    super::JimpleOperation::Assign {
+                        left: merged.clone(),
+                        right: integer(1),
+                    },
+                ),
+                statement(
+                    4,
+                    vec![5],
+                    super::JimpleOperation::Assign {
+                        left: merged.clone(),
+                        right: integer(0),
+                    },
+                ),
+                statement(
+                    5,
+                    vec![6],
+                    super::JimpleOperation::Assign {
+                        left: output,
+                        right: merged,
+                    },
+                ),
+                statement(6, Vec::new(), super::JimpleOperation::ReturnVoid),
+            ],
+        };
+
+        let effects = method.effect_summary().effects;
+        let writes: Vec<_> = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                super::JimpleDirectEffect::FieldWrite(write) => Some(write),
+                super::JimpleDirectEffect::Invocation(_) => None,
+            })
+            .collect();
+        assert_eq!(writes.len(), 2);
+        assert_eq!(writes[0].field.name, "gate");
+        assert_eq!(writes[0].guards.len(), 1);
+        assert!(!writes[0].guards[0].expected);
+        assert_eq!(writes[1].field.name, "output");
+        assert_eq!(writes[1].guards, Vec::new());
+        assert!(matches!(writes[1].value, SymbolicValue::Unknown { .. }));
     }
 
     #[test]

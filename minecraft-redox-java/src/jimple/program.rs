@@ -11,8 +11,8 @@ use serde::Serialize;
 use super::{
     AbstractArrayEntry, AbstractArrayIdentity, AbstractArraySnapshot, AbstractFieldValue,
     AbstractInvocation, AbstractObjectSnapshot, AbstractValue, ExecutionState, JimpleDirectEffect,
-    JimpleInvocation, JimpleMethod, JimpleMethodSignature, JimpleOperation, JimpleStatement,
-    JimpleValue, JimpleValueKind, MutableArray, MutableObject, SymbolicValue,
+    JimpleGuard, JimpleInvocation, JimpleMethod, JimpleMethodSignature, JimpleOperation,
+    JimpleStatement, JimpleValue, JimpleValueKind, MutableArray, MutableObject, SymbolicValue,
     abstract_array_identity, abstract_binary, abstract_cast, abstract_default_value,
     abstract_truth, abstract_unary, substitute_symbolic,
 };
@@ -31,8 +31,17 @@ pub struct JimpleEffectCallFrame {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct JimpleEffectGuard {
+    pub method: JimpleMethodSignature,
+    pub branch_statement_id: usize,
+    pub expected: bool,
+    pub condition: SymbolicValue,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct JimpleProgramFieldWrite {
     pub call_path: Vec<JimpleEffectCallFrame>,
+    pub guards: Vec<JimpleEffectGuard>,
     pub statement_id: usize,
     pub field: super::JimpleFieldSignature,
     pub receiver: Option<SymbolicValue>,
@@ -50,6 +59,7 @@ pub enum JimpleUnresolvedEffectReason {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct JimpleUnresolvedEffectCall {
     pub call_path: Vec<JimpleEffectCallFrame>,
+    pub guards: Vec<JimpleEffectGuard>,
     pub receiver: Option<SymbolicValue>,
     pub arguments: Vec<SymbolicValue>,
     pub reason: JimpleUnresolvedEffectReason,
@@ -67,6 +77,7 @@ struct StructuralEffectContext<'a> {
     this_value: Option<&'a SymbolicValue>,
     arguments: &'a [SymbolicValue],
     call_path: &'a [JimpleEffectCallFrame],
+    guards: &'a [JimpleEffectGuard],
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -183,6 +194,7 @@ impl JimpleProgram {
                 this_value: None,
                 arguments: &[],
                 call_path: &[],
+                guards: &[],
             },
             &mut active,
             &mut summary,
@@ -200,8 +212,17 @@ impl JimpleProgram {
         for effect in method.effect_summary().effects {
             match effect {
                 JimpleDirectEffect::FieldWrite(write) => {
+                    let mut guards = context.guards.to_vec();
+                    guards.extend(self.substitute_guards(
+                        &method.signature,
+                        &write.guards,
+                        context.this_value,
+                        context.arguments,
+                    ));
+                    dedupe_guards(&mut guards);
                     summary.possible_field_writes.push(JimpleProgramFieldWrite {
                         call_path: context.call_path.to_vec(),
+                        guards,
                         statement_id: write.statement_id,
                         field: write.field,
                         receiver: write.receiver.as_ref().map(|receiver| {
@@ -244,6 +265,14 @@ impl JimpleProgram {
             .iter()
             .map(|argument| substitute_symbolic(argument, context.this_value, context.arguments))
             .collect();
+        let mut invocation_guards = context.guards.to_vec();
+        invocation_guards.extend(self.substitute_guards(
+            &current_method.signature,
+            &invocation.guards,
+            context.this_value,
+            context.arguments,
+        ));
+        dedupe_guards(&mut invocation_guards);
         let frame = JimpleEffectCallFrame {
             caller: current_method.signature.clone(),
             statement_id: invocation.statement_id,
@@ -256,6 +285,7 @@ impl JimpleProgram {
         let Some(target_method) = self.method(&invocation.method) else {
             summary.unresolved_calls.push(JimpleUnresolvedEffectCall {
                 call_path: next_path,
+                guards: invocation_guards,
                 receiver,
                 arguments: call_arguments,
                 reason: JimpleUnresolvedEffectReason::MissingMethod,
@@ -270,6 +300,7 @@ impl JimpleProgram {
         ) {
             summary.unresolved_calls.push(JimpleUnresolvedEffectCall {
                 call_path: next_path,
+                guards: invocation_guards,
                 receiver,
                 arguments: call_arguments,
                 reason: JimpleUnresolvedEffectReason::DynamicDispatch,
@@ -280,6 +311,7 @@ impl JimpleProgram {
         if active.contains(&target_method.signature) {
             summary.unresolved_calls.push(JimpleUnresolvedEffectCall {
                 call_path: next_path,
+                guards: invocation_guards,
                 receiver,
                 arguments: call_arguments,
                 reason: JimpleUnresolvedEffectReason::RecursiveCycle,
@@ -294,11 +326,159 @@ impl JimpleProgram {
                 this_value: receiver.as_ref(),
                 arguments: &call_arguments,
                 call_path: &next_path,
+                guards: &invocation_guards,
             },
             active,
             summary,
         );
         active.pop();
+    }
+
+    fn substitute_guards(
+        &self,
+        method: &JimpleMethodSignature,
+        guards: &[JimpleGuard],
+        this_value: Option<&SymbolicValue>,
+        arguments: &[SymbolicValue],
+    ) -> Vec<JimpleEffectGuard> {
+        guards
+            .iter()
+            .map(|guard| {
+                let condition = substitute_symbolic(&guard.condition, this_value, arguments);
+                let condition = self.simplify_guard_value(condition, 0);
+                let (expected, condition) = normalize_guard_polarity(guard.expected, condition);
+                JimpleEffectGuard {
+                    method: method.clone(),
+                    branch_statement_id: guard.branch_statement_id,
+                    expected,
+                    condition,
+                }
+            })
+            .collect()
+    }
+
+    fn simplify_guard_value(&self, value: SymbolicValue, depth: usize) -> SymbolicValue {
+        if depth >= 16 {
+            return value;
+        }
+        match value {
+            SymbolicValue::Invoke {
+                method,
+                base,
+                arguments,
+            } => self.simplify_guard_invoke(method, base, arguments, depth),
+            SymbolicValue::Binary {
+                operator,
+                left,
+                right,
+            } => {
+                let left = self.simplify_guard_value(*left, depth + 1);
+                let right = self.simplify_guard_value(*right, depth + 1);
+                simplify_boolean_comparison(operator, left, right)
+            }
+            SymbolicValue::Unary { operator, value } => {
+                self.simplify_guard_unary(operator, *value, depth)
+            }
+            SymbolicValue::InstanceField { base, field } => SymbolicValue::InstanceField {
+                base: Box::new(self.simplify_guard_value(*base, depth + 1)),
+                field,
+            },
+            SymbolicValue::ArrayElement { base, index } => SymbolicValue::ArrayElement {
+                base: Box::new(self.simplify_guard_value(*base, depth + 1)),
+                index: Box::new(self.simplify_guard_value(*index, depth + 1)),
+            },
+            SymbolicValue::Cast { type_name, value } => SymbolicValue::Cast {
+                type_name,
+                value: Box::new(self.simplify_guard_value(*value, depth + 1)),
+            },
+            SymbolicValue::ArrayLength { value } => SymbolicValue::ArrayLength {
+                value: Box::new(self.simplify_guard_value(*value, depth + 1)),
+            },
+            SymbolicValue::NewArray { element_type, size } => SymbolicValue::NewArray {
+                element_type,
+                size: Box::new(self.simplify_guard_value(*size, depth + 1)),
+            },
+            SymbolicValue::NewMultiArray { array_type, sizes } => SymbolicValue::NewMultiArray {
+                array_type,
+                sizes: sizes
+                    .into_iter()
+                    .map(|size| self.simplify_guard_value(size, depth + 1))
+                    .collect(),
+            },
+            SymbolicValue::Phi { values } => SymbolicValue::Phi {
+                values: values
+                    .into_iter()
+                    .map(|item| self.simplify_guard_value(item, depth + 1))
+                    .collect(),
+            },
+            other => other,
+        }
+    }
+
+    fn simplify_guard_invoke(
+        &self,
+        method: JimpleMethodSignature,
+        base: Option<Box<SymbolicValue>>,
+        arguments: Vec<SymbolicValue>,
+        depth: usize,
+    ) -> SymbolicValue {
+        let base = base.map(|base| Box::new(self.simplify_guard_value(*base, depth + 1)));
+        let arguments: Vec<_> = arguments
+            .into_iter()
+            .map(|argument| self.simplify_guard_value(argument, depth + 1))
+            .collect();
+        let exact_instance =
+            exact_symbolic_runtime_type(base.as_deref()) == Some(method.owner.as_str());
+        let exact_static = base.is_none()
+            && self
+                .method(&method)
+                .is_some_and(|target| !method_has_this(target));
+        if (exact_instance || exact_static)
+            && let Some(target) = self.method(&method)
+            && let Some(returned) = target.boolean_materialized_return()
+        {
+            let substituted = substitute_symbolic(&returned, base.as_deref(), &arguments);
+            return self.simplify_guard_value(substituted, depth + 1);
+        }
+        SymbolicValue::Invoke {
+            method,
+            base,
+            arguments,
+        }
+    }
+
+    fn simplify_guard_unary(
+        &self,
+        operator: String,
+        value: SymbolicValue,
+        depth: usize,
+    ) -> SymbolicValue {
+        let value = self.simplify_guard_value(value, depth + 1);
+        if operator == "!" {
+            if let SymbolicValue::Unary {
+                operator: inner_operator,
+                value: inner,
+            } = &value
+                && inner_operator == "!"
+            {
+                return (**inner).clone();
+            }
+            if let SymbolicValue::Integer {
+                value: integer,
+                type_name,
+            } = &value
+                && matches!(integer, 0 | 1)
+            {
+                return SymbolicValue::Integer {
+                    value: i64::from(*integer == 0),
+                    type_name: type_name.clone(),
+                };
+            }
+        }
+        SymbolicValue::Unary {
+            operator,
+            value: Box::new(value),
+        }
     }
 
     fn class_initializer(&self, owner: &str) -> Option<&JimpleMethod> {
@@ -2087,6 +2267,110 @@ impl<'a> ProgramVm<'a> {
             opaque_call_shapes: self.opaque_call_shapes,
             unresolved_array_writes: self.unresolved_array_writes,
             exceptional_paths: self.exceptional_paths,
+        }
+    }
+}
+
+fn method_has_this(method: &JimpleMethod) -> bool {
+    method.statements.iter().any(|statement| {
+        matches!(
+            &statement.operation,
+            JimpleOperation::Identity {
+                right: JimpleValue {
+                    kind: JimpleValueKind::This,
+                    ..
+                },
+                ..
+            }
+        )
+    })
+}
+
+fn symbolic_boolean(value: &SymbolicValue) -> bool {
+    match value {
+        SymbolicValue::Integer { value, .. } => matches!(value, 0 | 1),
+        SymbolicValue::InstanceField { field, .. } | SymbolicValue::StaticField { field } => {
+            field.type_name == "boolean"
+        }
+        SymbolicValue::Binary { operator, .. } => {
+            matches!(operator.as_str(), "==" | "!=" | "<" | "<=" | ">" | ">=")
+        }
+        SymbolicValue::Unary { operator, .. } => operator == "!",
+        SymbolicValue::Invoke { method, .. } => method.return_type == "boolean",
+        SymbolicValue::Cast { type_name, value } => {
+            type_name == "boolean" || symbolic_boolean(value)
+        }
+        _ => false,
+    }
+}
+
+fn simplify_boolean_comparison(
+    operator: String,
+    left: SymbolicValue,
+    right: SymbolicValue,
+) -> SymbolicValue {
+    let simplify = |boolean: SymbolicValue, integer: i64| {
+        if !symbolic_boolean(&boolean) || !matches!(integer, 0 | 1) {
+            return None;
+        }
+        let equivalent = match (operator.as_str(), integer) {
+            ("!=", 0) | ("==", 1) => true,
+            ("==", 0) | ("!=", 1) => false,
+            _ => return None,
+        };
+        Some(if equivalent {
+            boolean
+        } else {
+            SymbolicValue::Unary {
+                operator: String::from("!"),
+                value: Box::new(boolean),
+            }
+        })
+    };
+    if let SymbolicValue::Integer { value, .. } = &right
+        && let Some(value) = simplify(left.clone(), *value)
+    {
+        return value;
+    }
+    if let SymbolicValue::Integer { value, .. } = &left
+        && let Some(value) = simplify(right.clone(), *value)
+    {
+        return value;
+    }
+    SymbolicValue::Binary {
+        operator,
+        left: Box::new(left),
+        right: Box::new(right),
+    }
+}
+
+fn normalize_guard_polarity(
+    mut expected: bool,
+    mut condition: SymbolicValue,
+) -> (bool, SymbolicValue) {
+    loop {
+        let SymbolicValue::Unary { operator, value } = condition else {
+            return (expected, condition);
+        };
+        if operator != "!" {
+            return (expected, SymbolicValue::Unary { operator, value });
+        }
+        expected = !expected;
+        condition = *value;
+    }
+}
+
+fn dedupe_guards(guards: &mut Vec<JimpleEffectGuard>) {
+    let mut index = 0;
+    while index < guards.len() {
+        let duplicate = guards[..index].iter().any(|existing| {
+            existing.expected == guards[index].expected
+                && existing.condition == guards[index].condition
+        });
+        if duplicate {
+            guards.remove(index);
+        } else {
+            index += 1;
         }
     }
 }

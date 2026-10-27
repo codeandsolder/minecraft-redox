@@ -73,6 +73,21 @@ On the real vanilla Hopper `updateEntity` reachable dump this recovers the coold
 
 These are reported as **possible structural effects**, not unconditional writes. CFG guards still need to be attached before they become executable graph reactions. Missing methods and unresolved dynamic dispatch remain explicit in the summary rather than being guessed.
 
+## CFG guards and predicate recovery
+
+Structural effects now carry branch guards recovered from the Jimple CFG. For each `if`, the false/true successor regions are separated using immediate post-dominators; an effect inherits a branch predicate only when it is reachable from exactly one arm before reconvergence. Guard expressions resolve locals through CFG **reaching definitions**, not textual proximity. If multiple definitions can reach a use, the local remains symbolic instead of choosing an arbitrary assignment.
+
+Program-level composition substitutes `this`/arguments through both effects and their guards, simplifies boolean comparisons, inlines exact boolean-materialization helpers, normalizes negation into guard polarity, and deduplicates equivalent predicates inherited through nested calls. This is still structural: guards are conjunctions of necessary control predicates, not a claim that every opaque call inside them is already lowered.
+
+On the real vanilla Hopper `updateEntity` path this now yields:
+
+- the cooldown decrement guarded by non-null world, server-side execution, and cooldown `> 0`;
+- `setCooldown(0)` guarded by non-null world, server-side execution, and concrete `cooldown <= 0` (the legacy `func_145888_j()` helper is gone);
+- the successful-transfer `setCooldown(8)` path inherits the same `cooldown <= 0` predicate and lowers another static helper to its metadata bit test;
+- the final transfer-success local `l1` remains symbolic because several branch-dependent definitions reach it. That is the correct next frontier: guarded/piecewise value reconstruction rather than unsafe nearest-definition substitution.
+
+Furnace recovery also benefits immediately: burn-time decrement is structurally guarded by burn time `> 0`, while cook-time increment carries the server-side, input/fuel presence, burn-active, and can-smelt predicates.
+
 ## Missing pieces exposed by vanilla
 
 The current graph runtime proves the scheduling model but intentionally still has prototype numeric state. Exact Minecraft lowering needs:
