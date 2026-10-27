@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use num_bigint::BigInt;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::{
     AbstractArrayEntry, AbstractArrayIdentity, AbstractArraySnapshot, AbstractFieldValue,
@@ -74,6 +74,24 @@ pub struct JimpleProgramCall {
     pub resolution: JimpleProgramCallResolution,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct JimpleScheduleOnceBinding {
+    pub callee: JimpleMethodSignature,
+    pub key_arguments: Vec<usize>,
+    pub delay_argument: usize,
+    pub priority_argument: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct JimpleScheduleOnceCandidate {
+    pub call_path: Vec<JimpleEffectCallFrame>,
+    pub guards: Vec<JimpleEffectGuard>,
+    pub resolution: JimpleProgramCallResolution,
+    pub key: Vec<SymbolicValue>,
+    pub delay: SymbolicValue,
+    pub priority: Option<SymbolicValue>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct JimpleUnresolvedEffectCall {
     pub call_path: Vec<JimpleEffectCallFrame>,
@@ -89,6 +107,73 @@ pub struct JimpleProgramEffectSummary {
     pub possible_field_writes: Vec<JimpleProgramFieldWrite>,
     pub calls: Vec<JimpleProgramCall>,
     pub unresolved_calls: Vec<JimpleUnresolvedEffectCall>,
+}
+
+impl JimpleProgramEffectSummary {
+    /// Bind calls to a source scheduler API into generic schedule-once candidates.
+    ///
+    /// The binding is declarative: argument positions define the canonical deduplication key,
+    /// delay, and optional priority. The source method name itself carries no semantics here.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a matching call does not contain an argument required by the binding.
+    pub fn bind_schedule_once(
+        &self,
+        binding: &JimpleScheduleOnceBinding,
+    ) -> Result<Vec<JimpleScheduleOnceCandidate>> {
+        self.calls
+            .iter()
+            .filter(|call| {
+                call.call_path
+                    .last()
+                    .is_some_and(|frame| frame.callee == binding.callee)
+            })
+            .map(|call| {
+                let key = binding
+                    .key_arguments
+                    .iter()
+                    .map(|index| {
+                        call.arguments.get(*index).cloned().with_context(|| {
+                            format!(
+                                "schedule binding key argument {index} missing from call to {:?}",
+                                binding.callee
+                            )
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let delay = call
+                    .arguments
+                    .get(binding.delay_argument)
+                    .cloned()
+                    .with_context(|| {
+                        format!(
+                            "schedule binding delay argument {} missing from call to {:?}",
+                            binding.delay_argument, binding.callee
+                        )
+                    })?;
+                let priority = binding
+                    .priority_argument
+                    .map(|index| {
+                        call.arguments.get(index).cloned().with_context(|| {
+                            format!(
+                                "schedule binding priority argument {index} missing from call to {:?}",
+                                binding.callee
+                            )
+                        })
+                    })
+                    .transpose()?;
+                Ok(JimpleScheduleOnceCandidate {
+                    call_path: call.call_path.clone(),
+                    guards: call.guards.clone(),
+                    resolution: call.resolution,
+                    key,
+                    delay,
+                    priority,
+                })
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -211,6 +296,38 @@ impl JimpleProgram {
         &self,
         entry: &JimpleMethodSignature,
     ) -> Result<JimpleProgramEffectSummary> {
+        self.structural_effects_with_runtime_this(entry, None)
+    }
+
+    /// Expand structural effects with an exact runtime class for the entry receiver.
+    ///
+    /// The runtime class must be the entry owner itself or a subtype proven by the exported
+    /// class hierarchy. Virtual/interface calls are then dispatched by walking that exact class
+    /// hierarchy, while the concrete receiver identity is preserved through inherited methods.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the entry is absent or the supplied runtime class is not known to be
+    /// compatible with the entry owner.
+    pub fn structural_effects_for_runtime_this(
+        &self,
+        entry: &JimpleMethodSignature,
+        runtime_type: &str,
+    ) -> Result<JimpleProgramEffectSummary> {
+        if !self.is_known_subtype(runtime_type, &entry.owner) {
+            bail!(
+                "runtime type {runtime_type:?} is not a known subtype of entry owner {:?}",
+                entry.owner
+            );
+        }
+        self.structural_effects_with_runtime_this(entry, Some(runtime_type))
+    }
+
+    fn structural_effects_with_runtime_this(
+        &self,
+        entry: &JimpleMethodSignature,
+        runtime_type: Option<&str>,
+    ) -> Result<JimpleProgramEffectSummary> {
         let method = self
             .method(entry)
             .with_context(|| format!("Jimple method {entry:?} does not exist"))?;
@@ -220,11 +337,14 @@ impl JimpleProgram {
             calls: Vec::new(),
             unresolved_calls: Vec::new(),
         };
+        let runtime_this = runtime_type.map(|type_name| SymbolicValue::This {
+            type_name: type_name.to_owned(),
+        });
         let mut active = vec![entry.clone()];
         self.expand_structural_effects(
             method,
             StructuralEffectContext {
-                this_value: None,
+                this_value: runtime_this.as_ref(),
                 arguments: &[],
                 call_path: &[],
                 guards: &[],
@@ -340,10 +460,13 @@ impl JimpleProgram {
                         receiver: write.receiver.as_ref().map(|receiver| {
                             substitute_symbolic(receiver, context.this_value, context.arguments)
                         }),
-                        value: substitute_symbolic(
-                            &write.value,
-                            context.this_value,
-                            context.arguments,
+                        value: self.simplify_symbolic_value(
+                            substitute_symbolic(
+                                &write.value,
+                                context.this_value,
+                                context.arguments,
+                            ),
+                            0,
                         ),
                     });
                 }
@@ -421,14 +544,21 @@ impl JimpleProgram {
         active: &mut Vec<JimpleMethodSignature>,
         summary: &mut JimpleProgramEffectSummary,
     ) {
-        let receiver = invocation
-            .receiver
-            .as_ref()
-            .map(|receiver| substitute_symbolic(receiver, context.this_value, context.arguments));
+        let receiver = invocation.receiver.as_ref().map(|receiver| {
+            self.simplify_symbolic_value(
+                substitute_symbolic(receiver, context.this_value, context.arguments),
+                0,
+            )
+        });
         let call_arguments: Vec<_> = invocation
             .arguments
             .iter()
-            .map(|argument| substitute_symbolic(argument, context.this_value, context.arguments))
+            .map(|argument| {
+                self.simplify_symbolic_value(
+                    substitute_symbolic(argument, context.this_value, context.arguments),
+                    0,
+                )
+            })
             .collect();
         let mut invocation_guards = context.guards.to_vec();
         invocation_guards.extend(self.substitute_guards(
@@ -447,33 +577,24 @@ impl JimpleProgram {
         let mut next_path = context.call_path.to_vec();
         next_path.push(frame);
 
-        let Some(target_method) = self.method(&invocation.method) else {
-            Self::record_unresolved_call(
-                summary,
-                next_path,
-                invocation_guards,
-                receiver,
-                call_arguments,
-                JimpleUnresolvedEffectReason::MissingMethod,
-            );
-            return;
-        };
-
-        if !structurally_exact_dispatch(
+        let target_method = match self.structural_dispatch_target(
             &invocation.invoke_kind,
             receiver.as_ref(),
             &invocation.method,
         ) {
-            Self::record_unresolved_call(
-                summary,
-                next_path,
-                invocation_guards,
-                receiver,
-                call_arguments,
-                JimpleUnresolvedEffectReason::DynamicDispatch,
-            );
-            return;
-        }
+            Ok(target) => target,
+            Err(reason) => {
+                Self::record_unresolved_call(
+                    summary,
+                    next_path,
+                    invocation_guards,
+                    receiver,
+                    call_arguments,
+                    reason,
+                );
+                return;
+            }
+        };
 
         if active.contains(&target_method.signature) {
             Self::record_unresolved_call(
@@ -508,6 +629,276 @@ impl JimpleProgram {
             summary,
         );
         active.pop();
+    }
+
+    fn structural_dispatch_target(
+        &self,
+        invoke_kind: &str,
+        receiver: Option<&SymbolicValue>,
+        declared: &JimpleMethodSignature,
+    ) -> std::result::Result<&JimpleMethod, JimpleUnresolvedEffectReason> {
+        match invoke_kind {
+            "JStaticInvokeExpr" | "JSpecialInvokeExpr" => self
+                .method(declared)
+                .ok_or(JimpleUnresolvedEffectReason::MissingMethod),
+            "JVirtualInvokeExpr" | "JInterfaceInvokeExpr" => {
+                let runtime_owner = exact_symbolic_runtime_type(receiver)
+                    .ok_or(JimpleUnresolvedEffectReason::DynamicDispatch)?;
+                if !self.is_known_subtype(runtime_owner, &declared.owner) {
+                    return Err(JimpleUnresolvedEffectReason::DynamicDispatch);
+                }
+                self.dispatched_method_in_hierarchy(runtime_owner, declared)
+                    .ok_or(JimpleUnresolvedEffectReason::MissingMethod)
+            }
+            _ => Err(JimpleUnresolvedEffectReason::DynamicDispatch),
+        }
+    }
+
+    fn dispatched_method_in_hierarchy(
+        &self,
+        runtime_owner: &str,
+        declared: &JimpleMethodSignature,
+    ) -> Option<&JimpleMethod> {
+        let mut owner = Some(runtime_owner);
+        let mut visited = BTreeSet::new();
+        while let Some(current) = owner {
+            if !visited.insert(current.to_owned()) {
+                return None;
+            }
+            if let Some(method) = self.dispatch_method_on_owner(current, declared) {
+                return Some(method);
+            }
+            owner = self.superclass_of(current);
+        }
+        if self.is_known_subtype(runtime_owner, &declared.owner) {
+            self.method(declared)
+        } else {
+            None
+        }
+    }
+
+    fn dispatch_method_on_owner(
+        &self,
+        owner: &str,
+        declared: &JimpleMethodSignature,
+    ) -> Option<&JimpleMethod> {
+        let mut matching = self.methods.iter().filter(|method| {
+            method.signature.owner == owner
+                && method.signature.name == declared.name
+                && method.signature.parameter_types == declared.parameter_types
+        });
+        let first = matching.next()?;
+        if first.signature.return_type == declared.return_type {
+            return Some(first);
+        }
+        matching
+            .find(|method| method.signature.return_type == declared.return_type)
+            .or(Some(first))
+    }
+
+    fn superclass_of(&self, owner: &str) -> Option<&str> {
+        self.methods
+            .iter()
+            .find(|method| method.signature.owner == owner)
+            .and_then(|method| method.declaring_superclass.as_deref())
+    }
+
+    fn direct_interfaces_of(&self, owner: &str) -> &[String] {
+        self.methods
+            .iter()
+            .find(|method| method.signature.owner == owner)
+            .map_or(&[], |method| method.declaring_interfaces.as_slice())
+    }
+
+    fn is_known_subtype(&self, candidate: &str, expected: &str) -> bool {
+        if candidate == expected {
+            return true;
+        }
+        let mut pending = vec![candidate.to_owned()];
+        let mut visited = BTreeSet::new();
+        while let Some(current) = pending.pop() {
+            if !visited.insert(current.clone()) {
+                continue;
+            }
+            if let Some(superclass) = self.superclass_of(&current) {
+                if superclass == expected {
+                    return true;
+                }
+                pending.push(superclass.to_owned());
+            }
+            for interface in self.direct_interfaces_of(&current) {
+                if interface == expected {
+                    return true;
+                }
+                pending.push(interface.clone());
+            }
+        }
+        false
+    }
+
+    fn simplify_symbolic_value(&self, value: SymbolicValue, depth: usize) -> SymbolicValue {
+        if depth >= 16 {
+            return value;
+        }
+        match value {
+            SymbolicValue::Invoke {
+                method,
+                base,
+                arguments,
+            } => self.simplify_symbolic_invoke(method, base, arguments, depth),
+            SymbolicValue::InstanceField { base, field } => SymbolicValue::InstanceField {
+                base: Box::new(self.simplify_symbolic_value(*base, depth + 1)),
+                field,
+            },
+            SymbolicValue::ArrayElement { base, index } => SymbolicValue::ArrayElement {
+                base: Box::new(self.simplify_symbolic_value(*base, depth + 1)),
+                index: Box::new(self.simplify_symbolic_value(*index, depth + 1)),
+            },
+            SymbolicValue::Binary {
+                operator,
+                left,
+                right,
+            } => SymbolicValue::Binary {
+                operator,
+                left: Box::new(self.simplify_symbolic_value(*left, depth + 1)),
+                right: Box::new(self.simplify_symbolic_value(*right, depth + 1)),
+            },
+            SymbolicValue::Cast { type_name, value } => SymbolicValue::Cast {
+                type_name,
+                value: Box::new(self.simplify_symbolic_value(*value, depth + 1)),
+            },
+            SymbolicValue::Unary { operator, value } => SymbolicValue::Unary {
+                operator,
+                value: Box::new(self.simplify_symbolic_value(*value, depth + 1)),
+            },
+            SymbolicValue::ArrayLength { value } => SymbolicValue::ArrayLength {
+                value: Box::new(self.simplify_symbolic_value(*value, depth + 1)),
+            },
+            SymbolicValue::NewArray { element_type, size } => SymbolicValue::NewArray {
+                element_type,
+                size: Box::new(self.simplify_symbolic_value(*size, depth + 1)),
+            },
+            SymbolicValue::NewMultiArray { array_type, sizes } => SymbolicValue::NewMultiArray {
+                array_type,
+                sizes: sizes
+                    .into_iter()
+                    .map(|size| self.simplify_symbolic_value(size, depth + 1))
+                    .collect(),
+            },
+            SymbolicValue::Phi { values } => SymbolicValue::Phi {
+                values: values
+                    .into_iter()
+                    .map(|value| self.simplify_symbolic_value(value, depth + 1))
+                    .collect(),
+            },
+            SymbolicValue::Piecewise { arms } => SymbolicValue::Piecewise {
+                arms: arms
+                    .into_iter()
+                    .map(|arm| SymbolicPiecewiseArm {
+                        guards: arm
+                            .guards
+                            .into_iter()
+                            .map(|guard| JimpleGuard {
+                                branch_statement_id: guard.branch_statement_id,
+                                expected: guard.expected,
+                                condition: self.simplify_symbolic_value(guard.condition, depth + 1),
+                            })
+                            .collect(),
+                        value: self.simplify_symbolic_value(arm.value, depth + 1),
+                    })
+                    .collect(),
+            },
+            other => other,
+        }
+    }
+
+    fn simplify_symbolic_invoke(
+        &self,
+        method: JimpleMethodSignature,
+        base: Option<Box<SymbolicValue>>,
+        arguments: Vec<SymbolicValue>,
+        depth: usize,
+    ) -> SymbolicValue {
+        let base = base.map(|base| Box::new(self.simplify_symbolic_value(*base, depth + 1)));
+        let arguments: Vec<_> = arguments
+            .into_iter()
+            .map(|argument| self.simplify_symbolic_value(argument, depth + 1))
+            .collect();
+        let invoke_kind = if base.is_some() {
+            "JVirtualInvokeExpr"
+        } else {
+            "JStaticInvokeExpr"
+        };
+        if let Ok(target) = self.structural_dispatch_target(invoke_kind, base.as_deref(), &method) {
+            let mut active = Vec::new();
+            if let Some(returned) = self.pure_symbolic_return(
+                target,
+                base.as_deref(),
+                &arguments,
+                depth + 1,
+                &mut active,
+            ) {
+                return self.simplify_symbolic_value(returned, depth + 1);
+            }
+        }
+        SymbolicValue::Invoke {
+            method,
+            base,
+            arguments,
+        }
+    }
+
+    fn pure_symbolic_return(
+        &self,
+        method: &JimpleMethod,
+        this_value: Option<&SymbolicValue>,
+        arguments: &[SymbolicValue],
+        depth: usize,
+        active: &mut Vec<JimpleMethodSignature>,
+    ) -> Option<SymbolicValue> {
+        if depth >= 16
+            || method.has_nonlocal_write_or_opaque_control()
+            || active.contains(&method.signature)
+        {
+            return None;
+        }
+        active.push(method.signature.clone());
+        let result = (|| {
+            let returned = method.symbolic_return_value()?;
+            for effect in method.effect_summary().effects {
+                match effect {
+                    JimpleDirectEffect::FieldWrite(_) => return None,
+                    JimpleDirectEffect::Invocation(invocation) => {
+                        let receiver = invocation
+                            .receiver
+                            .as_ref()
+                            .map(|receiver| substitute_symbolic(receiver, this_value, arguments));
+                        let call_arguments: Vec<_> = invocation
+                            .arguments
+                            .iter()
+                            .map(|argument| substitute_symbolic(argument, this_value, arguments))
+                            .collect();
+                        let target = self
+                            .structural_dispatch_target(
+                                &invocation.invoke_kind,
+                                receiver.as_ref(),
+                                &invocation.method,
+                            )
+                            .ok()?;
+                        self.pure_symbolic_return(
+                            target,
+                            receiver.as_ref(),
+                            &call_arguments,
+                            depth + 1,
+                            active,
+                        )?;
+                    }
+                }
+            }
+            Some(substitute_symbolic(&returned, this_value, arguments))
+        })();
+        active.pop();
+        result
     }
 
     fn substitute_guards(
@@ -626,18 +1017,29 @@ impl JimpleProgram {
             .into_iter()
             .map(|argument| self.simplify_guard_value(argument, depth + 1))
             .collect();
-        let exact_instance =
-            exact_symbolic_runtime_type(base.as_deref()) == Some(method.owner.as_str());
-        let exact_static = base.is_none()
-            && self
-                .method(&method)
-                .is_some_and(|target| !method_has_this(target));
-        if (exact_instance || exact_static)
-            && let Some(target) = self.method(&method)
-            && let Some(returned) = target.boolean_materialized_return()
+        let invoke_kind = if base.is_some() {
+            "JVirtualInvokeExpr"
+        } else {
+            "JStaticInvokeExpr"
+        };
+        if let Ok(target) = self.structural_dispatch_target(invoke_kind, base.as_deref(), &method)
+            && (base.is_some() || !method_has_this(target))
         {
-            let substituted = substitute_symbolic(&returned, base.as_deref(), &arguments);
-            return self.simplify_guard_value(substituted, depth + 1);
+            let mut active = Vec::new();
+            if let Some(pure_return) = self.pure_symbolic_return(
+                target,
+                base.as_deref(),
+                &arguments,
+                depth + 1,
+                &mut active,
+            ) {
+                let returned = target
+                    .boolean_materialized_return()
+                    .map_or(pure_return, |boolean| {
+                        substitute_symbolic(&boolean, base.as_deref(), &arguments)
+                    });
+                return self.simplify_guard_value(returned, depth + 1);
+            }
         }
         SymbolicValue::Invoke {
             method,
@@ -2802,20 +3204,6 @@ fn dedupe_guards(guards: &mut Vec<JimpleEffectGuard>) {
     }
 }
 
-fn structurally_exact_dispatch(
-    invoke_kind: &str,
-    receiver: Option<&SymbolicValue>,
-    method: &JimpleMethodSignature,
-) -> bool {
-    match invoke_kind {
-        "JStaticInvokeExpr" | "JSpecialInvokeExpr" => true,
-        "JVirtualInvokeExpr" => {
-            exact_symbolic_runtime_type(receiver) == Some(method.owner.as_str())
-        }
-        _ => false,
-    }
-}
-
 fn exact_symbolic_runtime_type(value: Option<&SymbolicValue>) -> Option<&str> {
     match value? {
         SymbolicValue::This { type_name } => Some(type_name),
@@ -3552,6 +3940,8 @@ mod tests {
                 parameter_types: Vec::new(),
             },
             display_signature: format!("<{owner}: void {name}()>"),
+            declaring_superclass: None,
+            declaring_interfaces: Vec::new(),
             statements,
         }
     }
@@ -3934,6 +4324,8 @@ mod tests {
                 parameter_types: Vec::new(),
             },
             display_signature: String::from("<demo.AutoInit: int answer()>"),
+            declaring_superclass: None,
+            declaring_interfaces: Vec::new(),
             statements: vec![statement(
                 0,
                 Vec::new(),
@@ -4171,6 +4563,220 @@ mod tests {
         Ok(())
     }
 
+    fn typed_invoke(
+        invoke_kind: &str,
+        base: Option<JimpleValue>,
+        owner: &str,
+        name: &str,
+        return_type: &str,
+        parameter_types: Vec<&str>,
+        arguments: Vec<JimpleValue>,
+    ) -> JimpleValue {
+        value(
+            JimpleValueKind::Invoke {
+                invoke_kind: invoke_kind.to_owned(),
+                method: JimpleMethodSignature {
+                    owner: owner.to_owned(),
+                    name: name.to_owned(),
+                    return_type: return_type.to_owned(),
+                    parameter_types: parameter_types.into_iter().map(str::to_owned).collect(),
+                },
+                base: base.map(Box::new),
+                arguments,
+                bootstrap_method: None,
+                bootstrap_arguments: Vec::new(),
+            },
+            return_type,
+            "typed invoke",
+        )
+    }
+
+    fn runtime_binding_entry() -> JimpleMethod {
+        let this = local("this", "demo.Base");
+        let argument = local("argument", "int");
+        let delay = typed_invoke(
+            "JVirtualInvokeExpr",
+            Some(this.clone()),
+            "demo.Base",
+            "delay",
+            "int",
+            vec!["int"],
+            vec![argument.clone()],
+        );
+        let schedule = typed_invoke(
+            "JStaticInvokeExpr",
+            None,
+            "demo.Engine",
+            "schedule",
+            "void",
+            vec!["int"],
+            vec![delay],
+        );
+        JimpleMethod {
+            signature: JimpleMethodSignature {
+                owner: String::from("demo.Base"),
+                name: String::from("run"),
+                return_type: String::from("void"),
+                parameter_types: vec![String::from("int")],
+            },
+            display_signature: String::from("<demo.Base: void run(int)>"),
+            declaring_superclass: Some(String::from("java.lang.Object")),
+            declaring_interfaces: Vec::new(),
+            statements: vec![
+                statement(
+                    0,
+                    vec![1],
+                    JimpleOperation::Identity {
+                        left: this,
+                        right: value(JimpleValueKind::This, "demo.Base", "@this"),
+                    },
+                ),
+                statement(
+                    1,
+                    vec![2],
+                    JimpleOperation::Identity {
+                        left: argument,
+                        right: value(
+                            JimpleValueKind::Parameter { index: 0 },
+                            "int",
+                            "@parameter0",
+                        ),
+                    },
+                ),
+                statement(
+                    2,
+                    vec![3],
+                    JimpleOperation::Invoke {
+                        expression: Some(schedule),
+                    },
+                ),
+                statement(3, Vec::new(), JimpleOperation::ReturnVoid),
+            ],
+        }
+    }
+
+    fn runtime_binding_wrapper() -> JimpleMethod {
+        let this = local("this", "demo.Base");
+        let argument = local("argument", "int");
+        let implementation = typed_invoke(
+            "JVirtualInvokeExpr",
+            Some(this.clone()),
+            "demo.Base",
+            "delayImpl",
+            "int",
+            vec!["int"],
+            vec![argument.clone()],
+        );
+        JimpleMethod {
+            signature: JimpleMethodSignature {
+                owner: String::from("demo.Base"),
+                name: String::from("delay"),
+                return_type: String::from("int"),
+                parameter_types: vec![String::from("int")],
+            },
+            display_signature: String::from("<demo.Base: int delay(int)>"),
+            declaring_superclass: Some(String::from("java.lang.Object")),
+            declaring_interfaces: Vec::new(),
+            statements: vec![
+                statement(
+                    0,
+                    vec![1],
+                    JimpleOperation::Identity {
+                        left: this,
+                        right: value(JimpleValueKind::This, "demo.Base", "@this"),
+                    },
+                ),
+                statement(
+                    1,
+                    vec![2],
+                    JimpleOperation::Identity {
+                        left: argument,
+                        right: value(
+                            JimpleValueKind::Parameter { index: 0 },
+                            "int",
+                            "@parameter0",
+                        ),
+                    },
+                ),
+                statement(
+                    2,
+                    Vec::new(),
+                    JimpleOperation::Return {
+                        value: implementation,
+                    },
+                ),
+            ],
+        }
+    }
+
+    fn runtime_binding_implementation() -> JimpleMethod {
+        JimpleMethod {
+            signature: JimpleMethodSignature {
+                owner: String::from("demo.Impl"),
+                name: String::from("delayImpl"),
+                return_type: String::from("int"),
+                parameter_types: vec![String::from("int")],
+            },
+            display_signature: String::from("<demo.Impl: int delayImpl(int)>"),
+            declaring_superclass: Some(String::from("demo.Base")),
+            declaring_interfaces: Vec::new(),
+            statements: vec![statement(
+                0,
+                Vec::new(),
+                JimpleOperation::Return { value: integer(2) },
+            )],
+        }
+    }
+
+    #[test]
+    fn runtime_type_binding_dispatches_inherited_wrapper_to_concrete_override() -> Result<()> {
+        let entry = runtime_binding_entry();
+        let signature = entry.signature.clone();
+        let summary = JimpleProgram::new(vec![
+            entry,
+            runtime_binding_wrapper(),
+            runtime_binding_implementation(),
+        ])
+        .structural_effects_for_runtime_this(&signature, "demo.Impl")?;
+        let engine = summary
+            .calls
+            .iter()
+            .find(|call| {
+                call.call_path
+                    .last()
+                    .is_some_and(|frame| frame.callee.owner == "demo.Engine")
+            })
+            .context("engine boundary missing")?;
+        assert_eq!(
+            engine.resolution,
+            JimpleProgramCallResolution::MissingMethod
+        );
+        assert!(matches!(
+            engine.arguments.as_slice(),
+            [SymbolicValue::Integer { value: 2, .. }]
+        ));
+        let callee = engine
+            .call_path
+            .last()
+            .context("engine call frame missing")?
+            .callee
+            .clone();
+        let candidates = summary.bind_schedule_once(&JimpleScheduleOnceBinding {
+            callee,
+            key_arguments: Vec::new(),
+            delay_argument: 0,
+            priority_argument: None,
+        })?;
+        let [candidate] = candidates.as_slice() else {
+            bail!("expected one bound schedule candidate");
+        };
+        assert!(matches!(
+            candidate.delay,
+            SymbolicValue::Integer { value: 2, .. }
+        ));
+        Ok(())
+    }
+
     #[test]
     fn leaves_ambiguous_virtual_dispatch_explicit() -> Result<()> {
         let this_local = local("this", "demo.Caller");
@@ -4245,6 +4851,8 @@ mod tests {
         let method = JimpleMethod {
             signature: signature.clone(),
             display_signature: String::from("<demo.Identity: int apply(int)>"),
+            declaring_superclass: None,
+            declaring_interfaces: Vec::new(),
             statements: vec![
                 statement(
                     0,
@@ -4312,6 +4920,8 @@ mod tests {
                 parameter_types: Vec::new(),
             },
             display_signature: String::from("<demo.Impl: demo.Value make()>"),
+            declaring_superclass: None,
+            declaring_interfaces: Vec::new(),
             statements: vec![
                 statement(
                     0,
@@ -4567,6 +5177,8 @@ mod tests {
         let method = JimpleMethod {
             signature: signature.clone(),
             display_signature: String::from("<demo.Registry: java.lang.Object lookup(int)>"),
+            declaring_superclass: None,
+            declaring_interfaces: Vec::new(),
             statements: vec![
                 statement(
                     0,

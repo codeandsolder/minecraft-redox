@@ -95,7 +95,7 @@ public final class DumpReachable {
 
         List<Object> encoded = exporter.methods.values().stream()
                 .sorted(Comparator.comparing(method -> method.getSignature().toString()))
-                .map(DumpJson::method)
+                .map(method -> DumpJson.method(method, view))
                 .toList();
         System.err.printf(
                 "reachable Jimple: %d methods across %d classes (max depth %d)%n",

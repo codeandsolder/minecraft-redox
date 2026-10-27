@@ -120,9 +120,11 @@ Inspection of the patched vanilla 1.7.10 `WorldServer` / `NextTickListEntry` sou
 
 The Jimple effect IR now preserves **all** composed calls as first-class call sites with substituted guards/receiver/arguments and a resolution status (`expanded`, `missing_method`, `dynamic_dispatch`, or `recursive_cycle`). `jimple-calls` can filter this surface without parsing a giant effect dump. The diode scheduler appears as exactly one `dynamic_dispatch` boundary on `World`, with four guards, priority `-1`, and its delay expression intact. Refusing to guess `WorldServer` dispatch is useful here because the call is exactly where a source-API → engine-primitive binding belongs.
 
-The remaining diode delay is also correctly polymorphic rather than merely unsimplified: base `BlockRedstoneDiode.func_149899_k(meta)` delegates to abstract `func_149901_b(meta)`. `BlockRedstoneRepeater` implements metadata-dependent `repeaterState[(meta & 12) >> 2] * 2`, while `BlockRedstoneComparator` returns constant `2`. A later concrete-type binding can specialize this; the abstract diode analysis must not.
+The diode delay is correctly polymorphic rather than merely unsimplified: base `BlockRedstoneDiode.func_149899_k(meta)` delegates to abstract `func_149901_b(meta)`. `BlockRedstoneRepeater` implements metadata-dependent `repeaterState[(meta & 12) >> 2] * 2`, while `BlockRedstoneComparator` returns constant `2`. The exporter now carries superclass/interface metadata and the Rust structural analyzer accepts an exact runtime `this` type, walks that hierarchy for virtual/interface dispatch, preserves the concrete receiver through inherited wrappers, and inlines bounded side-effect-free symbolic returns. On the real bytecode, binding the diode root to `BlockRedstoneRepeater` recovers the powered-repeater block identity plus `repeaterState[(metadata & 12) >> 2] * 2`; binding it to `BlockRedstoneComparator` recovers the powered-comparator identity plus literal delay `2`. The abstract diode analysis still refuses to choose either one.
 
-Quiescence now has the corresponding domain-neutral primitive: keyed schedule-once reaction reevaluations survive ordinary dependency invalidation, preserve the first accepted deadline for duplicate keys, and order same-time callbacks by priority then insertion sequence. Minecraft-specific key construction, block revalidation, chunk policy, and the legacy 1000-per-world-tick budget remain adapter policy rather than generic graph semantics.
+Source APIs are connected to engine primitives through declarative binding descriptors rather than method-name rules. `JimpleScheduleOnceBinding` identifies a source method signature and the argument positions forming the deduplication key, delay, and optional priority. Applied to the vanilla world scheduler, args `0..3` become `(x, y, z, block)`, arg `4` is the specialized delay expression, and arg `5` is priority `-1`; the original guards and call-resolution provenance are retained on the bound candidate.
+
+Quiescence has the corresponding domain-neutral primitive: keyed schedule-once reaction reevaluations survive ordinary dependency invalidation, preserve the first accepted deadline for duplicate keys, and order same-time callbacks by priority then insertion sequence. Minecraft-specific block revalidation, chunk policy, source-tick-to-time conversion, and the legacy 1000-per-world-tick budget remain adapter policy rather than generic graph semantics.
 
 ## Missing pieces exposed by vanilla
 
@@ -130,7 +132,7 @@ The current graph runtime proves the scheduling model but intentionally still ha
 
 - richer typed/canonical value policy beyond the now-implemented exact atom/handle nodes when domain code needs more than immutable snapshot identity;
 - interprocedural effect summaries with parameter substitution, so a call like `setCooldown(8)` recovers as a concrete write even when the callee assigns a parameter to the field;
-- semantic lowering for the world scheduled-update queue, including priority and duplicate/coalescing behavior;
+- adapter lowering from bound source scheduler calls to world callback identity/revalidation, chunk policy, and source-time conversion;
 - explicit stochastic event/RNG semantics for random ticks and random outcomes;
 - bounded temporal-history/window primitives for behavior such as redstone-torch burnout;
 - transaction primitives for inventory/resource movement across graph-owned objects.

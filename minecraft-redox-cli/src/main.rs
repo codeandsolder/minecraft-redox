@@ -9,7 +9,8 @@ use minecraft_redox_gtnh::{GtnhSummary, lower_recipe_with_project, recover_with_
 use minecraft_redox_java::{
     JavaProjectIndex, analyze_source, inventory_source,
     jimple::{
-        AbstractValue, JimpleMethodSignature, JimpleProgram, ProgramExecution, parse_methods,
+        AbstractValue, JimpleMethodSignature, JimpleProgram, JimpleScheduleOnceBinding,
+        ProgramExecution, parse_methods,
     },
 };
 use rayon::prelude::*;
@@ -83,16 +84,27 @@ fn main() -> Result<()> {
             print_jimple_clocked(path, method)
         }
         [_, command, path, method, callee] if command == "jimple-calls" => {
-            print_jimple_calls(path, method, callee)
+            print_jimple_calls(path, method, callee, None)
+        }
+        [_, command, path, method, callee, runtime_type] if command == "jimple-calls-runtime" => {
+            print_jimple_calls(path, method, callee, Some(runtime_type))
+        }
+        [_, command, path, method, runtime_type, binding] if command == "jimple-bind-schedule" => {
+            print_jimple_schedule_binding(path, method, runtime_type, binding)
         }
         [_, command, path, request] if command == "jimple-call" => print_jimple_call(path, request),
         _ => bail!(
-            "usage: minecraft-redox [inventory|chains] <java-file> | gtnh [--summary|--blockers] <file-or-dir> | jimple-slice <json> <method-substring> <sink-substring> | jimple-execute-array <json> <method-substring> <field-owner> <field-name> | jimple-program <json> <owner::method,...> | jimple-program-call <json> <owner::method,...> <request-json> | jimple-call <json> <request-json> | jimple-temporal <json> | jimple-effects <json> <method-substring> | jimple-clocked <json> <method-substring> | jimple-calls <json> <method-substring> <callee-substring>"
+            "usage: minecraft-redox [inventory|chains] <java-file> | gtnh [--summary|--blockers] <file-or-dir> | jimple-slice <json> <method-substring> <sink-substring> | jimple-execute-array <json> <method-substring> <field-owner> <field-name> | jimple-program <json> <owner::method,...> | jimple-program-call <json> <owner::method,...> <request-json> | jimple-call <json> <request-json> | jimple-temporal <json> | jimple-effects <json> <method-substring> | jimple-clocked <json> <method-substring> | jimple-calls <json> <method-substring> <callee-substring> | jimple-calls-runtime <json> <method-substring> <callee-substring> <runtime-type> | jimple-bind-schedule <json> <method-substring> <runtime-type-or--> <binding-json>"
         ),
     }
 }
 
-fn print_jimple_calls(path: &str, method_filter: &str, callee_filter: &str) -> Result<()> {
+fn print_jimple_schedule_binding(
+    path: &str,
+    method_filter: &str,
+    runtime_type: &str,
+    binding_path: &str,
+) -> Result<()> {
     let json = fs::read_to_string(path).with_context(|| format!("failed to read {path}"))?;
     let methods = parse_methods(&json)?;
     let matching: Vec<_> = methods
@@ -109,7 +121,51 @@ fn print_jimple_calls(path: &str, method_filter: &str, callee_filter: &str) -> R
         );
     };
     let entry = method.signature.clone();
-    let summary = JimpleProgram::new(methods).structural_effects(&entry)?;
+    let binding_json = fs::read_to_string(binding_path)
+        .with_context(|| format!("failed to read {binding_path}"))?;
+    let binding: JimpleScheduleOnceBinding = serde_json::from_str(&binding_json)
+        .with_context(|| format!("failed to parse {binding_path}"))?;
+    let program = JimpleProgram::new(methods);
+    let summary = if runtime_type == "-" {
+        program.structural_effects(&entry)?
+    } else {
+        program.structural_effects_for_runtime_this(&entry, runtime_type)?
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&summary.bind_schedule_once(&binding)?)?
+    );
+    Ok(())
+}
+
+fn print_jimple_calls(
+    path: &str,
+    method_filter: &str,
+    callee_filter: &str,
+    runtime_type: Option<&str>,
+) -> Result<()> {
+    let json = fs::read_to_string(path).with_context(|| format!("failed to read {path}"))?;
+    let methods = parse_methods(&json)?;
+    let matching: Vec<_> = methods
+        .iter()
+        .filter(|method| {
+            method.signature.name == method_filter
+                || method.display_signature.contains(method_filter)
+        })
+        .collect();
+    let [method] = matching.as_slice() else {
+        bail!(
+            "method filter {method_filter:?} matched {} methods; expected exactly one",
+            matching.len()
+        );
+    };
+    let entry = method.signature.clone();
+    let program = JimpleProgram::new(methods);
+    let summary = if let Some(runtime_type) = runtime_type {
+        program.structural_effects_for_runtime_this(&entry, runtime_type)?
+    } else {
+        program.structural_effects(&entry)?
+    };
     let calls: Vec<_> = summary
         .calls
         .into_iter()

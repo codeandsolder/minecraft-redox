@@ -75,12 +75,12 @@ public final class DumpJson {
         List<Object> methods = klass.getMethods().stream()
                 .filter(method -> method.isConcrete() && method.getName().contains(filter))
                 .sorted(Comparator.comparing(method -> method.getSignature().toString()))
-                .map(DumpJson::method)
+                .map(method -> DumpJson.method(method, view))
                 .toList();
         System.out.println(GSON.toJson(methods));
     }
 
-    static Object method(SootMethod method) {
+    static Object method(SootMethod method, View view) {
         Body body = method.getBody();
         List<Stmt> statements = body.getStmts();
         Map<Stmt, Integer> ids = new IdentityHashMap<>();
@@ -104,6 +104,14 @@ public final class DumpJson {
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("signature", methodSignature(method.getSignature()));
         result.put("display_signature", method.getSignature().toString());
+        view.getClass(method.getSignature().getDeclClassType()).ifPresent(klass -> {
+            result.put(
+                    "declaring_superclass",
+                    klass.getSuperclass().map(Object::toString).orElse(null));
+            result.put(
+                    "declaring_interfaces",
+                    klass.getInterfaces().stream().map(Object::toString).sorted().toList());
+        });
         result.put("statements", encoded);
         return result;
     }

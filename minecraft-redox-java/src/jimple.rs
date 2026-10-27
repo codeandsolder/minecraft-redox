@@ -14,8 +14,8 @@ pub use program::{
     AbstractMapEntry, AbstractMapSnapshot, AbstractOpaqueCallShape, AbstractStaticFieldValue,
     JimpleClockedStateCandidate, JimpleEffectCallFrame, JimpleEffectGuard, JimpleProgram,
     JimpleProgramCall, JimpleProgramCallResolution, JimpleProgramEffectSummary,
-    JimpleProgramFieldWrite, JimpleUnresolvedEffectCall, JimpleUnresolvedEffectReason,
-    ProgramExecution,
+    JimpleProgramFieldWrite, JimpleScheduleOnceBinding, JimpleScheduleOnceCandidate,
+    JimpleUnresolvedEffectCall, JimpleUnresolvedEffectReason, ProgramExecution,
 };
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
@@ -38,6 +38,10 @@ pub struct JimpleMethodSignature {
 pub struct JimpleMethod {
     pub signature: JimpleMethodSignature,
     pub display_signature: String,
+    #[serde(default)]
+    pub declaring_superclass: Option<String>,
+    #[serde(default)]
+    pub declaring_interfaces: Vec<String>,
     pub statements: Vec<JimpleStatement>,
 }
 
@@ -1001,6 +1005,40 @@ impl JimpleMethod {
             return None;
         };
         Some(*definition)
+    }
+
+    pub(super) fn symbolic_return_value(&self) -> Option<SymbolicValue> {
+        let returns: Vec<_> = self
+            .statements
+            .iter()
+            .filter_map(|statement| match &statement.operation {
+                JimpleOperation::Return { value } => Some((statement, value)),
+                _ => None,
+            })
+            .collect();
+        let [(return_statement, return_value)] = returns.as_slice() else {
+            return None;
+        };
+        let mut visiting = BTreeSet::new();
+        Some(self.resolve_locals_only(return_statement.id, return_value, &mut visiting))
+    }
+
+    pub(super) fn has_nonlocal_write_or_opaque_control(&self) -> bool {
+        self.statements
+            .iter()
+            .any(|statement| match &statement.operation {
+                JimpleOperation::Assign { left, .. } => {
+                    !matches!(left.kind, JimpleValueKind::Local { .. })
+                }
+                JimpleOperation::Throw { .. } | JimpleOperation::Opaque => true,
+                JimpleOperation::Identity { .. }
+                | JimpleOperation::If { .. }
+                | JimpleOperation::Invoke { .. }
+                | JimpleOperation::Return { .. }
+                | JimpleOperation::ReturnVoid
+                | JimpleOperation::Switch { .. }
+                | JimpleOperation::Goto => false,
+            })
     }
 
     pub(super) fn boolean_materialized_return(&self) -> Option<SymbolicValue> {
@@ -2742,6 +2780,8 @@ mod tests {
                 parameter_types: Vec::new(),
             },
             display_signature: String::from("<demo.Timer: void tick()>"),
+            declaring_superclass: None,
+            declaring_interfaces: Vec::new(),
             statements: vec![
                 statement(
                     0,
@@ -2826,6 +2866,8 @@ mod tests {
                 parameter_types: Vec::new(),
             },
             display_signature: String::from("<demo.Timer: boolean ready()>"),
+            declaring_superclass: None,
+            declaring_interfaces: Vec::new(),
             statements: vec![
                 statement(
                     0,
@@ -2911,6 +2953,8 @@ mod tests {
                 parameter_types: Vec::new(),
             },
             display_signature: String::from("<demo.Timer: void tick()>"),
+            declaring_superclass: None,
+            declaring_interfaces: Vec::new(),
             statements: vec![
                 statement(
                     0,
@@ -3009,6 +3053,8 @@ mod tests {
                 parameter_types: Vec::new(),
             },
             display_signature: String::from("<demo.Timer: void tick()>"),
+            declaring_superclass: None,
+            declaring_interfaces: Vec::new(),
             statements: vec![
                 statement(
                     0,
@@ -3108,6 +3154,8 @@ mod tests {
                 parameter_types: Vec::new(),
             },
             display_signature: String::from("<demo.Loop: void run()>"),
+            declaring_superclass: None,
+            declaring_interfaces: Vec::new(),
             statements: vec![
                 statement(
                     0,

@@ -38,10 +38,13 @@ Each concrete method is emitted as JSON with its signature and statements. Every
 - optional definition,
 - typed uses,
 - CFG successor statement IDs,
-- structured statement operations, and
-- recursively structured values for locals, constants, fields, arrays, arithmetic, casts, allocations and calls.
+- structured statement operations,
+- recursively structured values for locals, constants, fields, arrays, arithmetic, casts, allocations and calls, and
+- declaring-class superclass/interface metadata so downstream analysis can prove exact runtime dispatch when a concrete receiver type is known.
 
 `DumpJimple` is retained as a human-readable debugging companion.
+
+The Rust structural-effect path can optionally bind an exact runtime type for the entry receiver. It then performs JVM-style virtual/interface lookup through the exported hierarchy while preserving the concrete receiver through inherited methods. Bounded side-effect-free single-return helpers can be substituted symbolically, so polymorphic wrappers remain abstract until a runtime class is known and then specialize mechanically.
 
 ## GTNH spike results
 
