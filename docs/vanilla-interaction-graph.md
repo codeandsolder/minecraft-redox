@@ -126,6 +126,15 @@ Source APIs are connected to engine primitives through declarative binding descr
 
 Quiescence has the corresponding domain-neutral primitive: keyed schedule-once reaction reevaluations survive ordinary dependency invalidation, preserve the first accepted deadline for duplicate keys, and order same-time callbacks by priority then insertion sequence. Minecraft-specific block revalidation, chunk policy, source-tick-to-time conversion, and the legacy 1000-per-world-tick budget remain adapter policy rather than generic graph semantics.
 
+## Stochastic opportunity evidence
+
+Crop growth confirms a third execution family distinct from polling clocks and keyed scheduled callbacks. Vanilla random ticks have two separate randomness sources that must not be conflated:
+
+- `WorldServer.func_147456_g()` selects candidate block positions by advancing the world `updateLCG` state. For each active `ExtendedBlockStorage` needing random ticks, the compiled CFG contains a natural induction loop `i = 0; i < 3; ++i`. `JimpleMethod::fixed_trip_loops()` recovers that loop structurally and proves exactly **3 iterations** without knowing Minecraft names. Each iteration advances `updateLCG = updateLCG * 3 + 1013904223`, extracts three coordinate nibbles, tests the selected block's random-tick flag, and may dispatch `Block.updateTick(...)`.
+- `BlockCrops.updateTick()` receives the world's separate `java.util.Random` instance and, only after its deterministic light/stage guards, performs `nextInt((int)(25 / growthFactor) + 1)`. A declarative `JimpleUniformIntBinding` now lifts that source API call into a uniform integer draw while preserving the RNG receiver as stream identity, the symbolic exclusive bound, guards, and call-resolution provenance. On the real crop handler this yields one draw on parameter 4 with exactly the source growth bound.
+
+This argues against per-crop stochastic clocks. The dense world selector should remain a specialized source that owns its RNG state/order and emits causal callback opportunities. Handler-local random draws remain explicit effects on the distinct RNG stream when those callbacks execute. The graph only needs an unkeyed external-event injection surface for emitted callbacks; it does not need to own or statistically approximate the legacy random-tick selector.
+
 ## Missing pieces exposed by vanilla
 
 The current graph runtime proves the scheduling model but intentionally still has prototype numeric state. Exact Minecraft lowering needs:

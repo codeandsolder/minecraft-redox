@@ -15,7 +15,8 @@ pub use program::{
     JimpleClockedStateCandidate, JimpleEffectCallFrame, JimpleEffectGuard, JimpleProgram,
     JimpleProgramCall, JimpleProgramCallResolution, JimpleProgramEffectSummary,
     JimpleProgramFieldWrite, JimpleScheduleOnceBinding, JimpleScheduleOnceCandidate,
-    JimpleUnresolvedEffectCall, JimpleUnresolvedEffectReason, ProgramExecution,
+    JimpleUniformIntBinding, JimpleUniformIntCandidate, JimpleUnresolvedEffectCall,
+    JimpleUnresolvedEffectReason, ProgramExecution,
 };
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
@@ -398,6 +399,19 @@ pub struct JimpleTemporalSummary {
     pub comparisons: Vec<JimpleFieldComparison>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct JimpleFixedTripLoop {
+    pub header_statement_id: usize,
+    pub induction_local: String,
+    pub initial_value: i64,
+    pub step: i64,
+    pub comparison_operator: String,
+    pub bound: i64,
+    pub continue_when_condition: bool,
+    pub iterations: u64,
+    pub statement_ids: Vec<usize>,
+}
+
 /// Decode methods produced by the structured Jimple exporter.
 ///
 /// # Errors
@@ -431,6 +445,147 @@ impl JimpleMethod {
             self.add_value_dependencies(before_id, value, &mut included, &mut pending);
         }
         included.into_iter().collect()
+    }
+
+    /// Recover natural loops with a provable constant trip count.
+    ///
+    /// This recognizes ordinary compiler-lowered induction loops from CFG structure rather than
+    /// source syntax. Ambiguous induction, non-constant bounds, overflow, or multiple loop-body
+    /// successors are left unresolved.
+    #[must_use]
+    pub fn fixed_trip_loops(&self) -> Vec<JimpleFixedTripLoop> {
+        let predecessors = self.predecessors();
+        let dominators = self.dominators(&predecessors);
+        let mut loops = Vec::new();
+        for source in &self.statements {
+            for header_id in &source.successors {
+                if !dominators
+                    .get(&source.id)
+                    .is_some_and(|set| set.contains(header_id))
+                {
+                    continue;
+                }
+                let Some(header) = self.statements.iter().find(|item| item.id == *header_id) else {
+                    continue;
+                };
+                let JimpleOperation::If { condition } = &header.operation else {
+                    continue;
+                };
+                let Some((local, operator, bound)) = induction_comparison(condition) else {
+                    continue;
+                };
+                let loop_nodes = natural_loop_nodes(header.id, source.id, &predecessors);
+                let [when_false, when_true] = header.successors.as_slice() else {
+                    continue;
+                };
+                let false_in = loop_nodes.contains(when_false);
+                let true_in = loop_nodes.contains(when_true);
+                if false_in == true_in {
+                    continue;
+                }
+                let continue_when_condition = true_in;
+                let definitions = self.reaching_local_definitions(header.id, &local);
+                let mut initial = None;
+                let mut step = None;
+                for definition in definitions {
+                    if loop_nodes.contains(&definition.id) {
+                        if let Some(delta) = local_step(definition, &local)
+                            && step.replace(delta).is_some()
+                        {
+                            step = None;
+                            break;
+                        }
+                    } else if let Some(value) = local_constant_definition(definition, &local)
+                        && initial.replace(value).is_some()
+                    {
+                        initial = None;
+                        break;
+                    }
+                }
+                let (Some(initial_value), Some(step)) = (initial, step) else {
+                    continue;
+                };
+                let Some(iterations) = fixed_trip_count(
+                    initial_value,
+                    step,
+                    &operator,
+                    bound,
+                    continue_when_condition,
+                ) else {
+                    continue;
+                };
+                loops.push(JimpleFixedTripLoop {
+                    header_statement_id: header.id,
+                    induction_local: local,
+                    initial_value,
+                    step,
+                    comparison_operator: operator,
+                    bound,
+                    continue_when_condition,
+                    iterations,
+                    statement_ids: loop_nodes.into_iter().collect(),
+                });
+            }
+        }
+        loops.sort_by_key(|item| item.header_statement_id);
+        loops.dedup_by_key(|item| item.header_statement_id);
+        loops
+    }
+
+    fn dominators(
+        &self,
+        predecessors: &BTreeMap<usize, Vec<usize>>,
+    ) -> BTreeMap<usize, BTreeSet<usize>> {
+        let Some(entry) = self.statements.first().map(|statement| statement.id) else {
+            return BTreeMap::new();
+        };
+        let universe: BTreeSet<_> = self
+            .statements
+            .iter()
+            .map(|statement| statement.id)
+            .collect();
+        let mut dominators: BTreeMap<_, _> = self
+            .statements
+            .iter()
+            .map(|statement| {
+                let set = if statement.id == entry {
+                    BTreeSet::from([entry])
+                } else {
+                    universe.clone()
+                };
+                (statement.id, set)
+            })
+            .collect();
+        loop {
+            let mut changed = false;
+            for statement in self
+                .statements
+                .iter()
+                .filter(|statement| statement.id != entry)
+            {
+                let Some(preds) = predecessors.get(&statement.id) else {
+                    continue;
+                };
+                if preds.is_empty() {
+                    continue;
+                }
+                let mut next = universe.clone();
+                for predecessor in preds {
+                    if let Some(dom) = dominators.get(predecessor) {
+                        next.retain(|candidate| dom.contains(candidate));
+                    }
+                }
+                next.insert(statement.id);
+                if dominators.get(&statement.id) != Some(&next) {
+                    dominators.insert(statement.id, next);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        dominators
     }
 
     /// Recover direct structural effects from this method without interpreting domain names.
@@ -1402,6 +1557,141 @@ fn field_comparison(statement_id: usize, value: &SymbolicValue) -> Option<Jimple
             constant,
             field_on_left: false,
         });
+    }
+    None
+}
+
+fn natural_loop_nodes(
+    header: usize,
+    source: usize,
+    predecessors: &BTreeMap<usize, Vec<usize>>,
+) -> BTreeSet<usize> {
+    let mut nodes = BTreeSet::from([header, source]);
+    let mut pending = vec![source];
+    while let Some(node) = pending.pop() {
+        for predecessor in predecessors.get(&node).into_iter().flatten() {
+            if nodes.insert(*predecessor) && *predecessor != header {
+                pending.push(*predecessor);
+            }
+        }
+    }
+    nodes
+}
+
+fn induction_comparison(value: &JimpleValue) -> Option<(String, String, i64)> {
+    let JimpleValueKind::Binary {
+        operator,
+        left,
+        right,
+    } = &value.kind
+    else {
+        return None;
+    };
+    if let (JimpleValueKind::Local { name }, JimpleValueKind::IntegerConstant { value }) =
+        (&left.kind, &right.kind)
+    {
+        return Some((name.clone(), operator.trim().to_owned(), *value));
+    }
+    let (JimpleValueKind::IntegerConstant { value }, JimpleValueKind::Local { name }) =
+        (&left.kind, &right.kind)
+    else {
+        return None;
+    };
+    let reversed = match operator.trim() {
+        "<" => ">",
+        "<=" => ">=",
+        ">" => "<",
+        ">=" => "<=",
+        "==" => "==",
+        "!=" => "!=",
+        _ => return None,
+    };
+    Some((name.clone(), reversed.to_owned(), *value))
+}
+
+fn local_constant_definition(statement: &JimpleStatement, name: &str) -> Option<i64> {
+    let (JimpleOperation::Assign { left, right } | JimpleOperation::Identity { left, right }) =
+        &statement.operation
+    else {
+        return None;
+    };
+    let JimpleValueKind::Local { name: target } = &left.kind else {
+        return None;
+    };
+    if target != name {
+        return None;
+    }
+    let JimpleValueKind::IntegerConstant { value } = right.kind else {
+        return None;
+    };
+    Some(value)
+}
+
+fn local_step(statement: &JimpleStatement, name: &str) -> Option<i64> {
+    let JimpleOperation::Assign { left, right } = &statement.operation else {
+        return None;
+    };
+    let JimpleValueKind::Local { name: target } = &left.kind else {
+        return None;
+    };
+    if target != name {
+        return None;
+    }
+    let JimpleValueKind::Binary {
+        operator,
+        left,
+        right,
+    } = &right.kind
+    else {
+        return None;
+    };
+    if matches!(&left.kind, JimpleValueKind::Local { name: source } if source == name)
+        && let JimpleValueKind::IntegerConstant { value } = right.kind
+    {
+        return match operator.trim() {
+            "+" => Some(value),
+            "-" => value.checked_neg(),
+            _ => None,
+        };
+    }
+    if operator.trim() == "+"
+        && matches!(&right.kind, JimpleValueKind::Local { name: source } if source == name)
+        && let JimpleValueKind::IntegerConstant { value } = left.kind
+    {
+        return Some(value);
+    }
+    None
+}
+
+fn fixed_trip_count(
+    initial: i64,
+    step: i64,
+    operator: &str,
+    bound: i64,
+    continue_when_condition: bool,
+) -> Option<u64> {
+    const MAX_PROVABLE_ITERATIONS: u64 = 1_000_000;
+    if step == 0 {
+        return None;
+    }
+    let condition = |value: i64| match operator {
+        "<" => Some(value < bound),
+        "<=" => Some(value <= bound),
+        ">" => Some(value > bound),
+        ">=" => Some(value >= bound),
+        "==" => Some(value == bound),
+        "!=" => Some(value != bound),
+        _ => None,
+    };
+    let mut value = initial;
+    for iterations in 0..=MAX_PROVABLE_ITERATIONS {
+        if condition(value)? != continue_when_condition {
+            return Some(iterations);
+        }
+        if iterations == MAX_PROVABLE_ITERATIONS {
+            return None;
+        }
+        value = value.checked_add(step)?;
     }
     None
 }
@@ -3133,6 +3423,21 @@ mod tests {
         Ok(())
     }
 
+    fn assert_three_iteration_loop(method: &super::JimpleMethod) -> anyhow::Result<()> {
+        let loops = method.fixed_trip_loops();
+        let [recovered] = loops.as_slice() else {
+            return Err(anyhow::anyhow!("expected one fixed-trip loop"));
+        };
+        assert_eq!(recovered.header_statement_id, 2);
+        assert_eq!(recovered.induction_local, "i");
+        assert_eq!(recovered.initial_value, 0);
+        assert_eq!(recovered.step, 1);
+        assert_eq!(recovered.bound, 3);
+        assert!(!recovered.continue_when_condition);
+        assert_eq!(recovered.iterations, 3);
+        Ok(())
+    }
+
     #[test]
     fn finitely_executes_bounded_array_loop() -> anyhow::Result<()> {
         let array = local("array", "int[]");
@@ -3208,6 +3513,8 @@ mod tests {
                 statement(6, Vec::new(), super::JimpleOperation::ReturnVoid),
             ],
         };
+        assert_three_iteration_loop(&method)?;
+
         let execution = method.execute_finite(100)?;
         assert_eq!(execution.steps, 16);
         let array = execution

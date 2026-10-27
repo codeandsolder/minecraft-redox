@@ -75,6 +75,21 @@ pub struct JimpleProgramCall {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct JimpleUniformIntBinding {
+    pub callee: JimpleMethodSignature,
+    pub bound_argument: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct JimpleUniformIntCandidate {
+    pub call_path: Vec<JimpleEffectCallFrame>,
+    pub guards: Vec<JimpleEffectGuard>,
+    pub resolution: JimpleProgramCallResolution,
+    pub stream: Option<SymbolicValue>,
+    pub bound_exclusive: SymbolicValue,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub struct JimpleScheduleOnceBinding {
     pub callee: JimpleMethodSignature,
     pub key_arguments: Vec<usize>,
@@ -110,6 +125,46 @@ pub struct JimpleProgramEffectSummary {
 }
 
 impl JimpleProgramEffectSummary {
+    /// Bind calls to a source RNG API into uniform integer draws.
+    ///
+    /// The receiver remains explicit so distinct source RNG streams do not collapse together.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a matching call does not contain the configured bound argument.
+    pub fn bind_uniform_int(
+        &self,
+        binding: &JimpleUniformIntBinding,
+    ) -> Result<Vec<JimpleUniformIntCandidate>> {
+        self.calls
+            .iter()
+            .filter(|call| {
+                call.call_path
+                    .last()
+                    .is_some_and(|frame| frame.callee == binding.callee)
+            })
+            .map(|call| {
+                let bound_exclusive = call
+                    .arguments
+                    .get(binding.bound_argument)
+                    .cloned()
+                    .with_context(|| {
+                        format!(
+                            "uniform-int bound argument {} missing from call to {:?}",
+                            binding.bound_argument, binding.callee
+                        )
+                    })?;
+                Ok(JimpleUniformIntCandidate {
+                    call_path: call.call_path.clone(),
+                    guards: call.guards.clone(),
+                    resolution: call.resolution,
+                    stream: call.receiver.clone(),
+                    bound_exclusive,
+                })
+            })
+            .collect()
+    }
+
     /// Bind calls to a source scheduler API into generic schedule-once candidates.
     ///
     /// The binding is declarative: argument positions define the canonical deduplication key,
@@ -4773,6 +4828,63 @@ mod tests {
         assert!(matches!(
             candidate.delay,
             SymbolicValue::Integer { value: 2, .. }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn uniform_int_binding_preserves_stream_and_bound() -> Result<()> {
+        let callee = JimpleMethodSignature {
+            owner: String::from("demo.Random"),
+            name: String::from("draw"),
+            return_type: String::from("int"),
+            parameter_types: vec![String::from("int")],
+        };
+        let stream = SymbolicValue::Parameter {
+            index: 4,
+            type_name: String::from("demo.Random"),
+        };
+        let summary = JimpleProgramEffectSummary {
+            entry: JimpleMethodSignature {
+                owner: String::from("demo.Handler"),
+                name: String::from("run"),
+                return_type: String::from("void"),
+                parameter_types: Vec::new(),
+            },
+            possible_field_writes: Vec::new(),
+            calls: vec![JimpleProgramCall {
+                call_path: vec![JimpleEffectCallFrame {
+                    caller: JimpleMethodSignature {
+                        owner: String::from("demo.Handler"),
+                        name: String::from("run"),
+                        return_type: String::from("void"),
+                        parameter_types: Vec::new(),
+                    },
+                    statement_id: 7,
+                    invoke_kind: String::from("JVirtualInvokeExpr"),
+                    callee: callee.clone(),
+                }],
+                guards: Vec::new(),
+                receiver: Some(stream.clone()),
+                arguments: vec![SymbolicValue::Integer {
+                    value: 11,
+                    type_name: String::from("int"),
+                }],
+                resolution: JimpleProgramCallResolution::DynamicDispatch,
+            }],
+            unresolved_calls: Vec::new(),
+        };
+        let candidates = summary.bind_uniform_int(&JimpleUniformIntBinding {
+            callee,
+            bound_argument: 0,
+        })?;
+        let [candidate] = candidates.as_slice() else {
+            bail!("expected one uniform draw candidate");
+        };
+        assert_eq!(candidate.stream, Some(stream));
+        assert!(matches!(
+            candidate.bound_exclusive,
+            SymbolicValue::Integer { value: 11, .. }
         ));
         Ok(())
     }
