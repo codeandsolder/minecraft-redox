@@ -33,20 +33,22 @@ On the vanilla sample this immediately finds three tick-polling counters:
 - furnace burn time: decrement by 1, with zero/nonzero boundary tests;
 - furnace cook time: increment by 1, reset to 0, with the 200 boundary test;
 - brewing time: decrement by 1, reset to 0 or 400;
-- hopper cooldown: decrement by 1 (its 0/8 resets are hidden behind a parameterized setter, which is the next interprocedural effect-summary target).
+- hopper cooldown: decrement by 1; interprocedural effect composition now also recovers helper-mediated resets to `0` and `8`.
 
 By contrast, crop, repeater, and torch update handlers do not contain local polling counters. That is useful negative evidence rather than a failure: the repeater/torch are already invoked by the world scheduled-update mechanism, while crops receive stochastic random-tick opportunities.
 
 ## Execution model validated in Quiescence
 
-Quiescence commit `7a45dc9` adds first-class sparse reactions:
+Quiescence commit `7a45dc9` adds first-class sparse reactions; `7a7d2c6` adds exact canonical atom/handle state alongside quantized numeric state:
 
 - dynamic read dependencies;
 - generation-stamped forecast invalidation when any dependency changes;
 - delayed causal transitions;
 - atomic batches of state writes;
 - a sparse reverse index for reaction dependencies so reaction-free node graphs do not carry an extra adjacency set per node;
-- next-event introspection for proactive simulation.
+- next-event introspection for proactive simulation;
+- exact `u64` canonical handles for immutable structured snapshots such as inventories/block states, with the same equality cutoff and dependency invalidation as numeric nodes;
+- atomic mixed numeric + atom write batches.
 
 A furnace-shaped example stores burn/cook deadlines rather than replaying 20 Hz polling. With three inputs and one coal-equivalent fuel, 80 seconds of simulated time reaches the same coarse terminal state using four causal queue events versus 1,600 legacy tick callbacks. This is a runtime-shape demonstration, not yet a claim of full vanilla furnace parity.
 
@@ -71,7 +73,7 @@ On the real vanilla Hopper `updateEntity` reachable dump this recovers the coold
 - one-hop helper effect: `setCooldown(0)` -> cooldown write `0`;
 - two-hop successful-transfer effect: `tryTransfer()` -> `setCooldown(8)` -> cooldown write `8`.
 
-These are reported as **possible structural effects**, not unconditional writes. CFG guards still need to be attached before they become executable graph reactions. Missing methods and unresolved dynamic dispatch remain explicit in the summary rather than being guessed.
+These are reported as **possible structural effects**, not unconditional writes. CFG guards and guarded piecewise local values are now attached before composition; missing methods and unresolved dynamic dispatch remain explicit rather than being guessed.
 
 ## CFG guards and predicate recovery
 
@@ -84,15 +86,28 @@ On the real vanilla Hopper `updateEntity` path this now yields:
 - the cooldown decrement guarded by non-null world, server-side execution, and cooldown `> 0`;
 - `setCooldown(0)` guarded by non-null world, server-side execution, and concrete `cooldown <= 0` (the legacy `func_145888_j()` helper is gone);
 - the successful-transfer `setCooldown(8)` path inherits the same `cooldown <= 0` predicate and lowers another static helper to its metadata bit test;
-- the final transfer-success local `l1` remains symbolic because several branch-dependent definitions reach it. That is the correct next frontier: guarded/piecewise value reconstruction rather than unsafe nearest-definition substitution.
+- the final transfer-success local `l1` is now reconstructed as a guarded piecewise value by walking complete entry-to-use CFG paths while carrying the last assignment. This handles initialize-then-conditionally-overwrite compiler shapes without pretending assignment-site guards alone describe the value at use time;
+- binary predicates over piecewise values are expanded into boolean formulas, common path guards are factored, and the real Hopper cooldown-8 condition now contains neither an unresolved local nor a remaining piecewise node.
 
-Furnace recovery also benefits immediately: burn-time decrement is structurally guarded by burn time `> 0`, while cook-time increment carries the server-side, input/fuel presence, burn-active, and can-smelt predicates.
+Furnace recovery also benefits immediately: burn-time decrement is structurally guarded by burn time `> 0`, while cook-time increment carries the server-side, input/fuel presence, burn-active, and can-smelt predicates. Piecewise path reconstruction is bounded and fail-closed: relevant CFG cycles or branching switches are not guessed.
+
+## Clocked-state candidates
+
+`JimpleProgram::clocked_state_candidates()` and the `jimple-clocked` CLI now combine direct temporal-counter recovery with the interprocedural guarded-effect summary. The result deliberately does **not** assert that a fixed-delta field is a timer. It records the evidence needed by a later lowering layer: delta per entry activation, activation guards, other guarded writes to the same state, direct comparisons, guard predicates that observe the state, and whether the receiver is the entry `this` object.
+
+The three vanilla samples expose why that distinction matters:
+
+- Hopper cooldown: one entry-owned candidate, delta `-1`, helper-mediated writes `0/8`, and two composed guards that observe the cooldown.
+- Brewing time: one entry-owned candidate, delta `-1`, writes `0/0/400`, direct `<= 0`/`!= 0` comparisons, and four observing guards.
+- Furnace: entry-owned burn (`-1`) and cook (`+1`) candidates **plus** `ItemStack.stackSize -= 1` on a nested receiver. The latter is a resource mutation with the same superficial fixed-delta shape, so the analyzer exposes it rather than naming every decrement a clock.
+
+Activation cadence remains external semantic evidence. Once a caller knows that one entry activation is 50 ms, Hopper's recovered `-1`, readiness-at-`<=0`, and successful reset-to-`8` can be represented as a 400 ms absolute deadline. Without that cadence evidence the IR remains per-activation rather than inventing time.
 
 ## Missing pieces exposed by vanilla
 
 The current graph runtime proves the scheduling model but intentionally still has prototype numeric state. Exact Minecraft lowering needs:
 
-- typed/canonical state values or stable handles for item stacks, block states, inventories, entities, and other structured resources;
+- richer typed/canonical value policy beyond the now-implemented exact atom/handle nodes when domain code needs more than immutable snapshot identity;
 - interprocedural effect summaries with parameter substitution, so a call like `setCooldown(8)` recovers as a concrete write even when the callee assigns a parameter to the field;
 - semantic lowering for the world scheduled-update queue, including priority and duplicate/coalescing behavior;
 - explicit stochastic event/RNG semantics for random ticks and random outcomes;

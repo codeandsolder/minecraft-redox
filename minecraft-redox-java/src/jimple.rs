@@ -12,9 +12,9 @@ use serde::{Deserialize, Serialize};
 mod program;
 pub use program::{
     AbstractMapEntry, AbstractMapSnapshot, AbstractOpaqueCallShape, AbstractStaticFieldValue,
-    JimpleEffectCallFrame, JimpleEffectGuard, JimpleProgram, JimpleProgramEffectSummary,
-    JimpleProgramFieldWrite, JimpleUnresolvedEffectCall, JimpleUnresolvedEffectReason,
-    ProgramExecution,
+    JimpleClockedStateCandidate, JimpleEffectCallFrame, JimpleEffectGuard, JimpleProgram,
+    JimpleProgramEffectSummary, JimpleProgramFieldWrite, JimpleUnresolvedEffectCall,
+    JimpleUnresolvedEffectReason, ProgramExecution,
 };
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]

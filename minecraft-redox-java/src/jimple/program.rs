@@ -11,8 +11,8 @@ use serde::Serialize;
 use super::{
     AbstractArrayEntry, AbstractArrayIdentity, AbstractArraySnapshot, AbstractFieldValue,
     AbstractInvocation, AbstractObjectSnapshot, AbstractValue, ExecutionState, JimpleDirectEffect,
-    JimpleGuard, JimpleInvocation, JimpleMethod, JimpleMethodSignature, JimpleOperation,
-    JimpleStatement, JimpleValue, JimpleValueKind, MutableArray, MutableObject,
+    JimpleFieldComparison, JimpleGuard, JimpleInvocation, JimpleMethod, JimpleMethodSignature,
+    JimpleOperation, JimpleStatement, JimpleValue, JimpleValueKind, MutableArray, MutableObject,
     SymbolicPiecewiseArm, SymbolicValue, abstract_array_identity, abstract_binary, abstract_cast,
     abstract_default_value, abstract_truth, abstract_unary, substitute_symbolic,
 };
@@ -70,6 +70,19 @@ pub struct JimpleProgramEffectSummary {
     pub entry: JimpleMethodSignature,
     pub possible_field_writes: Vec<JimpleProgramFieldWrite>,
     pub unresolved_calls: Vec<JimpleUnresolvedEffectCall>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct JimpleClockedStateCandidate {
+    pub update_statement_id: usize,
+    pub field: super::JimpleFieldSignature,
+    pub receiver: Option<SymbolicValue>,
+    pub receiver_is_entry_this: bool,
+    pub delta_per_activation: i64,
+    pub activation_guards: Vec<JimpleEffectGuard>,
+    pub guarded_writes: Vec<JimpleProgramFieldWrite>,
+    pub direct_comparisons: Vec<JimpleFieldComparison>,
+    pub observed_guards: Vec<JimpleEffectGuard>,
 }
 
 #[derive(Clone, Copy)]
@@ -200,6 +213,85 @@ impl JimpleProgram {
             &mut summary,
         );
         Ok(summary)
+    }
+
+    /// Recover fields that advance by a fixed amount on each entry activation.
+    ///
+    /// This deliberately stops short of assigning wall-clock meaning to one activation. A caller
+    /// that knows the entry cadence can lower a stable monotonic candidate to a deadline/epoch,
+    /// while irregular entrypoints can keep the same per-activation representation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `entry` is absent from the program.
+    pub fn clocked_state_candidates(
+        &self,
+        entry: &JimpleMethodSignature,
+    ) -> Result<Vec<JimpleClockedStateCandidate>> {
+        let method = self
+            .method(entry)
+            .with_context(|| format!("Jimple method {entry:?} does not exist"))?;
+        let temporal = method.temporal_summary();
+        let effects = self.structural_effects(entry)?;
+        let mut candidates = Vec::new();
+        for update in temporal.counter_updates {
+            let Some(update_effect) = effects.possible_field_writes.iter().find(|write| {
+                write.call_path.is_empty()
+                    && write.statement_id == update.statement_id
+                    && write.field == update.field
+                    && write.receiver == update.receiver
+            }) else {
+                continue;
+            };
+            let guarded_writes: Vec<_> = effects
+                .possible_field_writes
+                .iter()
+                .filter(|write| {
+                    !(write.call_path.is_empty() && write.statement_id == update.statement_id)
+                        && write.field == update.field
+                        && write.receiver == update.receiver
+                })
+                .cloned()
+                .collect();
+            let direct_comparisons: Vec<_> = temporal
+                .comparisons
+                .iter()
+                .filter(|comparison| {
+                    comparison.field == update.field && comparison.receiver == update.receiver
+                })
+                .cloned()
+                .collect();
+            let mut observed_guards: Vec<_> = effects
+                .possible_field_writes
+                .iter()
+                .flat_map(|write| write.guards.iter())
+                .filter(|guard| {
+                    symbolic_references_field(
+                        &guard.condition,
+                        &update.field,
+                        update.receiver.as_ref(),
+                    )
+                })
+                .cloned()
+                .collect();
+            dedupe_effect_guards(&mut observed_guards);
+            let receiver_is_entry_this = matches!(
+                &update.receiver,
+                Some(SymbolicValue::This { type_name }) if type_name == &entry.owner
+            );
+            candidates.push(JimpleClockedStateCandidate {
+                update_statement_id: update.statement_id,
+                field: update.field,
+                receiver: update.receiver,
+                receiver_is_entry_this,
+                delta_per_activation: update.delta,
+                activation_guards: update_effect.guards.clone(),
+                guarded_writes,
+                direct_comparisons,
+                observed_guards,
+            });
+        }
+        Ok(candidates)
     }
 
     fn expand_structural_effects(
@@ -2294,6 +2386,74 @@ impl<'a> ProgramVm<'a> {
     }
 }
 
+fn dedupe_effect_guards(guards: &mut Vec<JimpleEffectGuard>) {
+    let mut index = 0;
+    while index < guards.len() {
+        if guards[..index].contains(&guards[index]) {
+            guards.remove(index);
+        } else {
+            index += 1;
+        }
+    }
+}
+
+fn symbolic_references_field(
+    value: &SymbolicValue,
+    field: &super::JimpleFieldSignature,
+    receiver: Option<&SymbolicValue>,
+) -> bool {
+    match value {
+        SymbolicValue::StaticField { field: candidate } => candidate == field && receiver.is_none(),
+        SymbolicValue::InstanceField {
+            base,
+            field: candidate,
+        } => candidate == field && receiver == Some(base.as_ref()),
+        SymbolicValue::ArrayElement { base, index }
+        | SymbolicValue::Binary {
+            left: base,
+            right: index,
+            ..
+        } => {
+            symbolic_references_field(base, field, receiver)
+                || symbolic_references_field(index, field, receiver)
+        }
+        SymbolicValue::Cast { value, .. }
+        | SymbolicValue::Unary { value, .. }
+        | SymbolicValue::ArrayLength { value }
+        | SymbolicValue::NewArray { size: value, .. } => {
+            symbolic_references_field(value, field, receiver)
+        }
+        SymbolicValue::NewMultiArray { sizes, .. } | SymbolicValue::Phi { values: sizes } => sizes
+            .iter()
+            .any(|item| symbolic_references_field(item, field, receiver)),
+        SymbolicValue::Piecewise { arms } => arms.iter().any(|arm| {
+            symbolic_references_field(&arm.value, field, receiver)
+                || arm
+                    .guards
+                    .iter()
+                    .any(|guard| symbolic_references_field(&guard.condition, field, receiver))
+        }),
+        SymbolicValue::Invoke {
+            base, arguments, ..
+        } => {
+            base.as_deref()
+                .is_some_and(|base| symbolic_references_field(base, field, receiver))
+                || arguments
+                    .iter()
+                    .any(|argument| symbolic_references_field(argument, field, receiver))
+        }
+        SymbolicValue::Integer { .. }
+        | SymbolicValue::Float { .. }
+        | SymbolicValue::String { .. }
+        | SymbolicValue::Null
+        | SymbolicValue::Parameter { .. }
+        | SymbolicValue::Local { .. }
+        | SymbolicValue::This { .. }
+        | SymbolicValue::New { .. }
+        | SymbolicValue::Unknown { .. } => false,
+    }
+}
+
 fn method_has_this(method: &JimpleMethod) -> bool {
     method.statements.iter().any(|statement| {
         matches!(
@@ -3418,6 +3578,78 @@ mod tests {
             .find(|field| field.field.owner == "demo.Box" && field.field.name == "value")
             .map(|field| &field.value)
             .context("joined object value missing")
+    }
+
+    #[test]
+    fn recovers_clocked_state_candidate_with_guarded_reset() -> Result<()> {
+        let counter_field = field("demo.Timer", "counter", "int");
+        let loaded = local("loaded", "int");
+        let decremented = local("decremented", "int");
+        let counter = static_field(&counter_field);
+        let tick = method(
+            "demo.Timer",
+            "tick",
+            vec![
+                statement(
+                    0,
+                    vec![1],
+                    JimpleOperation::Assign {
+                        left: loaded.clone(),
+                        right: counter.clone(),
+                    },
+                ),
+                statement(
+                    1,
+                    vec![2],
+                    JimpleOperation::Assign {
+                        left: decremented.clone(),
+                        right: binary("-", loaded, integer(1)),
+                    },
+                ),
+                statement(
+                    2,
+                    vec![3],
+                    JimpleOperation::Assign {
+                        left: counter.clone(),
+                        right: decremented,
+                    },
+                ),
+                statement(
+                    3,
+                    vec![5, 4],
+                    JimpleOperation::If {
+                        condition: binary("<=", counter.clone(), integer(0)),
+                    },
+                ),
+                statement(
+                    4,
+                    vec![5],
+                    JimpleOperation::Assign {
+                        left: counter,
+                        right: integer(0),
+                    },
+                ),
+                statement(5, Vec::new(), JimpleOperation::ReturnVoid),
+            ],
+        );
+        let signature = tick.signature.clone();
+        let candidates = JimpleProgram::new(vec![tick]).clocked_state_candidates(&signature)?;
+        let [candidate] = candidates.as_slice() else {
+            return Err(anyhow::anyhow!(
+                "expected one clocked-state candidate, got {}",
+                candidates.len()
+            ));
+        };
+        assert_eq!(candidate.field, counter_field);
+        assert!(!candidate.receiver_is_entry_this);
+        assert_eq!(candidate.delta_per_activation, -1);
+        assert_eq!(candidate.guarded_writes.len(), 1);
+        assert_eq!(candidate.direct_comparisons.len(), 1);
+        assert_eq!(candidate.direct_comparisons[0].operator, "<=");
+        assert_eq!(candidate.direct_comparisons[0].constant, 0);
+        assert_eq!(candidate.observed_guards.len(), 1);
+        assert!(candidate.observed_guards[0].expected);
+        Ok(())
     }
 
     #[test]
