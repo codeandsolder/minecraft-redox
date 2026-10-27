@@ -226,6 +226,10 @@ pub enum SymbolicValue {
         index: usize,
         type_name: String,
     },
+    Local {
+        name: String,
+        type_name: String,
+    },
     This {
         type_name: String,
     },
@@ -270,6 +274,9 @@ pub enum SymbolicValue {
     Phi {
         values: Vec<SymbolicValue>,
     },
+    Piecewise {
+        arms: Vec<SymbolicPiecewiseArm>,
+    },
     Invoke {
         method: JimpleMethodSignature,
         base: Option<Box<SymbolicValue>>,
@@ -279,6 +286,12 @@ pub enum SymbolicValue {
         type_name: String,
         text: String,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SymbolicPiecewiseArm {
+    pub guards: Vec<JimpleGuard>,
+    pub value: SymbolicValue,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -293,6 +306,25 @@ pub struct JimpleGuard {
     pub branch_statement_id: usize,
     pub expected: bool,
     pub condition: SymbolicValue,
+}
+
+#[derive(Clone)]
+struct PiecewisePathState {
+    statement_id: usize,
+    value: Option<SymbolicValue>,
+    guards: Vec<JimpleGuard>,
+    visited: BTreeSet<usize>,
+}
+
+impl PiecewisePathState {
+    fn new(statement_id: usize) -> Self {
+        Self {
+            statement_id,
+            value: None,
+            guards: Vec::new(),
+            visited: BTreeSet::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -548,29 +580,81 @@ impl JimpleMethod {
         value: &JimpleValue,
         visiting: &mut BTreeSet<(usize, String)>,
     ) -> SymbolicValue {
-        if let JimpleValueKind::Local { name } = &value.kind
-            && let Some(definition) = self.unique_reaching_local_definition(before_id, name)
-        {
-            let visit = (definition.id, name.clone());
-            if visiting.insert(visit.clone()) {
-                let resolved = match &definition.operation {
-                    JimpleOperation::Assign { right, .. }
-                    | JimpleOperation::Identity { right, .. } => {
-                        self.resolve_locals_only(definition.id, right, visiting)
-                    }
-                    _ => symbolic_leaf(value),
-                };
-                visiting.remove(&visit);
-                return resolved;
+        self.resolve_locals_impl(before_id, value, visiting, true)
+    }
+
+    fn resolve_locals_raw(
+        &self,
+        before_id: usize,
+        value: &JimpleValue,
+        visiting: &mut BTreeSet<(usize, String)>,
+    ) -> SymbolicValue {
+        self.resolve_locals_impl(before_id, value, visiting, false)
+    }
+
+    fn resolve_locals_impl(
+        &self,
+        before_id: usize,
+        value: &JimpleValue,
+        visiting: &mut BTreeSet<(usize, String)>,
+        allow_piecewise: bool,
+    ) -> SymbolicValue {
+        if let JimpleValueKind::Local { name } = &value.kind {
+            if let Some(definition) = self.unique_reaching_local_definition(before_id, name) {
+                let visit = (definition.id, name.clone());
+                if visiting.insert(visit.clone()) {
+                    let resolved = match &definition.operation {
+                        JimpleOperation::Assign { right, .. }
+                        | JimpleOperation::Identity { right, .. } => self.resolve_locals_impl(
+                            definition.id,
+                            right,
+                            visiting,
+                            allow_piecewise,
+                        ),
+                        _ => symbolic_leaf(value),
+                    };
+                    visiting.remove(&visit);
+                    return resolved;
+                }
+            } else if allow_piecewise
+                && let Some(piecewise) =
+                    self.piecewise_local_value(before_id, name, &value.type_name, visiting)
+            {
+                return piecewise;
             }
         }
+        self.resolve_locals_composite(before_id, value, visiting, allow_piecewise)
+    }
+
+    fn resolve_locals_composite(
+        &self,
+        before_id: usize,
+        value: &JimpleValue,
+        visiting: &mut BTreeSet<(usize, String)>,
+        allow_piecewise: bool,
+    ) -> SymbolicValue {
         match &value.kind {
             JimpleValueKind::ArrayRef { base, index } => SymbolicValue::ArrayElement {
-                base: Box::new(self.resolve_locals_only(before_id, base, visiting)),
-                index: Box::new(self.resolve_locals_only(before_id, index, visiting)),
+                base: Box::new(self.resolve_locals_impl(
+                    before_id,
+                    base,
+                    visiting,
+                    allow_piecewise,
+                )),
+                index: Box::new(self.resolve_locals_impl(
+                    before_id,
+                    index,
+                    visiting,
+                    allow_piecewise,
+                )),
             },
             JimpleValueKind::InstanceField { base, field } => SymbolicValue::InstanceField {
-                base: Box::new(self.resolve_locals_only(before_id, base, visiting)),
+                base: Box::new(self.resolve_locals_impl(
+                    before_id,
+                    base,
+                    visiting,
+                    allow_piecewise,
+                )),
                 field: field.clone(),
             },
             JimpleValueKind::Binary {
@@ -579,35 +663,81 @@ impl JimpleMethod {
                 right,
             } => SymbolicValue::Binary {
                 operator: operator.trim().to_owned(),
-                left: Box::new(self.resolve_locals_only(before_id, left, visiting)),
-                right: Box::new(self.resolve_locals_only(before_id, right, visiting)),
+                left: Box::new(self.resolve_locals_impl(
+                    before_id,
+                    left,
+                    visiting,
+                    allow_piecewise,
+                )),
+                right: Box::new(self.resolve_locals_impl(
+                    before_id,
+                    right,
+                    visiting,
+                    allow_piecewise,
+                )),
             },
             JimpleValueKind::Cast { cast_type, value } => SymbolicValue::Cast {
                 type_name: cast_type.clone(),
-                value: Box::new(self.resolve_locals_only(before_id, value, visiting)),
+                value: Box::new(self.resolve_locals_impl(
+                    before_id,
+                    value,
+                    visiting,
+                    allow_piecewise,
+                )),
             },
             JimpleValueKind::Unary { operator, value } => SymbolicValue::Unary {
                 operator: operator.clone(),
-                value: Box::new(self.resolve_locals_only(before_id, value, visiting)),
+                value: Box::new(self.resolve_locals_impl(
+                    before_id,
+                    value,
+                    visiting,
+                    allow_piecewise,
+                )),
             },
             JimpleValueKind::ArrayLength { value } => SymbolicValue::ArrayLength {
-                value: Box::new(self.resolve_locals_only(before_id, value, visiting)),
+                value: Box::new(self.resolve_locals_impl(
+                    before_id,
+                    value,
+                    visiting,
+                    allow_piecewise,
+                )),
             },
+            _ => self.resolve_locals_tail(before_id, value, visiting, allow_piecewise),
+        }
+    }
+
+    fn resolve_locals_tail(
+        &self,
+        before_id: usize,
+        value: &JimpleValue,
+        visiting: &mut BTreeSet<(usize, String)>,
+        allow_piecewise: bool,
+    ) -> SymbolicValue {
+        match &value.kind {
             JimpleValueKind::NewArray { element_type, size } => SymbolicValue::NewArray {
                 element_type: element_type.clone(),
-                size: Box::new(self.resolve_locals_only(before_id, size, visiting)),
+                size: Box::new(self.resolve_locals_impl(
+                    before_id,
+                    size,
+                    visiting,
+                    allow_piecewise,
+                )),
             },
             JimpleValueKind::NewMultiArray { array_type, sizes } => SymbolicValue::NewMultiArray {
                 array_type: array_type.clone(),
                 sizes: sizes
                     .iter()
-                    .map(|size| self.resolve_locals_only(before_id, size, visiting))
+                    .map(|size| {
+                        self.resolve_locals_impl(before_id, size, visiting, allow_piecewise)
+                    })
                     .collect(),
             },
             JimpleValueKind::Phi { values } => SymbolicValue::Phi {
                 values: values
                     .iter()
-                    .map(|item| self.resolve_locals_only(before_id, item, visiting))
+                    .map(|item| {
+                        self.resolve_locals_impl(before_id, item, visiting, allow_piecewise)
+                    })
                     .collect(),
             },
             JimpleValueKind::Invoke {
@@ -617,14 +747,24 @@ impl JimpleMethod {
                 ..
             } => SymbolicValue::Invoke {
                 method: method.clone(),
-                base: base
-                    .as_deref()
-                    .map(|item| Box::new(self.resolve_locals_only(before_id, item, visiting))),
+                base: base.as_deref().map(|item| {
+                    Box::new(self.resolve_locals_impl(before_id, item, visiting, allow_piecewise))
+                }),
                 arguments: arguments
                     .iter()
-                    .map(|item| self.resolve_locals_only(before_id, item, visiting))
+                    .map(|item| {
+                        self.resolve_locals_impl(before_id, item, visiting, allow_piecewise)
+                    })
                     .collect(),
             },
+            JimpleValueKind::ArrayRef { .. }
+            | JimpleValueKind::InstanceField { .. }
+            | JimpleValueKind::Binary { .. }
+            | JimpleValueKind::Cast { .. }
+            | JimpleValueKind::Unary { .. }
+            | JimpleValueKind::ArrayLength { .. } => {
+                unreachable!("composite value handled earlier")
+            }
             JimpleValueKind::Local { .. }
             | JimpleValueKind::IntegerConstant { .. }
             | JimpleValueKind::FloatConstant { .. }
@@ -639,6 +779,150 @@ impl JimpleMethod {
             | JimpleValueKind::New { .. }
             | JimpleValueKind::Opaque => symbolic_leaf(value),
         }
+    }
+
+    fn piecewise_local_value(
+        &self,
+        before_id: usize,
+        name: &str,
+        type_name: &str,
+        visiting: &mut BTreeSet<(usize, String)>,
+    ) -> Option<SymbolicValue> {
+        const MAX_PATH_STATES: usize = 256;
+        const MAX_ARMS: usize = 64;
+
+        let predecessors = self.predecessors();
+        let relevant = ancestors_of(before_id, &predecessors);
+        let entries: Vec<_> = self
+            .statements
+            .iter()
+            .filter(|statement| {
+                relevant.contains(&statement.id)
+                    && predecessors.get(&statement.id).is_none_or(Vec::is_empty)
+            })
+            .map(|statement| statement.id)
+            .collect();
+        if entries.is_empty() {
+            return None;
+        }
+
+        let mut pending: Vec<_> = entries.into_iter().map(PiecewisePathState::new).collect();
+        let mut arms = Vec::new();
+        let mut explored = 0_usize;
+        while let Some(mut path) = pending.pop() {
+            explored = explored.saturating_add(1);
+            if explored > MAX_PATH_STATES {
+                return None;
+            }
+            if path.statement_id == before_id {
+                let value = path.value?;
+                arms.push(SymbolicPiecewiseArm {
+                    guards: path.guards,
+                    value,
+                });
+                if arms.len() > MAX_ARMS {
+                    return None;
+                }
+                continue;
+            }
+            if !path.visited.insert(path.statement_id) {
+                return None;
+            }
+            let statement = self
+                .statements
+                .iter()
+                .find(|statement| statement.id == path.statement_id)?;
+            self.update_piecewise_local(statement, name, &mut path, visiting);
+            self.extend_piecewise_paths(statement, name, &path, &relevant, visiting, &mut pending)?;
+        }
+
+        normalize_piecewise_arms(&mut arms);
+        match arms.as_slice() {
+            [] => None,
+            [arm] => Some(arm.value.clone()),
+            _ if arms.iter().all(|arm| arm.value == arms[0].value) => Some(arms[0].value.clone()),
+            _ => Some(SymbolicValue::Piecewise { arms }),
+        }
+        .or_else(|| {
+            Some(SymbolicValue::Local {
+                name: name.to_owned(),
+                type_name: type_name.to_owned(),
+            })
+        })
+    }
+
+    fn update_piecewise_local(
+        &self,
+        statement: &JimpleStatement,
+        name: &str,
+        path: &mut PiecewisePathState,
+        visiting: &mut BTreeSet<(usize, String)>,
+    ) {
+        let Some(target) = operation_definition(&statement.operation) else {
+            return;
+        };
+        let JimpleValueKind::Local { name: defined } = &target.kind else {
+            return;
+        };
+        if defined != name {
+            return;
+        }
+        let (JimpleOperation::Assign { right, .. } | JimpleOperation::Identity { right, .. }) =
+            &statement.operation
+        else {
+            return;
+        };
+        let raw = self.resolve_locals_raw(statement.id, right, visiting);
+        path.value = Some(substitute_local_symbolic(&raw, name, path.value.as_ref()));
+    }
+
+    fn extend_piecewise_paths(
+        &self,
+        statement: &JimpleStatement,
+        name: &str,
+        path: &PiecewisePathState,
+        relevant: &BTreeSet<usize>,
+        visiting: &mut BTreeSet<(usize, String)>,
+        pending: &mut Vec<PiecewisePathState>,
+    ) -> Option<()> {
+        let successors: Vec<_> = statement
+            .successors
+            .iter()
+            .copied()
+            .filter(|successor| relevant.contains(successor))
+            .collect();
+        if successors.is_empty() {
+            return Some(());
+        }
+        if let JimpleOperation::If { condition } = &statement.operation {
+            let [when_false, when_true] = statement.successors.as_slice() else {
+                return None;
+            };
+            let raw = self.resolve_locals_raw(statement.id, condition, visiting);
+            let condition = substitute_local_symbolic(&raw, name, path.value.as_ref());
+            for (successor, expected) in [(*when_false, false), (*when_true, true)] {
+                if relevant.contains(&successor) {
+                    let mut branch = path.clone();
+                    branch.statement_id = successor;
+                    branch.guards.push(JimpleGuard {
+                        branch_statement_id: statement.id,
+                        expected,
+                        condition: condition.clone(),
+                    });
+                    pending.push(branch);
+                }
+            }
+            return Some(());
+        }
+        if matches!(statement.operation, JimpleOperation::Switch { .. }) && successors.len() > 1 {
+            return None;
+        }
+        for successor in successors {
+            let mut next = path.clone();
+            next.statement_id = successor;
+            pending.push(next);
+        }
+        Some(())
     }
 
     fn control_guards(&self, statement_id: usize) -> Vec<JimpleGuard> {
@@ -1125,6 +1409,150 @@ fn collect_invocations<'a>(
     }
 }
 
+fn ancestors_of(
+    statement_id: usize,
+    predecessors: &BTreeMap<usize, Vec<usize>>,
+) -> BTreeSet<usize> {
+    let mut reached = BTreeSet::from([statement_id]);
+    let mut pending = vec![statement_id];
+    while let Some(current) = pending.pop() {
+        if let Some(previous) = predecessors.get(&current) {
+            for predecessor in previous {
+                if reached.insert(*predecessor) {
+                    pending.push(*predecessor);
+                }
+            }
+        }
+    }
+    reached
+}
+
+fn normalize_piecewise_arms(arms: &mut Vec<SymbolicPiecewiseArm>) {
+    for arm in arms.iter_mut() {
+        arm.guards.sort_by_key(|guard| guard.branch_statement_id);
+        arm.guards.dedup_by(|left, right| {
+            left.branch_statement_id == right.branch_statement_id
+                && left.expected == right.expected
+                && left.condition == right.condition
+        });
+    }
+    let mut index = 0;
+    while index < arms.len() {
+        let duplicate = arms[..index]
+            .iter()
+            .any(|existing| existing == &arms[index]);
+        if duplicate {
+            arms.remove(index);
+        } else {
+            index += 1;
+        }
+    }
+}
+
+fn substitute_local_symbolic(
+    value: &SymbolicValue,
+    local_name: &str,
+    replacement: Option<&SymbolicValue>,
+) -> SymbolicValue {
+    if let SymbolicValue::Local { name, .. } = value
+        && name == local_name
+    {
+        return replacement.cloned().unwrap_or_else(|| value.clone());
+    }
+    match value {
+        SymbolicValue::InstanceField { base, field } => SymbolicValue::InstanceField {
+            base: Box::new(substitute_local_symbolic(base, local_name, replacement)),
+            field: field.clone(),
+        },
+        SymbolicValue::ArrayElement { base, index } => SymbolicValue::ArrayElement {
+            base: Box::new(substitute_local_symbolic(base, local_name, replacement)),
+            index: Box::new(substitute_local_symbolic(index, local_name, replacement)),
+        },
+        SymbolicValue::Binary {
+            operator,
+            left,
+            right,
+        } => SymbolicValue::Binary {
+            operator: operator.clone(),
+            left: Box::new(substitute_local_symbolic(left, local_name, replacement)),
+            right: Box::new(substitute_local_symbolic(right, local_name, replacement)),
+        },
+        SymbolicValue::Cast { type_name, value } => SymbolicValue::Cast {
+            type_name: type_name.clone(),
+            value: Box::new(substitute_local_symbolic(value, local_name, replacement)),
+        },
+        SymbolicValue::Unary { operator, value } => SymbolicValue::Unary {
+            operator: operator.clone(),
+            value: Box::new(substitute_local_symbolic(value, local_name, replacement)),
+        },
+        SymbolicValue::ArrayLength { value } => SymbolicValue::ArrayLength {
+            value: Box::new(substitute_local_symbolic(value, local_name, replacement)),
+        },
+        SymbolicValue::NewArray { element_type, size } => SymbolicValue::NewArray {
+            element_type: element_type.clone(),
+            size: Box::new(substitute_local_symbolic(size, local_name, replacement)),
+        },
+        SymbolicValue::NewMultiArray { array_type, sizes } => SymbolicValue::NewMultiArray {
+            array_type: array_type.clone(),
+            sizes: sizes
+                .iter()
+                .map(|size| substitute_local_symbolic(size, local_name, replacement))
+                .collect(),
+        },
+        SymbolicValue::Phi { values } => SymbolicValue::Phi {
+            values: values
+                .iter()
+                .map(|item| substitute_local_symbolic(item, local_name, replacement))
+                .collect(),
+        },
+        SymbolicValue::Piecewise { arms } => SymbolicValue::Piecewise {
+            arms: arms
+                .iter()
+                .map(|arm| SymbolicPiecewiseArm {
+                    guards: arm
+                        .guards
+                        .iter()
+                        .map(|guard| JimpleGuard {
+                            branch_statement_id: guard.branch_statement_id,
+                            expected: guard.expected,
+                            condition: substitute_local_symbolic(
+                                &guard.condition,
+                                local_name,
+                                replacement,
+                            ),
+                        })
+                        .collect(),
+                    value: substitute_local_symbolic(&arm.value, local_name, replacement),
+                })
+                .collect(),
+        },
+        SymbolicValue::Invoke {
+            method,
+            base,
+            arguments,
+        } => SymbolicValue::Invoke {
+            method: method.clone(),
+            base: base
+                .as_deref()
+                .map(|base| Box::new(substitute_local_symbolic(base, local_name, replacement))),
+            arguments: arguments
+                .iter()
+                .map(|argument| substitute_local_symbolic(argument, local_name, replacement))
+                .collect(),
+        },
+        SymbolicValue::Integer { .. }
+        | SymbolicValue::Float { .. }
+        | SymbolicValue::String { .. }
+        | SymbolicValue::Null
+        | SymbolicValue::Parameter { .. }
+        | SymbolicValue::Local { .. }
+        | SymbolicValue::This { .. }
+        | SymbolicValue::StaticField { .. }
+        | SymbolicValue::New { .. }
+        | SymbolicValue::Unknown { .. } => value.clone(),
+    }
+}
+
 pub(super) fn substitute_symbolic(
     value: &SymbolicValue,
     this_value: Option<&SymbolicValue>,
@@ -1181,6 +1609,23 @@ pub(super) fn substitute_symbolic(
                 .map(|item| substitute_symbolic(item, this_value, arguments))
                 .collect(),
         },
+        SymbolicValue::Piecewise { arms } => SymbolicValue::Piecewise {
+            arms: arms
+                .iter()
+                .map(|arm| SymbolicPiecewiseArm {
+                    guards: arm
+                        .guards
+                        .iter()
+                        .map(|guard| JimpleGuard {
+                            branch_statement_id: guard.branch_statement_id,
+                            expected: guard.expected,
+                            condition: substitute_symbolic(&guard.condition, this_value, arguments),
+                        })
+                        .collect(),
+                    value: substitute_symbolic(&arm.value, this_value, arguments),
+                })
+                .collect(),
+        },
         SymbolicValue::Invoke {
             method,
             base,
@@ -1198,6 +1643,7 @@ pub(super) fn substitute_symbolic(
         SymbolicValue::Integer { .. }
         | SymbolicValue::Float { .. }
         | SymbolicValue::String { .. }
+        | SymbolicValue::Local { .. }
         | SymbolicValue::Null
         | SymbolicValue::StaticField { .. }
         | SymbolicValue::New { .. }
@@ -1318,6 +1764,10 @@ fn symbolic_leaf(value: &JimpleValue) -> SymbolicValue {
         JimpleValueKind::NullConstant => SymbolicValue::Null,
         JimpleValueKind::Parameter { index } => SymbolicValue::Parameter {
             index: *index,
+            type_name: value.type_name.clone(),
+        },
+        JimpleValueKind::Local { name } => SymbolicValue::Local {
+            name: name.clone(),
             type_name: value.type_name.clone(),
         },
         JimpleValueKind::This => SymbolicValue::This {
@@ -2445,7 +2895,8 @@ mod tests {
     }
 
     #[test]
-    fn guards_use_cfg_reaching_definitions_and_keep_merged_locals_symbolic() {
+    fn guards_use_cfg_reaching_definitions_and_reconstructs_piecewise_locals() -> anyhow::Result<()>
+    {
         let this_local = local("this", "demo.Timer");
         let counter = instance_field(this_local.clone(), "demo.Timer", "counter");
         let gate = instance_field(this_local.clone(), "demo.Timer", "gate");
@@ -2525,7 +2976,114 @@ mod tests {
         assert!(!writes[0].guards[0].expected);
         assert_eq!(writes[1].field.name, "output");
         assert_eq!(writes[1].guards, Vec::new());
-        assert!(matches!(writes[1].value, SymbolicValue::Unknown { .. }));
+        let SymbolicValue::Piecewise { arms } = &writes[1].value else {
+            return Err(anyhow::anyhow!(
+                "expected piecewise merged local, got {:?}",
+                writes[1].value
+            ));
+        };
+        assert_eq!(arms.len(), 2);
+        assert!(arms.iter().any(|arm| {
+            matches!(arm.value, SymbolicValue::Integer { value: 1, .. })
+                && arm.guards.iter().any(|guard| !guard.expected)
+        }));
+        assert!(arms.iter().any(|arm| {
+            matches!(arm.value, SymbolicValue::Integer { value: 0, .. })
+                && arm.guards.iter().any(|guard| guard.expected)
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn piecewise_local_tracks_conditional_overwrite_after_initialization() -> anyhow::Result<()> {
+        let this_local = local("this", "demo.Timer");
+        let condition = instance_field(this_local.clone(), "demo.Timer", "condition");
+        let output = instance_field(this_local.clone(), "demo.Timer", "output");
+        let merged = local("merged", "int");
+        let method = super::JimpleMethod {
+            signature: super::JimpleMethodSignature {
+                owner: String::from("demo.Timer"),
+                name: String::from("tick"),
+                return_type: String::from("void"),
+                parameter_types: Vec::new(),
+            },
+            display_signature: String::from("<demo.Timer: void tick()>"),
+            statements: vec![
+                statement(
+                    0,
+                    vec![1],
+                    super::JimpleOperation::Identity {
+                        left: this_local,
+                        right: this_value("demo.Timer"),
+                    },
+                ),
+                statement(
+                    1,
+                    vec![2],
+                    super::JimpleOperation::Assign {
+                        left: merged.clone(),
+                        right: integer(0),
+                    },
+                ),
+                statement(
+                    2,
+                    vec![3, 4],
+                    super::JimpleOperation::If {
+                        condition: binary("!=", condition, integer(0)),
+                    },
+                ),
+                statement(
+                    3,
+                    vec![4],
+                    super::JimpleOperation::Assign {
+                        left: merged.clone(),
+                        right: integer(1),
+                    },
+                ),
+                statement(
+                    4,
+                    vec![5],
+                    super::JimpleOperation::Assign {
+                        left: output,
+                        right: merged,
+                    },
+                ),
+                statement(5, Vec::new(), super::JimpleOperation::ReturnVoid),
+            ],
+        };
+
+        let effects = method.effect_summary().effects;
+        let write = effects
+            .iter()
+            .find_map(|effect| match effect {
+                super::JimpleDirectEffect::FieldWrite(write) if write.field.name == "output" => {
+                    Some(write)
+                }
+                _ => None,
+            })
+            .ok_or_else(|| anyhow::anyhow!("output write missing"))?;
+        let SymbolicValue::Piecewise { arms } = &write.value else {
+            return Err(anyhow::anyhow!(
+                "expected piecewise overwrite, got {:?}",
+                write.value
+            ));
+        };
+        assert_eq!(arms.len(), 2);
+        assert!(arms.iter().any(|arm| {
+            matches!(arm.value, SymbolicValue::Integer { value: 1, .. })
+                && arm
+                    .guards
+                    .iter()
+                    .any(|guard| guard.branch_statement_id == 2 && !guard.expected)
+        }));
+        assert!(arms.iter().any(|arm| {
+            matches!(arm.value, SymbolicValue::Integer { value: 0, .. })
+                && arm
+                    .guards
+                    .iter()
+                    .any(|guard| guard.branch_statement_id == 2 && guard.expected)
+        }));
+        Ok(())
     }
 
     #[test]

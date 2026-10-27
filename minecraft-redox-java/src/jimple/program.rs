@@ -12,9 +12,9 @@ use super::{
     AbstractArrayEntry, AbstractArrayIdentity, AbstractArraySnapshot, AbstractFieldValue,
     AbstractInvocation, AbstractObjectSnapshot, AbstractValue, ExecutionState, JimpleDirectEffect,
     JimpleGuard, JimpleInvocation, JimpleMethod, JimpleMethodSignature, JimpleOperation,
-    JimpleStatement, JimpleValue, JimpleValueKind, MutableArray, MutableObject, SymbolicValue,
-    abstract_array_identity, abstract_binary, abstract_cast, abstract_default_value,
-    abstract_truth, abstract_unary, substitute_symbolic,
+    JimpleStatement, JimpleValue, JimpleValueKind, MutableArray, MutableObject,
+    SymbolicPiecewiseArm, SymbolicValue, abstract_array_identity, abstract_binary, abstract_cast,
+    abstract_default_value, abstract_truth, abstract_unary, substitute_symbolic,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -374,6 +374,12 @@ impl JimpleProgram {
             } => {
                 let left = self.simplify_guard_value(*left, depth + 1);
                 let right = self.simplify_guard_value(*right, depth + 1);
+                if let Some(expanded) = expand_piecewise_binary(&operator, &left, &right) {
+                    return self.simplify_guard_value(expanded, depth + 1);
+                }
+                if matches!(operator.as_str(), "&&" | "||") {
+                    return simplify_boolean_connective(operator, left, right);
+                }
                 simplify_boolean_comparison(operator, left, right)
             }
             SymbolicValue::Unary { operator, value } => {
@@ -409,6 +415,23 @@ impl JimpleProgram {
                 values: values
                     .into_iter()
                     .map(|item| self.simplify_guard_value(item, depth + 1))
+                    .collect(),
+            },
+            SymbolicValue::Piecewise { arms } => SymbolicValue::Piecewise {
+                arms: arms
+                    .into_iter()
+                    .map(|arm| SymbolicPiecewiseArm {
+                        guards: arm
+                            .guards
+                            .into_iter()
+                            .map(|guard| JimpleGuard {
+                                branch_statement_id: guard.branch_statement_id,
+                                expected: guard.expected,
+                                condition: self.simplify_guard_value(guard.condition, depth + 1),
+                            })
+                            .collect(),
+                        value: self.simplify_guard_value(arm.value, depth + 1),
+                    })
                     .collect(),
             },
             other => other,
@@ -2293,7 +2316,10 @@ fn symbolic_boolean(value: &SymbolicValue) -> bool {
             field.type_name == "boolean"
         }
         SymbolicValue::Binary { operator, .. } => {
-            matches!(operator.as_str(), "==" | "!=" | "<" | "<=" | ">" | ">=")
+            matches!(
+                operator.as_str(),
+                "==" | "!=" | "<" | "<=" | ">" | ">=" | "&&" | "||"
+            )
         }
         SymbolicValue::Unary { operator, .. } => operator == "!",
         SymbolicValue::Invoke { method, .. } => method.return_type == "boolean",
@@ -2304,11 +2330,168 @@ fn symbolic_boolean(value: &SymbolicValue) -> bool {
     }
 }
 
+fn expand_piecewise_binary(
+    operator: &str,
+    left: &SymbolicValue,
+    right: &SymbolicValue,
+) -> Option<SymbolicValue> {
+    match (left, right) {
+        (SymbolicValue::Piecewise { arms }, other) => {
+            piecewise_binary_formula(operator, arms, other, true)
+        }
+        (other, SymbolicValue::Piecewise { arms }) => {
+            piecewise_binary_formula(operator, arms, other, false)
+        }
+        _ => None,
+    }
+}
+
+fn piecewise_binary_formula(
+    operator: &str,
+    arms: &[SymbolicPiecewiseArm],
+    other: &SymbolicValue,
+    piecewise_on_left: bool,
+) -> Option<SymbolicValue> {
+    let common_guards = common_piecewise_guards(arms);
+    let mut alternatives = arms.iter().map(|arm| {
+        let comparison = if piecewise_on_left {
+            SymbolicValue::Binary {
+                operator: operator.to_owned(),
+                left: Box::new(arm.value.clone()),
+                right: Box::new(other.clone()),
+            }
+        } else {
+            SymbolicValue::Binary {
+                operator: operator.to_owned(),
+                left: Box::new(other.clone()),
+                right: Box::new(arm.value.clone()),
+            }
+        };
+        arm.guards
+            .iter()
+            .filter(|guard| !common_guards.contains(guard))
+            .map(guard_as_condition)
+            .chain(std::iter::once(comparison))
+            .reduce(and_symbolic)
+    });
+    let first = alternatives.next()??;
+    let alternatives =
+        alternatives.try_fold(first, |left, right| Some(or_symbolic(left, right?)))?;
+    common_guards
+        .iter()
+        .map(guard_as_condition)
+        .chain(std::iter::once(alternatives))
+        .reduce(and_symbolic)
+}
+
+fn common_piecewise_guards(arms: &[SymbolicPiecewiseArm]) -> Vec<JimpleGuard> {
+    let Some(first) = arms.first() else {
+        return Vec::new();
+    };
+    first
+        .guards
+        .iter()
+        .filter(|guard| arms.iter().all(|arm| arm.guards.contains(guard)))
+        .cloned()
+        .collect()
+}
+
+fn and_symbolic(left: SymbolicValue, right: SymbolicValue) -> SymbolicValue {
+    SymbolicValue::Binary {
+        operator: String::from("&&"),
+        left: Box::new(left),
+        right: Box::new(right),
+    }
+}
+
+fn or_symbolic(left: SymbolicValue, right: SymbolicValue) -> SymbolicValue {
+    SymbolicValue::Binary {
+        operator: String::from("||"),
+        left: Box::new(left),
+        right: Box::new(right),
+    }
+}
+
+fn guard_as_condition(guard: &JimpleGuard) -> SymbolicValue {
+    if guard.expected {
+        guard.condition.clone()
+    } else {
+        SymbolicValue::Unary {
+            operator: String::from("!"),
+            value: Box::new(guard.condition.clone()),
+        }
+    }
+}
+
+fn simplify_boolean_connective(
+    operator: String,
+    left: SymbolicValue,
+    right: SymbolicValue,
+) -> SymbolicValue {
+    if left == right {
+        return left;
+    }
+    let left_constant = symbolic_boolean_constant(&left);
+    let right_constant = symbolic_boolean_constant(&right);
+    match (operator.as_str(), left_constant, right_constant) {
+        ("&&", Some(false), _) | ("&&", _, Some(false)) => boolean_constant(false),
+        ("&&", Some(true), _) => right,
+        ("&&", _, Some(true)) | ("||", _, Some(false)) => left,
+        ("||", Some(true), _) | ("||", _, Some(true)) => boolean_constant(true),
+        ("||", Some(false), _) => right,
+        _ => SymbolicValue::Binary {
+            operator,
+            left: Box::new(left),
+            right: Box::new(right),
+        },
+    }
+}
+
+fn symbolic_boolean_constant(value: &SymbolicValue) -> Option<bool> {
+    let SymbolicValue::Integer { value, .. } = value else {
+        return None;
+    };
+    match value {
+        0 => Some(false),
+        1 => Some(true),
+        _ => None,
+    }
+}
+
+fn boolean_constant(value: bool) -> SymbolicValue {
+    SymbolicValue::Integer {
+        value: i64::from(value),
+        type_name: String::from("boolean"),
+    }
+}
+
 fn simplify_boolean_comparison(
     operator: String,
     left: SymbolicValue,
     right: SymbolicValue,
 ) -> SymbolicValue {
+    if let (
+        SymbolicValue::Integer {
+            value: left_value, ..
+        },
+        SymbolicValue::Integer {
+            value: right_value, ..
+        },
+    ) = (&left, &right)
+    {
+        let result = match operator.as_str() {
+            "==" => Some(left_value == right_value),
+            "!=" => Some(left_value != right_value),
+            "<" => Some(left_value < right_value),
+            "<=" => Some(left_value <= right_value),
+            ">" => Some(left_value > right_value),
+            ">=" => Some(left_value >= right_value),
+            _ => None,
+        };
+        if let Some(result) = result {
+            return boolean_constant(result);
+        }
+    }
     let simplify = |boolean: SymbolicValue, integer: i64| {
         if !symbolic_boolean(&boolean) || !matches!(integer, 0 | 1) {
             return None;
@@ -3235,6 +3418,49 @@ mod tests {
             .find(|field| field.field.owner == "demo.Box" && field.field.name == "value")
             .map(|field| &field.value)
             .context("joined object value missing")
+    }
+
+    #[test]
+    fn simplifies_piecewise_boolean_comparison_to_path_predicate() {
+        let flag = SymbolicValue::StaticField {
+            field: field("demo.Config", "FLAG", "boolean"),
+        };
+        let piecewise = SymbolicValue::Piecewise {
+            arms: vec![
+                SymbolicPiecewiseArm {
+                    guards: vec![JimpleGuard {
+                        branch_statement_id: 1,
+                        expected: false,
+                        condition: flag.clone(),
+                    }],
+                    value: SymbolicValue::Integer {
+                        value: 1,
+                        type_name: String::from("int"),
+                    },
+                },
+                SymbolicPiecewiseArm {
+                    guards: vec![JimpleGuard {
+                        branch_statement_id: 1,
+                        expected: true,
+                        condition: flag.clone(),
+                    }],
+                    value: SymbolicValue::Integer {
+                        value: 0,
+                        type_name: String::from("int"),
+                    },
+                },
+            ],
+        };
+        let expression = SymbolicValue::Binary {
+            operator: String::from("=="),
+            left: Box::new(piecewise),
+            right: Box::new(SymbolicValue::Integer {
+                value: 0,
+                type_name: String::from("int"),
+            }),
+        };
+        let simplified = JimpleProgram::default().simplify_guard_value(expression, 0);
+        assert_eq!(simplified, flag);
     }
 
     #[test]
