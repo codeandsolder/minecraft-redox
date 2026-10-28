@@ -6,9 +6,9 @@ use std::{
 };
 
 use minecraft_redox_core::transaction::{
-    MemoryTransactionHost, MemoryTransactionObject, MemoryTransactionState, MemoryTransactionStore,
-    TransactionDatum, TransactionExecution, TransactionExecutionLimits, TransactionProgram,
-    execute_transaction,
+    MemoryTransactionHost, MemoryTransactionHostQuery, MemoryTransactionObject,
+    MemoryTransactionState, MemoryTransactionStore, TransactionDatum, TransactionExecution,
+    TransactionExecutionLimits, TransactionProgram, execute_transaction,
 };
 use quiescence_core::NodeId;
 use quiescence_runtime::{EvalContext, EvalError, StateWrite};
@@ -170,6 +170,19 @@ pub enum ReactionArgument {
     Datum(TransactionDatum),
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct ReactionHostPreparation {
+    pub stores: Vec<ReactionStoreBinding>,
+    pub objects: BTreeMap<u64, MemoryTransactionObject>,
+    pub capabilities: BTreeMap<u64, BTreeSet<String>>,
+    pub host_queries: Vec<MemoryTransactionHostQuery>,
+}
+
+type HostPreparer = dyn for<'a> Fn(&EvalContext<'a>) -> Result<ReactionHostPreparation, EvalError>
+    + Send
+    + Sync
+    + 'static;
+
 #[derive(Clone)]
 pub struct TransactionReactionAdapter {
     program: Arc<TransactionProgram>,
@@ -178,6 +191,7 @@ pub struct TransactionReactionAdapter {
     arguments: Vec<ReactionArgument>,
     receiver: Option<ReactionArgument>,
     quantity_component: String,
+    host_preparer: Option<Arc<HostPreparer>>,
 }
 
 #[derive(Clone, Debug)]
@@ -204,7 +218,20 @@ impl TransactionReactionAdapter {
             arguments,
             receiver,
             quantity_component: quantity_component.into(),
+            host_preparer: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_host_preparer<F>(mut self, preparer: F) -> Self
+    where
+        F: for<'a> Fn(&EvalContext<'a>) -> Result<ReactionHostPreparation, EvalError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.host_preparer = Some(Arc::new(preparer));
+        self
     }
 
     #[must_use]
@@ -225,22 +252,31 @@ impl TransactionReactionAdapter {
         &self,
         context: &EvalContext<'_>,
     ) -> Result<TransactionReactionResult, EvalError> {
-        let snapshot_ids = self
-            .stores
+        let preparation = self.host_preparer.as_ref().map_or_else(
+            || Ok(ReactionHostPreparation::default()),
+            |prepare| prepare(context),
+        )?;
+        let mut stores = self.stores.clone();
+        stores.extend(preparation.stores.iter().copied());
+        validate_store_bindings(&stores).map_err(EvalError::Message)?;
+        let snapshot_ids = stores
             .iter()
             .map(|binding| context.read_atom(binding.node))
             .collect::<Result<Vec<_>, _>>()?;
+        let reserved_handle = preparation_reserved_handle(&stores, &preparation);
         let mut interner = self
             .interner
             .lock()
             .map_err(|_| EvalError::Message(String::from("snapshot interner lock poisoned")))?;
         let mut host = build_host(
             &interner,
-            &self.stores,
+            &stores,
             &snapshot_ids,
             &self.quantity_component,
+            reserved_handle,
         )
         .map_err(EvalError::Message)?;
+        apply_preparation(&mut host.state, preparation);
         let receiver = self
             .receiver
             .as_ref()
@@ -262,7 +298,7 @@ impl TransactionReactionAdapter {
         )
         .map_err(|error| EvalError::Message(error.to_string()))?;
         let state_values = host.state.state_values.clone();
-        let writes = publish_stores(&mut interner, &self.stores, &snapshot_ids, &host.state)
+        let writes = publish_stores(&mut interner, &stores, &snapshot_ids, &host.state)
             .map_err(EvalError::Message)?;
         Ok(TransactionReactionResult {
             execution,
@@ -290,6 +326,7 @@ fn build_host(
     bindings: &[ReactionStoreBinding],
     snapshot_ids: &[u64],
     quantity_component: &str,
+    reserved_handle: u64,
 ) -> Result<MemoryTransactionHost, String> {
     if bindings.len() != snapshot_ids.len() {
         return Err(String::from("store binding/snapshot count mismatch"));
@@ -300,7 +337,7 @@ fn build_host(
         .max()
         .unwrap_or(0);
     let mut state = MemoryTransactionState {
-        next_handle: max_store_handle.saturating_add(1),
+        next_handle: max_store_handle.max(reserved_handle).saturating_add(1),
         ..MemoryTransactionState::default()
     };
     for (binding, snapshot_id) in bindings.iter().zip(snapshot_ids) {
@@ -313,6 +350,68 @@ fn build_host(
         state,
         quantity_component: quantity_component.to_owned(),
     })
+}
+
+fn validate_store_bindings(bindings: &[ReactionStoreBinding]) -> Result<(), String> {
+    let mut handles = BTreeSet::new();
+    let mut nodes = BTreeSet::new();
+    for binding in bindings {
+        if !handles.insert(binding.local_handle) {
+            return Err(format!(
+                "duplicate transaction store handle {}",
+                binding.local_handle
+            ));
+        }
+        if !nodes.insert(binding.node) {
+            return Err(format!("duplicate graph store node {:?}", binding.node));
+        }
+    }
+    Ok(())
+}
+
+fn preparation_reserved_handle(
+    stores: &[ReactionStoreBinding],
+    preparation: &ReactionHostPreparation,
+) -> u64 {
+    let mut maximum = stores
+        .iter()
+        .map(|binding| binding.local_handle)
+        .max()
+        .unwrap_or(0);
+    maximum = maximum.max(preparation.objects.keys().copied().max().unwrap_or(0));
+    maximum = maximum.max(preparation.capabilities.keys().copied().max().unwrap_or(0));
+    for query in &preparation.host_queries {
+        if let Some(receiver) = &query.receiver {
+            maximum = maximum.max(max_datum_handle(receiver));
+        }
+        for argument in &query.arguments {
+            maximum = maximum.max(max_datum_handle(argument));
+        }
+        maximum = maximum.max(max_datum_handle(&query.result));
+    }
+    maximum
+}
+
+fn max_datum_handle(value: &TransactionDatum) -> u64 {
+    match value {
+        TransactionDatum::Handle(handle) => *handle,
+        TransactionDatum::Sequence(values) => {
+            values.iter().map(max_datum_handle).max().unwrap_or(0)
+        }
+        _ => 0,
+    }
+}
+
+fn apply_preparation(state: &mut MemoryTransactionState, preparation: ReactionHostPreparation) {
+    state.objects.extend(preparation.objects);
+    for (handle, capabilities) in preparation.capabilities {
+        state
+            .capabilities
+            .entry(handle)
+            .or_default()
+            .extend(capabilities);
+    }
+    state.host_queries.extend(preparation.host_queries);
 }
 
 fn materialize_store(
@@ -562,6 +661,107 @@ mod tests {
             vec![statement(0, TransactionOperation::Return { value: None })],
             0,
         )
+    }
+
+    fn prepared_store_program() -> TransactionProgram {
+        TransactionProgram {
+            entry: TransactionFunctionId(0),
+            functions: vec![TransactionFunction {
+                id: TransactionFunctionId(0),
+                parameter_count: 0,
+                local_count: 2,
+                entry_statement: TransactionStatementId(0),
+                statements: vec![
+                    statement(
+                        0,
+                        TransactionOperation::Assign {
+                            target: TransactionLocalId(0),
+                            value: TransactionValue::HostQuery {
+                                operation: String::from("topology.source"),
+                                receiver: None,
+                                arguments: Vec::new(),
+                            },
+                            next: TransactionStatementId(1),
+                        },
+                    ),
+                    statement(
+                        1,
+                        TransactionOperation::Assign {
+                            target: TransactionLocalId(1),
+                            value: TransactionValue::StoreTake {
+                                store: Box::new(TransactionValue::Local {
+                                    local: TransactionLocalId(0),
+                                }),
+                                key: vec![TransactionValue::Integer { value: 0 }],
+                                amount: Box::new(TransactionValue::Integer { value: 1 }),
+                            },
+                            next: TransactionStatementId(2),
+                        },
+                    ),
+                    statement(2, TransactionOperation::Return { value: None }),
+                ],
+            }],
+        }
+    }
+
+    #[test]
+    fn prepared_graph_store_is_materialized_and_published() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut interner = SnapshotInterner::new();
+        let initial = interner.intern(snapshot(5))?;
+        let interner = Arc::new(Mutex::new(interner));
+        let mut graph = Graph::new(RuntimeConfig::default());
+        let source = graph.add_atom_input("source", initial)?;
+        let adapter = TransactionReactionAdapter::new(
+            Arc::new(prepared_store_program()),
+            Arc::clone(&interner),
+            Vec::new(),
+            Vec::new(),
+            None,
+            "quantity",
+        )
+        .with_host_preparer(move |_| {
+            Ok(ReactionHostPreparation {
+                stores: vec![ReactionStoreBinding {
+                    node: source,
+                    local_handle: 2,
+                }],
+                host_queries: vec![MemoryTransactionHostQuery {
+                    operation: String::from("topology.source"),
+                    receiver: None,
+                    arguments: Vec::new(),
+                    result: TransactionDatum::Handle(2),
+                    consume: false,
+                }],
+                ..ReactionHostPreparation::default()
+            })
+        });
+        let evaluations = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&evaluations);
+        graph.add_reaction("prepared source", move |context| {
+            if observed.fetch_add(1, Ordering::Relaxed) != 0 {
+                return Ok(ReactionOutput::idle());
+            }
+            let result = adapter.execute(context)?;
+            Ok(ReactionOutput::immediate(result.writes))
+        })?;
+        graph.settle()?;
+
+        let snapshot_id = graph.value_atom(source)?;
+        assert_ne!(snapshot_id, initial);
+        let snapshots = interner
+            .lock()
+            .map_err(|_| String::from("snapshot interner lock poisoned"))?;
+        let snapshot = snapshots
+            .get(snapshot_id)
+            .ok_or_else(|| String::from("published snapshot missing"))?;
+        assert_eq!(
+            snapshot.slots[0]
+                .as_ref()
+                .and_then(|value| value.components.get("quantity")),
+            Some(&TransactionDatum::Integer(4))
+        );
+        Ok(())
     }
 
     #[test]

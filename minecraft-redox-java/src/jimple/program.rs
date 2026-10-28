@@ -209,7 +209,7 @@ pub struct JimpleValueComponentUpdateCandidate {
     pub guards: Vec<JimpleEffectGuard>,
     pub statement_id: usize,
     pub component: String,
-    pub origin: JimpleIndexedStoreValueOrigin,
+    pub indexed_store_origin: Option<JimpleIndexedStoreValueOrigin>,
     pub value: SymbolicValue,
 }
 
@@ -532,15 +532,14 @@ impl JimpleProgramEffectSummary {
         Ok(candidates)
     }
 
-    /// Bind field mutations on values obtained from indexed stores into transaction-local
-    /// immutable component updates.
+    /// Bind configured mutable source fields into transaction-local immutable component updates.
     ///
-    /// A matching field write is accepted only when its receiver is structurally the value
-    /// returned by exactly one configured read or take API. This keeps arbitrary heap-object
-    /// field writes graph-visible while allowing mutable source value objects to lower as private
-    /// transforms of a transaction snapshot.
+    /// Indexed-store provenance is retained when it can be proven, but it is not required: a
+    /// value may also come from another bound semantic source such as an entity payload. The
+    /// component binding itself defines the field semantics; executable lowering remains
+    /// fail-closed if the receiver cannot be represented in the transaction IR.
     #[must_use]
-    pub fn bind_indexed_value_component_updates(
+    pub fn bind_value_component_updates(
         &self,
         store_bindings: &[JimpleIndexedStoreBinding],
         component_bindings: &[JimpleValueComponentBinding],
@@ -549,14 +548,16 @@ impl JimpleProgramEffectSummary {
             .iter()
             .filter_map(|write| {
                 let component = unique_value_component_name(&write.field, component_bindings)?;
-                let receiver = write.receiver.as_ref()?;
-                let origin = indexed_store_value_origin(receiver, store_bindings)?;
+                let indexed_store_origin = write
+                    .receiver
+                    .as_ref()
+                    .and_then(|receiver| indexed_store_value_origin(receiver, store_bindings));
                 Some(JimpleValueComponentUpdateCandidate {
                     call_path: write.call_path.clone(),
                     guards: write.guards.clone(),
                     statement_id: write.statement_id,
                     component,
-                    origin,
+                    indexed_store_origin,
                     value: write.value.clone(),
                 })
             })
@@ -644,10 +645,8 @@ impl JimpleProgramEffectSummary {
         let operations = self.bind_indexed_store(&bindings.indexed_stores)?;
         let rollbacks = self
             .bind_speculative_take_rollbacks(&bindings.indexed_stores, &bindings.snapshot_clones)?;
-        let component_updates = self.bind_indexed_value_component_updates(
-            &bindings.indexed_stores,
-            &bindings.value_components,
-        );
+        let component_updates =
+            self.bind_value_component_updates(&bindings.indexed_stores, &bindings.value_components);
         let value_operations = self.bind_pure_value_operations(&bindings.pure_values);
         let store_queries = self.bind_indexed_store_queries(&bindings.store_queries)?;
         let state_writes = self.bind_object_state_writes(&bindings.state_writes)?;

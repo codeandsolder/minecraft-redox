@@ -195,19 +195,29 @@ Primitive JVM casts are now separate from reference-capability casts. The source
 
 Applied to real vanilla `TileEntityHopper.func_145893_b`, one descriptor lowers the helper to **2 anonymous functions / 45 transaction statements** with zero source-name leakage. Its five host operations are `topology.object_at`, `topology.block_at`, `topology.composite_store_at`, `topology.inventory_objects_in_region`, and `random.uniform_int`; AABB construction lowers to a six-element sequence and list `size/get` lower to length/index. Semantic-bound source implementations are treated as transitive coverage boundaries, so AABB constructor field writes and `Object.<init>` do not reappear as false blockers. The resulting coverage is `complete=true` with zero unaccounted calls or writes.
 
-The generic memory host executes all three recovered branches:
+The generic memory host executes all three recovered discovery branches:
 
 - direct inventory tile hit -> returned store handle `2` in 38 transaction statements;
 - chest-like tile + block normalization -> returned composite store handle `4` in 43 statements;
 - no inventory tile -> region query returns two inventory candidates, the source RNG stream selects index 1, and handle `4` is returned in 47 statements.
 
-Topology queries are repeatable by default in the reference draft; the configured RNG query is consumable and disappears after one draw. The next step is to lower the outer Hopper pull orchestration so its recovered discovery result feeds the existing sided-slot scan and one-item transfer transaction automatically rather than supplying source/destination stores by hand.
+Topology queries are repeatable by default in the reference draft; the configured RNG query is consumable and disappears after one draw.
+
+The outer pull orchestration is now lowered too. `TileEntityHopper.func_145891_a(IHopper)` becomes **13 anonymous functions / 284 transaction statements**. Its complete semantic surface contains 34 indexed-store operations, 2 proven speculative rollbacks, 12 bound value-component writes (10 with direct indexed-store provenance), 64 pure value operations, 24 store queries, 7 state writes, 7 host queries, and 10 recovered loops, with zero unaccounted calls or field writes. The extra two component writes come from the loose-item-entity payload path; component-write recovery now keeps indexed-store provenance when available without requiring every private value to originate in a store.
+
+Real memory-host execution covers the major branches. With a five-item source inventory above an empty Hopper, discovery feeds the source store directly into the recovered transfer path: return `1`, 139 executed statements, source quantity `5 -> 4`, destination `0 -> 1`, cooldown `8`, and both stores touched. With all five destination slots full of an incompatible item, all 284 statements execute, return `0`, destination/cooldown/touches remain unchanged, and the source is restored to an independent pre-take snapshot. With no inventory above, the recovered item-entity search/pickup path moves the loose stack into the Hopper, writes cooldown `8`, and consumes the stateful `entity.destroy` host operation.
+
+`TransactionReactionAdapter` now accepts an optional reaction-time host-preparation hook. It can add graph-backed stores, transaction-local objects/capabilities, and host-operation results for that evaluation. The adapter still owns snapshot materialization, isolated execution, canonical interning, and atomic graph publication. Prepared store bindings participate in normal dynamic dependency tracking and are published exactly like fixed stores.
+
+The `vanilla_hopper_discovered` graph example loads the real 284-statement outer-pull program. At the first 400 ms boundary it discovers the source and atomically publishes Hopper quantity `0 -> 1`, source `5 -> 4`, and deadline `800`. Replacing the source snapshot with quantity `7` at 500 ms does **not** wake the Hopper because the successful same-time reevaluation has already shrunk dependencies back to the deadline. At 800 ms the recovered transaction reads the latest source and publishes Hopper `1 -> 2`, source `7 -> 6`, and deadline `1200`. The run takes five reaction evaluations total.
+
+The next source frontier is the complementary push path and `func_145887_i`: recover destination discovery/facing and compose push + pull into the same transfer-attempt transaction, while keeping world/topology resolution at the adapter boundary.
 
 ## Missing pieces exposed by vanilla
 
 The current graph runtime proves the scheduling model but intentionally still has prototype numeric state. Exact Minecraft lowering needs:
 
-- outer machine orchestration that composes the now-bound topology discovery result with sided-slot scans and resource transactions, removing the remaining hand-wired store arguments;
+- the complementary Hopper push path / facing-aware destination discovery, then full `func_145887_i` push+pull composition;
 - adapter lowering for block/chunk revalidation, chunk policy, and source-time conversion around already-bound transaction/scheduler primitives;
 - production persistent/native store implementations behind the source-neutral transaction host interface; the current memory host is a reference/differential implementation;
 - source/runtime-type evidence for polymorphic world objects and modded subclasses wherever static bytecode alone cannot prove dispatch;
