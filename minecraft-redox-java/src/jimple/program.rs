@@ -118,6 +118,8 @@ pub struct JimpleIndexedStoreOperation {
 pub enum JimpleIndexedStoreQueryKind {
     Extent,
     Keys,
+    Empty,
+    Full,
     AllowsRead,
     AllowsWrite,
 }
@@ -1720,7 +1722,7 @@ impl JimpleProgram {
         }
     }
 
-    fn dispatched_method_in_hierarchy(
+    pub(super) fn dispatched_method_in_hierarchy(
         &self,
         runtime_owner: &str,
         declared: &JimpleMethodSignature,
@@ -1776,7 +1778,7 @@ impl JimpleProgram {
             .map_or(&[], |method| method.declaring_interfaces.as_slice())
     }
 
-    fn is_known_subtype(&self, candidate: &str, expected: &str) -> bool {
+    pub(super) fn is_known_subtype(&self, candidate: &str, expected: &str) -> bool {
         if candidate == expected {
             return true;
         }
@@ -2148,7 +2150,7 @@ impl JimpleProgram {
         }
     }
 
-    fn class_initializer(&self, owner: &str) -> Option<&JimpleMethod> {
+    pub(super) fn class_initializer(&self, owner: &str) -> Option<&JimpleMethod> {
         self.methods.iter().find(|method| {
             method.signature.owner == owner
                 && method.signature.name == "<clinit>"

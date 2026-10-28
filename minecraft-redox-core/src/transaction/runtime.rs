@@ -690,9 +690,8 @@ fn binary<E>(
     match operator {
         "==" => Ok(TransactionDatum::Boolean(cfg_equal(&left, &right))),
         "!=" => Ok(TransactionDatum::Boolean(!cfg_equal(&left, &right))),
-        "+" | "-" | "*" | "/" | "%" | "<" | "<=" | ">" | ">=" | "cmpg" | "cmpl" => {
-            binary_numeric(operator, left, right)
-        }
+        "+" | "-" | "*" | "/" | "%" | "&" | "|" | "^" | "<" | "<=" | ">" | ">=" | "cmpg"
+        | "cmpl" => binary_numeric(operator, left, right),
         _ => Err(TransactionExecutionError::InvalidValue(format!(
             "unsupported binary operator {operator:?}"
         ))),
@@ -738,6 +737,9 @@ fn integer_binary<E>(
         "*" => TransactionDatum::Integer(left.wrapping_mul(right)),
         "/" if right != 0 => TransactionDatum::Integer(left.wrapping_div(right)),
         "%" if right != 0 => TransactionDatum::Integer(left.wrapping_rem(right)),
+        "&" => TransactionDatum::Integer(left & right),
+        "|" => TransactionDatum::Integer(left | right),
+        "^" => TransactionDatum::Integer(left ^ right),
         "<" => TransactionDatum::Boolean(left < right),
         "<=" => TransactionDatum::Boolean(left <= right),
         ">" => TransactionDatum::Boolean(left > right),
@@ -1270,6 +1272,24 @@ mod tests {
             )
             .map_err(|error| error.to_string())?,
             TransactionDatum::Boolean(false)
+        );
+        assert_eq!(
+            binary::<String>(
+                "&",
+                TransactionDatum::Integer(13),
+                TransactionDatum::Integer(7),
+            )
+            .map_err(|error| error.to_string())?,
+            TransactionDatum::Integer(5)
+        );
+        assert_eq!(
+            binary::<String>(
+                "^",
+                TransactionDatum::Integer(5),
+                TransactionDatum::Integer(1),
+            )
+            .map_err(|error| error.to_string())?,
+            TransactionDatum::Integer(4)
         );
         Ok(())
     }

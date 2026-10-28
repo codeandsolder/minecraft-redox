@@ -211,16 +211,28 @@ Real memory-host execution covers the major branches. With a five-item source in
 
 The `vanilla_hopper_discovered` graph example loads the real 284-statement outer-pull program. At the first 400 ms boundary it discovers the source and atomically publishes Hopper quantity `0 -> 1`, source `5 -> 4`, and deadline `800`. Replacing the source snapshot with quantity `7` at 500 ms does **not** wake the Hopper because the successful same-time reevaluation has already shrunk dependencies back to the deadline. At 800 ms the recovered transaction reads the latest source and publishes Hopper `1 -> 2`, source `7 -> 6`, and deadline `1200`. The run takes five reaction evaluations total.
 
-The next source frontier is the complementary push path and `func_145887_i`: recover destination discovery/facing and compose push + pull into the same transfer-attempt transaction, while keeping world/topology resolution at the adapter boundary.
+The complementary push path and the complete `func_145887_i` transfer attempt are now lowered too. Two generic JVM gaps had to be closed rather than papered over with Hopper rules. First, the reachable exporter resolves concrete inherited method bodies through the superclass chain, so calls emitted against a subclass-owned signature retain implementations such as `TileEntity.getBlockMetadata()`. Second, transaction lowering accepts an optional exact runtime `this`, recovers Soot's `this := @this` local alias structurally, and performs the same hierarchy dispatch as the structural analyzer while leaving other dynamic receivers fail-closed.
+
+Facing is recovered from startup bytecode rather than copied into the descriptor. Static primitive-array reads trigger the reachable owner `<clinit>` through the existing abstract JVM and lower materialized arrays to literal source-neutral sequences, including JVM default-filled entries. The real `Facing` opposite/X/Y/Z tables therefore disappear into constants derived from class initialization. Integer bitwise operators (`&`, `|`, `^`) execute the real metadata helpers, while generic draft-aware `empty`/`full` store queries replace Hopper's local scans at the semantic boundary.
+
+With an exact `TileEntityHopper` runtime type and the full transaction descriptor, `func_145887_i()` lowers to **22 anonymous functions / 428 CFG statements** with zero `net.minecraft`, `java.util`, SRG `func_*`/`field_*`, `Facing`, `TileEntityHopper`, or `World` names in serialized target IR. Its current coverage is `complete=true`: **50** indexed-store operations, **2** proven rollbacks, **22** component updates, **87** pure value operations, **35** store queries, **10** state writes, **18** host-query occurrences, and **17** recovered loops, with zero unaccounted calls or field writes.
+
+Differential execution now exercises the full vanilla attempt ordering rather than a helper in isolation:
+
+- **push succeeds:** return `1` after 276 target statements; Hopper stack `5 -> 4`, discovered destination `0 -> 1`, cooldown `8`, Hopper and destination touched;
+- **push blocked, pull succeeds:** return `1` after 322 statements; full destination unchanged, Hopper stack `5 -> 6`, discovered source `5 -> 4`, cooldown `8`, Hopper and source touched;
+- **both blocked/full:** return `0` after 146 statements with all stores/state untouched.
+
+The `vanilla_hopper_full` graph example executes that same 428-statement transaction behind the deadline gate. At 400 ms it successfully pushes one item and pulls one item in one activation, leaving Hopper quantity `5`, destination `1`, source `4`, and deadline `800`. At 500 ms both neighboring snapshots are replaced; neither wakes the cooling Hopper. At 800 ms the replacement destination is full, so push is blocked, while the latest source is pulled (`Hopper 5 -> 6`, source `7 -> 6`) and deadline advances to `1200`. The complete run still takes only five reaction evaluations.
 
 ## Missing pieces exposed by vanilla
 
-The current graph runtime proves the scheduling model but intentionally still has prototype numeric state. Exact Minecraft lowering needs:
+The current graph runtime proves the scheduling model and now covers the complete vanilla Hopper transfer attempt. The next exactness gaps are at the world/adapter boundary rather than in Hopper control flow:
 
-- the complementary Hopper push path / facing-aware destination discovery, then full `func_145887_i` push+pull composition;
+- make topology-to-store resolution **lazy inside an active transaction**. Prepared neighbor stores are currently read eagerly when the transaction starts, so push and pull candidates both become active-phase dependencies even when source control flow skips one branch. A lazy resolver should materialize/read a graph store only when the transaction first dereferences the semantic handle, preserving branch-level dependency precision as well as cooldown-phase precision;
 - adapter lowering for block/chunk revalidation, chunk policy, and source-time conversion around already-bound transaction/scheduler primitives;
 - production persistent/native store implementations behind the source-neutral transaction host interface; the current memory host is a reference/differential implementation;
 - source/runtime-type evidence for polymorphic world objects and modded subclasses wherever static bytecode alone cannot prove dispatch;
 - preservation of source RNG state/order in dense adapters while bound random draws and emitted callbacks cross the semantic IR boundary.
 
-The important result of this spike is that none of these require reintroducing a global tick loop. They are additions to the causal graph interface.
+The important result of this spike is that none of these require reintroducing a global tick loop. They are additions to the causal graph/adapter interface.

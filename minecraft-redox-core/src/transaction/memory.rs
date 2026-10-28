@@ -63,12 +63,19 @@ pub struct MemoryTransactionState {
 pub struct MemoryTransactionHost {
     pub state: MemoryTransactionState,
     pub quantity_component: String,
+    #[serde(default = "default_max_quantity_component")]
+    pub max_quantity_component: String,
+}
+
+fn default_max_quantity_component() -> String {
+    String::from("max_quantity")
 }
 
 pub struct MemoryTransactionDraft<'a> {
     host: &'a mut MemoryTransactionHost,
     state: MemoryTransactionState,
     quantity_component: String,
+    max_quantity_component: String,
 }
 
 impl TransactionHost for MemoryTransactionHost {
@@ -79,6 +86,7 @@ impl TransactionHost for MemoryTransactionHost {
         Ok(MemoryTransactionDraft {
             state: self.state.clone(),
             quantity_component: self.quantity_component.clone(),
+            max_quantity_component: self.max_quantity_component.clone(),
             host: self,
         })
     }
@@ -356,6 +364,31 @@ impl TransactionDraft for MemoryTransactionDraft<'_> {
                     })
                     .collect::<Result<Vec<_>, _>>()?,
             )),
+            TransactionStoreQueryKind::Empty => Ok(TransactionDatum::Boolean(
+                store.slots.iter().all(Option::is_none),
+            )),
+            TransactionStoreQueryKind::Full => {
+                let full = store.slots.iter().all(|slot| {
+                    let Some(handle) = slot else {
+                        return false;
+                    };
+                    let Some(object) = self.state.objects.get(handle) else {
+                        return false;
+                    };
+                    let Some(TransactionDatum::Integer(quantity)) =
+                        object.components.get(&self.quantity_component)
+                    else {
+                        return false;
+                    };
+                    let Some(TransactionDatum::Integer(max_quantity)) =
+                        object.components.get(&self.max_quantity_component)
+                    else {
+                        return false;
+                    };
+                    quantity >= max_quantity
+                });
+                Ok(TransactionDatum::Boolean(full))
+            }
             TransactionStoreQueryKind::AllowsRead => {
                 Ok(TransactionDatum::Boolean(store.allows_read))
             }
@@ -405,6 +438,72 @@ mod tests {
     }
 
     #[test]
+    fn store_empty_and_full_queries_follow_draft_state() -> Result<(), String> {
+        let mut host = MemoryTransactionHost {
+            state: MemoryTransactionState {
+                objects: [(
+                    7,
+                    MemoryTransactionObject {
+                        components: [
+                            (String::from("quantity"), TransactionDatum::Integer(64)),
+                            (String::from("max_quantity"), TransactionDatum::Integer(64)),
+                        ]
+                        .into_iter()
+                        .collect(),
+                        semantic_tag: Some(String::from("item")),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+                stores: [(
+                    1,
+                    MemoryTransactionStore {
+                        slots: vec![None],
+                        allows_read: true,
+                        allows_write: true,
+                    },
+                )]
+                .into_iter()
+                .collect(),
+                next_handle: 8,
+                ..MemoryTransactionState::default()
+            },
+            quantity_component: String::from("quantity"),
+            max_quantity_component: String::from("max_quantity"),
+        };
+        let store = TransactionDatum::Handle(1);
+        let key = [TransactionDatum::Integer(0)];
+        let mut draft = host.begin()?;
+        assert_eq!(
+            draft.store_query(TransactionStoreQueryKind::Empty, &store, &[], None, &[])?,
+            TransactionDatum::Boolean(true)
+        );
+        assert_eq!(
+            draft.store_query(TransactionStoreQueryKind::Full, &store, &[], None, &[])?,
+            TransactionDatum::Boolean(false)
+        );
+        draft.store_write(&store, &key, TransactionDatum::Handle(7))?;
+        assert_eq!(
+            draft.store_query(TransactionStoreQueryKind::Empty, &store, &[], None, &[])?,
+            TransactionDatum::Boolean(false)
+        );
+        assert_eq!(
+            draft.store_query(TransactionStoreQueryKind::Full, &store, &[], None, &[])?,
+            TransactionDatum::Boolean(true)
+        );
+        draft.set_component(
+            &TransactionDatum::Handle(7),
+            "quantity",
+            TransactionDatum::Integer(63),
+        )?;
+        assert_eq!(
+            draft.store_query(TransactionStoreQueryKind::Full, &store, &[], None, &[])?,
+            TransactionDatum::Boolean(false)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn host_queries_can_be_repeatable_or_consumed() -> Result<(), String> {
         let mut host = MemoryTransactionHost {
             state: MemoryTransactionState {
@@ -415,6 +514,7 @@ mod tests {
                 ..MemoryTransactionState::default()
             },
             quantity_component: String::from("quantity"),
+            max_quantity_component: String::from("max_quantity"),
         };
         let receiver = TransactionDatum::Handle(1);
         let arguments = [TransactionDatum::Integer(2)];

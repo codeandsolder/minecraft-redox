@@ -349,6 +349,7 @@ fn build_host(
     Ok(MemoryTransactionHost {
         state,
         quantity_component: quantity_component.to_owned(),
+        max_quantity_component: String::from("max_quantity"),
     })
 }
 

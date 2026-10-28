@@ -95,6 +95,8 @@ pub enum TransactionNumericType {
 pub enum TransactionStoreQueryKind {
     Extent,
     Keys,
+    Empty,
+    Full,
     AllowsRead,
     AllowsWrite,
 }

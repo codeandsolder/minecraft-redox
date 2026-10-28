@@ -10,9 +10,10 @@ use minecraft_redox_core::transaction::{
 };
 
 use super::{
-    JimpleCallOperandBinding, JimpleIndexedStoreOperationKind, JimpleIndexedStoreQueryKind,
-    JimpleMethod, JimpleMethodSignature, JimpleOperation, JimpleProgram, JimplePureValueOperation,
-    JimpleStatement, JimpleTransactionBindings, JimpleValue, JimpleValueKind,
+    AbstractArrayIdentity, AbstractValue, JimpleCallOperandBinding, JimpleFieldSignature,
+    JimpleIndexedStoreOperationKind, JimpleIndexedStoreQueryKind, JimpleMethod,
+    JimpleMethodSignature, JimpleOperation, JimpleProgram, JimplePureValueOperation,
+    JimpleStatement, JimpleTransactionBindings, JimpleValue, JimpleValueKind, ProgramExecution,
 };
 
 impl JimpleProgram {
@@ -32,22 +33,62 @@ impl JimpleProgram {
         entry: &JimpleMethodSignature,
         bindings: &JimpleTransactionBindings,
     ) -> Result<TransactionProgram> {
-        let signatures = discover_transaction_methods(self, entry, bindings)?;
-        let function_ids: Vec<_> = signatures
+        self.lower_transaction_program_impl(entry, None, bindings)
+    }
+
+    /// Lower one entrypoint assuming an exact runtime type for its `this` receiver.
+    ///
+    /// This enables virtual/interface calls on `this` to dispatch through exported class hierarchy
+    /// metadata. Calls on other dynamic receivers remain fail-closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the runtime type is not a known subtype, dispatch is ambiguous or
+    /// missing, one helper would require conflicting runtime specializations, or ordinary
+    /// transaction lowering fails.
+    pub fn lower_transaction_program_for_runtime_this(
+        &self,
+        entry: &JimpleMethodSignature,
+        runtime_type: &str,
+        bindings: &JimpleTransactionBindings,
+    ) -> Result<TransactionProgram> {
+        if !self.is_known_subtype(runtime_type, &entry.owner) {
+            bail!(
+                "runtime transaction type {runtime_type:?} is not a known subtype of {:?}",
+                entry.owner
+            );
+        }
+        self.lower_transaction_program_impl(entry, Some(runtime_type), bindings)
+    }
+
+    fn lower_transaction_program_impl(
+        &self,
+        entry: &JimpleMethodSignature,
+        runtime_type: Option<&str>,
+        bindings: &JimpleTransactionBindings,
+    ) -> Result<TransactionProgram> {
+        let methods = discover_transaction_methods(self, entry, runtime_type, bindings)?;
+        let function_ids: Vec<_> = methods
             .iter()
             .enumerate()
-            .map(|(index, signature)| {
+            .map(|(index, method)| {
                 let id = u32::try_from(index).context("transaction function count exceeds u32")?;
-                Ok((signature.clone(), TransactionFunctionId(id)))
+                Ok((method.signature.clone(), TransactionFunctionId(id)))
             })
             .collect::<Result<_>>()?;
-        let functions = signatures
+        let functions = methods
             .iter()
-            .map(|signature| {
-                let method = self
-                    .method(signature)
-                    .with_context(|| format!("Jimple method {signature:?} does not exist"))?;
-                lower_transaction_function(self, method, bindings, &function_ids)
+            .map(|discovered| {
+                let method = self.method(&discovered.signature).with_context(|| {
+                    format!("Jimple method {:?} does not exist", discovered.signature)
+                })?;
+                lower_transaction_function(
+                    self,
+                    method,
+                    discovered.runtime_this.as_deref(),
+                    bindings,
+                    &function_ids,
+                )
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(TransactionProgram {
@@ -57,43 +98,61 @@ impl JimpleProgram {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DiscoveredTransactionMethod {
+    signature: JimpleMethodSignature,
+    runtime_this: Option<String>,
+}
+
 fn discover_transaction_methods(
     program: &JimpleProgram,
     entry: &JimpleMethodSignature,
+    runtime_type: Option<&str>,
     bindings: &JimpleTransactionBindings,
-) -> Result<Vec<JimpleMethodSignature>> {
+) -> Result<Vec<DiscoveredTransactionMethod>> {
     program
         .method(entry)
         .with_context(|| format!("Jimple method {entry:?} does not exist"))?;
-    let mut discovered = vec![entry.clone()];
+    let mut discovered = vec![DiscoveredTransactionMethod {
+        signature: entry.clone(),
+        runtime_this: runtime_type.map(str::to_owned),
+    }];
     let mut index = 0;
     while index < discovered.len() {
-        let signature = discovered[index].clone();
+        let current = discovered[index].clone();
         let method = program
-            .method(&signature)
-            .with_context(|| format!("Jimple method {signature:?} disappeared"))?;
+            .method(&current.signature)
+            .with_context(|| format!("Jimple method {:?} disappeared", current.signature))?;
+        let this_aliases = this_alias_locals(method);
         let mut calls = Vec::new();
         for statement in &method.statements {
             collect_statement_calls(statement, &mut calls);
         }
-        for (invoke_kind, callee) in calls {
-            if semantic_call_binding_count(callee, bindings) > 0 {
+        for call in calls {
+            if semantic_call_binding_count(call.callee, bindings) > 0 {
                 continue;
             }
-            if !matches!(invoke_kind, "JStaticInvokeExpr" | "JSpecialInvokeExpr") {
-                bail!(
-                    "unbound dynamic transaction call {callee:?} in {}",
-                    method.display_signature
-                );
-            }
-            if program.method(callee).is_none() {
-                bail!(
-                    "unbound external transaction call {callee:?} in {}",
-                    method.display_signature
-                );
-            }
-            if !discovered.contains(callee) {
-                discovered.push(callee.clone());
+            let (target, target_runtime_this) = resolve_transaction_call_target(
+                program,
+                &current,
+                call.invoke_kind,
+                call.base
+                    .is_some_and(|base| value_is_this_alias(base, &this_aliases)),
+                call.callee,
+            )?;
+            if let Some(existing) = discovered.iter().find(|item| item.signature == target) {
+                if existing.runtime_this != target_runtime_this {
+                    bail!(
+                        "transaction helper {target:?} requires conflicting runtime-this specializations {:?} and {:?}",
+                        existing.runtime_this,
+                        target_runtime_this
+                    );
+                }
+            } else {
+                discovered.push(DiscoveredTransactionMethod {
+                    signature: target,
+                    runtime_this: target_runtime_this,
+                });
             }
         }
         index += 1;
@@ -101,9 +160,96 @@ fn discover_transaction_methods(
     Ok(discovered)
 }
 
+struct TransactionSourceCall<'a> {
+    invoke_kind: &'a str,
+    callee: &'a JimpleMethodSignature,
+    base: Option<&'a JimpleValue>,
+}
+
+fn resolve_transaction_call_target(
+    program: &JimpleProgram,
+    current: &DiscoveredTransactionMethod,
+    invoke_kind: &str,
+    base_is_this: bool,
+    callee: &JimpleMethodSignature,
+) -> Result<(JimpleMethodSignature, Option<String>)> {
+    match invoke_kind {
+        "JStaticInvokeExpr" => {
+            program
+                .method(callee)
+                .with_context(|| format!("unbound external transaction call {callee:?}"))?;
+            Ok((callee.clone(), None))
+        }
+        "JSpecialInvokeExpr" => {
+            program
+                .method(callee)
+                .with_context(|| format!("unbound external transaction call {callee:?}"))?;
+            let runtime_this = base_is_this.then(|| current.runtime_this.clone()).flatten();
+            Ok((callee.clone(), runtime_this))
+        }
+        "JVirtualInvokeExpr" | "JInterfaceInvokeExpr" if base_is_this => {
+            let runtime_this = current.runtime_this.as_deref().with_context(|| {
+                format!("dynamic transaction call {callee:?} requires exact runtime `this`")
+            })?;
+            let target = program
+                .dispatched_method_in_hierarchy(runtime_this, callee)
+                .with_context(|| {
+                    format!(
+                        "runtime dispatch from {runtime_this:?} cannot resolve transaction call {callee:?}"
+                    )
+                })?;
+            Ok((target.signature.clone(), Some(runtime_this.to_owned())))
+        }
+        _ => bail!("unbound dynamic transaction call {callee:?}"),
+    }
+}
+
+fn this_alias_locals(method: &JimpleMethod) -> BTreeSet<String> {
+    let candidates: BTreeSet<_> = method
+        .statements
+        .iter()
+        .filter_map(|statement| match &statement.operation {
+            JimpleOperation::Identity { left, right }
+                if matches!(right.kind, JimpleValueKind::This) =>
+            {
+                match &left.kind {
+                    JimpleValueKind::Local { name } => Some(name.clone()),
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+        .collect();
+    candidates
+        .into_iter()
+        .filter(|candidate| {
+            !method.statements.iter().any(|statement| {
+                matches!(
+                    &statement.operation,
+                    JimpleOperation::Assign {
+                        left: JimpleValue {
+                            kind: JimpleValueKind::Local { name },
+                            ..
+                        },
+                        ..
+                    } if name == candidate
+                )
+            })
+        })
+        .collect()
+}
+
+fn value_is_this_alias(value: &JimpleValue, aliases: &BTreeSet<String>) -> bool {
+    match &value.kind {
+        JimpleValueKind::This => true,
+        JimpleValueKind::Local { name } => aliases.contains(name),
+        _ => false,
+    }
+}
+
 fn collect_statement_calls<'a>(
     statement: &'a JimpleStatement,
-    calls: &mut Vec<(&'a str, &'a JimpleMethodSignature)>,
+    calls: &mut Vec<TransactionSourceCall<'a>>,
 ) {
     match &statement.operation {
         JimpleOperation::Assign { left, right } | JimpleOperation::Identity { left, right } => {
@@ -124,10 +270,7 @@ fn collect_statement_calls<'a>(
     }
 }
 
-fn collect_value_calls<'a>(
-    value: &'a JimpleValue,
-    calls: &mut Vec<(&'a str, &'a JimpleMethodSignature)>,
-) {
+fn collect_value_calls<'a>(value: &'a JimpleValue, calls: &mut Vec<TransactionSourceCall<'a>>) {
     match &value.kind {
         JimpleValueKind::Invoke {
             invoke_kind,
@@ -137,7 +280,11 @@ fn collect_value_calls<'a>(
             bootstrap_arguments,
             ..
         } => {
-            calls.push((invoke_kind, method));
+            calls.push(TransactionSourceCall {
+                invoke_kind,
+                callee: method,
+                base: base.as_deref(),
+            });
             if let Some(base) = base {
                 collect_value_calls(base, calls);
             }
@@ -221,13 +368,17 @@ struct FunctionLowerer<'a> {
     program: &'a JimpleProgram,
     bindings: &'a JimpleTransactionBindings,
     function_ids: &'a [(JimpleMethodSignature, TransactionFunctionId)],
+    runtime_this: Option<&'a str>,
+    this_aliases: BTreeSet<String>,
     locals: Vec<String>,
     elided_assignments: BTreeSet<usize>,
+    static_values: BTreeMap<JimpleFieldSignature, TransactionValue>,
 }
 
 fn lower_transaction_function(
     program: &JimpleProgram,
     method: &JimpleMethod,
+    runtime_this: Option<&str>,
     bindings: &JimpleTransactionBindings,
     function_ids: &[(JimpleMethodSignature, TransactionFunctionId)],
 ) -> Result<TransactionFunction> {
@@ -241,8 +392,11 @@ fn lower_transaction_function(
         program,
         bindings,
         function_ids,
+        runtime_this,
+        this_aliases: this_alias_locals(method),
         locals: Vec::new(),
         elided_assignments: elidable_local_assignments(method, bindings),
+        static_values: BTreeMap::new(),
     };
     let statements = method
         .statements
@@ -560,7 +714,7 @@ impl FunctionLowerer<'_> {
                 next,
             }),
             JimpleValueKind::InstanceField { base, field } => {
-                let component = unique_component(field, self.bindings)?;
+                let component = unique_component(self.program, field, self.bindings)?;
                 Ok(TransactionOperation::SetComponent {
                     target: self.lower_value(base)?,
                     component,
@@ -595,13 +749,14 @@ impl FunctionLowerer<'_> {
                 Ok(TransactionValue::Parameter { index: *index })
             }
             JimpleValueKind::This => Ok(TransactionValue::This),
+            JimpleValueKind::StaticField { field } => self.lower_static_field(field),
             JimpleValueKind::ArrayRef { base, index } => Ok(TransactionValue::Index {
                 sequence: Box::new(self.lower_value(base)?),
                 index: Box::new(self.lower_value(index)?),
             }),
             JimpleValueKind::InstanceField { base, field } => Ok(TransactionValue::Component {
                 value: Box::new(self.lower_value(base)?),
-                component: unique_component(field, self.bindings)?,
+                component: unique_component(self.program, field, self.bindings)?,
             }),
             JimpleValueKind::Binary {
                 operator,
@@ -658,7 +813,6 @@ impl FunctionLowerer<'_> {
             JimpleValueKind::ClassConstant { .. }
             | JimpleValueKind::MethodHandle { .. }
             | JimpleValueKind::MethodType { .. }
-            | JimpleValueKind::StaticField { .. }
             | JimpleValueKind::New { .. }
             | JimpleValueKind::NewArray { .. }
             | JimpleValueKind::NewMultiArray { .. }
@@ -671,6 +825,36 @@ impl FunctionLowerer<'_> {
                 )
             }
         }
+    }
+
+    fn lower_static_field(&mut self, field: &JimpleFieldSignature) -> Result<TransactionValue> {
+        if let Some(value) = self.static_values.get(field) {
+            return Ok(value.clone());
+        }
+        self.program
+            .class_initializer(&field.owner)
+            .with_context(|| {
+                format!("transaction static field {field:?} has no reachable class initializer")
+            })?;
+        let execution = self
+            .program
+            .execute_named_sequence(&[(field.owner.as_str(), "<clinit>")], 100_000)
+            .with_context(|| format!("failed to recover startup value for {field:?}"))?;
+        for candidate in &execution.static_fields {
+            if let Ok(lowered) = lower_abstract_constant(&candidate.value, &execution) {
+                self.static_values
+                    .entry(candidate.field.clone())
+                    .or_insert(lowered);
+            }
+        }
+        if let Some(lowered) = self.static_values.get(field) {
+            return Ok(lowered.clone());
+        }
+        let value = execution
+            .static_field_value(&field.owner, &field.name)
+            .with_context(|| format!("class initializer did not materialize {field:?}"))?;
+        lower_abstract_constant(value, &execution)
+            .with_context(|| format!("static field {field:?} is not a target constant"))
     }
 
     fn lower_invoke(&mut self, value: &JimpleValue) -> Result<LoweredInvoke> {
@@ -732,7 +916,14 @@ impl FunctionLowerer<'_> {
         {
             return Ok(lowered);
         }
-        self.lower_internal_invoke(invoke_kind, method, receiver, arguments)
+        self.lower_internal_invoke(
+            invoke_kind,
+            method,
+            base.as_deref()
+                .is_some_and(|base| value_is_this_alias(base, &self.this_aliases)),
+            receiver,
+            arguments,
+        )
     }
 
     fn lower_store_invoke(
@@ -878,6 +1069,8 @@ impl FunctionLowerer<'_> {
         let operation = match binding.operation {
             JimpleIndexedStoreQueryKind::Extent => TransactionStoreQueryKind::Extent,
             JimpleIndexedStoreQueryKind::Keys => TransactionStoreQueryKind::Keys,
+            JimpleIndexedStoreQueryKind::Empty => TransactionStoreQueryKind::Empty,
+            JimpleIndexedStoreQueryKind::Full => TransactionStoreQueryKind::Full,
             JimpleIndexedStoreQueryKind::AllowsRead => TransactionStoreQueryKind::AllowsRead,
             JimpleIndexedStoreQueryKind::AllowsWrite => TransactionStoreQueryKind::AllowsWrite,
         };
@@ -982,18 +1175,32 @@ impl FunctionLowerer<'_> {
         &self,
         invoke_kind: &str,
         method: &JimpleMethodSignature,
+        base_is_this: bool,
         receiver: Option<TransactionValue>,
         arguments: Vec<TransactionValue>,
     ) -> Result<LoweredInvoke> {
-        if !matches!(invoke_kind, "JStaticInvokeExpr" | "JSpecialInvokeExpr") {
-            bail!("unbound dynamic transaction call {method:?}");
-        }
-        self.program
-            .method(method)
-            .with_context(|| format!("unbound external transaction call {method:?}"))?;
-        let function = function_id(self.function_ids, method)
-            .with_context(|| format!("transaction helper ID missing for {method:?}"))?;
-        if method.return_type == "void" {
+        let target = match invoke_kind {
+            "JStaticInvokeExpr" | "JSpecialInvokeExpr" => self
+                .program
+                .method(method)
+                .with_context(|| format!("unbound external transaction call {method:?}"))?,
+            "JVirtualInvokeExpr" | "JInterfaceInvokeExpr" if base_is_this => {
+                let runtime_this = self.runtime_this.with_context(|| {
+                    format!("dynamic transaction call {method:?} requires exact runtime `this`")
+                })?;
+                self.program
+                    .dispatched_method_in_hierarchy(runtime_this, method)
+                    .with_context(|| {
+                        format!(
+                            "runtime dispatch from {runtime_this:?} cannot resolve transaction call {method:?}"
+                        )
+                    })?
+            }
+            _ => bail!("unbound dynamic transaction call {method:?}"),
+        };
+        let function = function_id(self.function_ids, &target.signature)
+            .with_context(|| format!("transaction helper ID missing for {:?}", target.signature))?;
+        if target.signature.return_type == "void" {
             Ok(LoweredInvoke::Effect(TransactionEffect::Call {
                 function,
                 receiver,
@@ -1021,24 +1228,91 @@ impl FunctionLowerer<'_> {
     }
 }
 
+fn lower_abstract_constant(
+    value: &AbstractValue,
+    execution: &ProgramExecution,
+) -> Result<TransactionValue> {
+    match value {
+        AbstractValue::Integer { value } => Ok(TransactionValue::Integer { value: *value }),
+        AbstractValue::Float { value } => Ok(TransactionValue::Float { value: *value }),
+        AbstractValue::String { value } => Ok(TransactionValue::String {
+            value: value.clone(),
+        }),
+        AbstractValue::Null => Ok(TransactionValue::Null),
+        AbstractValue::Sequence { values, .. } => Ok(TransactionValue::Sequence {
+            values: values
+                .iter()
+                .map(|value| lower_abstract_constant(value, execution))
+                .collect::<Result<Vec<_>>>()?,
+        }),
+        AbstractValue::ArrayRef { id, element_type } => {
+            let array = execution
+                .arrays
+                .iter()
+                .find(|array| array.identity == AbstractArrayIdentity::Allocated { id: *id })
+                .with_context(|| format!("startup array {id} is missing"))?;
+            let length = array
+                .length
+                .with_context(|| format!("startup array {id} has unknown length"))?;
+            let mut values = (0..length)
+                .map(|_| default_array_element(element_type))
+                .collect::<Result<Vec<_>>>()?;
+            for entry in &array.entries {
+                let index = usize::try_from(entry.index).with_context(|| {
+                    format!("startup array {id} has negative index {}", entry.index)
+                })?;
+                let slot = values.get_mut(index).with_context(|| {
+                    format!("startup array {id} index {index} is out of bounds")
+                })?;
+                *slot = lower_abstract_constant(&entry.value, execution)?;
+            }
+            Ok(TransactionValue::Sequence { values })
+        }
+        other => bail!("unsupported startup constant {other:?}"),
+    }
+}
+
+fn default_array_element(element_type: &str) -> Result<TransactionValue> {
+    match element_type {
+        "boolean" | "byte" | "char" | "short" | "int" | "long" => {
+            Ok(TransactionValue::Integer { value: 0 })
+        }
+        "float" | "double" => Ok(TransactionValue::Float { value: 0.0 }),
+        value if value.ends_with("[]") || value.contains('.') => Ok(TransactionValue::Null),
+        _ => bail!("unsupported startup array element type {element_type:?}"),
+    }
+}
+
 enum LoweredInvoke {
     Value(TransactionValue),
     Effect(TransactionEffect),
 }
 
 fn unique_component(
+    program: &JimpleProgram,
     field: &super::JimpleFieldSignature,
     bindings: &JimpleTransactionBindings,
 ) -> Result<String> {
-    let mut matching = bindings
+    let mut exact = bindings
         .value_components
         .iter()
         .filter(|binding| binding.field == *field);
-    let binding = matching
+    if let Some(binding) = exact.next() {
+        if exact.next().is_some() {
+            bail!("ambiguous transaction component binding for {field:?}");
+        }
+        return Ok(binding.component.clone());
+    }
+    let mut inherited = bindings.value_components.iter().filter(|binding| {
+        binding.field.name == field.name
+            && binding.field.type_name == field.type_name
+            && program.is_known_subtype(&field.owner, &binding.field.owner)
+    });
+    let binding = inherited
         .next()
         .with_context(|| format!("unbound transaction field {field:?}"))?;
-    if matching.next().is_some() {
-        bail!("ambiguous transaction component binding for {field:?}");
+    if inherited.next().is_some() {
+        bail!("ambiguous inherited transaction component binding for {field:?}");
     }
     Ok(binding.component.clone())
 }
@@ -1360,6 +1634,241 @@ mod tests {
         assert!(!serialized.contains("demo.SourceWorld"));
         assert!(!serialized.contains("demo.SourceSelector"));
         assert!(!serialized.contains("sourceOnlyLookup"));
+        Ok(())
+    }
+
+    #[test]
+    fn static_primitive_arrays_lower_from_recovered_class_initialization() -> Result<()> {
+        let field = super::super::JimpleFieldSignature {
+            owner: String::from("demo.Constants"),
+            name: String::from("VALUES"),
+            type_name: String::from("int[]"),
+        };
+        let clinit = JimpleMethodSignature {
+            owner: String::from("demo.Constants"),
+            name: String::from("<clinit>"),
+            return_type: String::from("void"),
+            parameter_types: Vec::new(),
+        };
+        let entry = JimpleMethodSignature {
+            owner: String::from("demo.Reader"),
+            name: String::from("read"),
+            return_type: String::from("int"),
+            parameter_types: Vec::new(),
+        };
+        let array = local("array", "int[]");
+        let result = local("result", "int");
+        let static_value = value(
+            "int[]",
+            "demo.Constants.VALUES",
+            JimpleValueKind::StaticField {
+                field: field.clone(),
+            },
+        );
+        let program = JimpleProgram::new(vec![
+            JimpleMethod {
+                signature: clinit,
+                display_signature: String::from("constants clinit"),
+                declaring_superclass: None,
+                declaring_interfaces: Vec::new(),
+                statements: vec![
+                    statement(
+                        0,
+                        vec![1],
+                        JimpleOperation::Assign {
+                            left: array.clone(),
+                            right: value(
+                                "int[]",
+                                "new int[3]",
+                                JimpleValueKind::NewArray {
+                                    element_type: String::from("int"),
+                                    size: Box::new(integer(3)),
+                                },
+                            ),
+                        },
+                    ),
+                    statement(
+                        1,
+                        vec![2],
+                        JimpleOperation::Assign {
+                            left: value(
+                                "int",
+                                "array[0]",
+                                JimpleValueKind::ArrayRef {
+                                    base: Box::new(array.clone()),
+                                    index: Box::new(integer(0)),
+                                },
+                            ),
+                            right: integer(4),
+                        },
+                    ),
+                    statement(
+                        2,
+                        vec![3],
+                        JimpleOperation::Assign {
+                            left: value(
+                                "int",
+                                "array[2]",
+                                JimpleValueKind::ArrayRef {
+                                    base: Box::new(array.clone()),
+                                    index: Box::new(integer(2)),
+                                },
+                            ),
+                            right: integer(9),
+                        },
+                    ),
+                    statement(
+                        3,
+                        vec![4],
+                        JimpleOperation::Assign {
+                            left: static_value.clone(),
+                            right: array,
+                        },
+                    ),
+                    statement(4, Vec::new(), JimpleOperation::ReturnVoid),
+                ],
+            },
+            JimpleMethod {
+                signature: entry.clone(),
+                display_signature: String::from("reader"),
+                declaring_superclass: None,
+                declaring_interfaces: Vec::new(),
+                statements: vec![
+                    statement(
+                        0,
+                        vec![1],
+                        JimpleOperation::Assign {
+                            left: local("values", "int[]"),
+                            right: static_value,
+                        },
+                    ),
+                    statement(
+                        1,
+                        vec![2],
+                        JimpleOperation::Assign {
+                            left: result.clone(),
+                            right: value(
+                                "int",
+                                "values[2]",
+                                JimpleValueKind::ArrayRef {
+                                    base: Box::new(local("values", "int[]")),
+                                    index: Box::new(integer(2)),
+                                },
+                            ),
+                        },
+                    ),
+                    statement(2, Vec::new(), JimpleOperation::Return { value: result }),
+                ],
+            },
+        ]);
+        let lowered =
+            program.lower_transaction_program(&entry, &JimpleTransactionBindings::default())?;
+        let TransactionOperation::Assign { value, .. } =
+            &lowered.functions[0].statements[0].operation
+        else {
+            bail!("static array did not lower to an assignment");
+        };
+        assert_eq!(
+            value,
+            &TransactionValue::Sequence {
+                values: vec![
+                    TransactionValue::Integer { value: 4 },
+                    TransactionValue::Integer { value: 0 },
+                    TransactionValue::Integer { value: 9 },
+                ]
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_this_dispatches_through_identity_alias_and_superclass() -> Result<()> {
+        let entry = JimpleMethodSignature {
+            owner: String::from("demo.Child"),
+            name: String::from("run"),
+            return_type: String::from("int"),
+            parameter_types: Vec::new(),
+        };
+        let declared = JimpleMethodSignature {
+            owner: String::from("demo.Child"),
+            name: String::from("value"),
+            return_type: String::from("int"),
+            parameter_types: Vec::new(),
+        };
+        let implementation = JimpleMethodSignature {
+            owner: String::from("demo.Base"),
+            name: String::from("value"),
+            return_type: String::from("int"),
+            parameter_types: Vec::new(),
+        };
+        let this_local = local("self", "demo.Child");
+        let result = local("result", "int");
+        let program = JimpleProgram::new(vec![
+            JimpleMethod {
+                signature: entry.clone(),
+                display_signature: String::from("child run"),
+                declaring_superclass: Some(String::from("demo.Base")),
+                declaring_interfaces: Vec::new(),
+                statements: vec![
+                    statement(
+                        0,
+                        vec![1],
+                        JimpleOperation::Identity {
+                            left: this_local.clone(),
+                            right: value("demo.Child", "@this", JimpleValueKind::This),
+                        },
+                    ),
+                    statement(
+                        1,
+                        vec![2],
+                        JimpleOperation::Assign {
+                            left: result.clone(),
+                            right: value(
+                                "int",
+                                "virtual value",
+                                JimpleValueKind::Invoke {
+                                    invoke_kind: String::from("JVirtualInvokeExpr"),
+                                    method: declared,
+                                    base: Some(Box::new(this_local)),
+                                    arguments: Vec::new(),
+                                    bootstrap_method: None,
+                                    bootstrap_arguments: Vec::new(),
+                                },
+                            ),
+                        },
+                    ),
+                    statement(2, Vec::new(), JimpleOperation::Return { value: result }),
+                ],
+            },
+            JimpleMethod {
+                signature: implementation,
+                display_signature: String::from("base value"),
+                declaring_superclass: None,
+                declaring_interfaces: Vec::new(),
+                statements: vec![statement(
+                    0,
+                    Vec::new(),
+                    JimpleOperation::Return { value: integer(7) },
+                )],
+            },
+        ]);
+        assert!(
+            program
+                .lower_transaction_program(&entry, &JimpleTransactionBindings::default())
+                .is_err()
+        );
+        let lowered = program.lower_transaction_program_for_runtime_this(
+            &entry,
+            "demo.Child",
+            &JimpleTransactionBindings::default(),
+        )?;
+        assert_eq!(lowered.functions.len(), 2);
+        assert_eq!(
+            lowered.functions[1].statements[0].operation,
+            TransactionOperation::Return {
+                value: Some(TransactionValue::Integer { value: 7 })
+            }
+        );
         Ok(())
     }
 

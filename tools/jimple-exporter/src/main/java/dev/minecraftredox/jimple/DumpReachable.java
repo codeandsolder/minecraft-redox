@@ -111,8 +111,8 @@ public final class DumpReachable {
     private void run() {
         while (!pending.isEmpty()) {
             Pending work = pending.removeFirst();
-            Optional<? extends SootMethod> resolved = view.getMethod(work.signature());
-            if (resolved.isEmpty() || !resolved.get().isConcrete()) {
+            Optional<? extends SootMethod> resolved = resolveConcrete(work.signature());
+            if (resolved.isEmpty()) {
                 continue;
             }
             SootMethod method = resolved.get();
@@ -129,6 +129,36 @@ public final class DumpReachable {
                 scan(method, work.depth());
             }
         }
+    }
+
+    private Optional<? extends SootMethod> resolveConcrete(MethodSignature signature) {
+        Optional<? extends SootMethod> direct = view.getMethod(signature);
+        if (direct.isPresent() && direct.get().isConcrete()) {
+            return direct;
+        }
+        ClassType owner = signature.getDeclClassType();
+        Set<String> visited = new HashSet<>();
+        while (visited.add(owner.toString())) {
+            Optional<? extends SootClass> klass = view.getClass(owner);
+            if (klass.isEmpty()) {
+                return Optional.empty();
+            }
+            Optional<? extends SootMethod> inherited = klass.get().getMethods().stream()
+                    .filter(SootMethod::isConcrete)
+                    .filter(method -> method.getName().equals(signature.getName()))
+                    .filter(method -> method.getSignature().getType().equals(signature.getType()))
+                    .filter(method -> method.getSignature().getParameterTypes().equals(signature.getParameterTypes()))
+                    .findFirst();
+            if (inherited.isPresent()) {
+                return inherited;
+            }
+            Optional<? extends ClassType> superclass = klass.get().getSuperclass();
+            if (superclass.isEmpty()) {
+                return Optional.empty();
+            }
+            owner = superclass.get();
+        }
+        return Optional.empty();
     }
 
     private void scan(SootMethod method, int depth) {
