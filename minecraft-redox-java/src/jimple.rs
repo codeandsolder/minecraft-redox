@@ -469,6 +469,36 @@ pub struct JimpleFixedTripLoop {
     pub statement_ids: Vec<usize>,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct JimpleAffineFieldRecurrence {
+    pub loop_header_statement_id: usize,
+    pub loop_iterations: u64,
+    pub statement_id: usize,
+    pub target: SymbolicValue,
+    pub multiplier: i64,
+    pub addend: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct JimpleAffineBitSlice {
+    pub argument_index: usize,
+    pub shift: u32,
+    pub mask: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct JimpleAffineBitSelectorCandidate {
+    pub loop_header_statement_id: usize,
+    pub loop_iterations: u64,
+    pub recurrence_statement_id: usize,
+    pub state: SymbolicValue,
+    pub multiplier: i64,
+    pub addend: i64,
+    pub selector_statement_id: usize,
+    pub selector_method: JimpleMethodSignature,
+    pub slices: Vec<JimpleAffineBitSlice>,
+}
+
 /// Decode methods produced by the structured Jimple exporter.
 ///
 /// # Errors
@@ -680,6 +710,134 @@ impl JimpleMethod {
                 })
             })
             .collect()
+    }
+
+    /// Recover affine field recurrences that execute inside provably fixed-trip loops.
+    ///
+    /// This deliberately recognizes only the exact source-neutral shape `field = field * m + a`
+    /// (with commuted multiplication/addition operands allowed). More complex recurrences remain
+    /// explicit rather than being guessed.
+    #[must_use]
+    pub fn fixed_loop_affine_field_recurrences(&self) -> Vec<JimpleAffineFieldRecurrence> {
+        let loops = self.fixed_trip_loops();
+        let writes: Vec<_> = self
+            .effect_summary()
+            .effects
+            .into_iter()
+            .filter_map(|effect| match effect {
+                JimpleDirectEffect::FieldWrite(write) => Some(write),
+                JimpleDirectEffect::Invocation(_) => None,
+            })
+            .collect();
+        let mut recurrences = Vec::new();
+        for fixed_loop in loops {
+            for write in writes
+                .iter()
+                .filter(|write| fixed_loop.statement_ids.contains(&write.statement_id))
+            {
+                let target = match &write.receiver {
+                    Some(receiver) => SymbolicValue::InstanceField {
+                        base: Box::new(receiver.clone()),
+                        field: write.field.clone(),
+                    },
+                    None => SymbolicValue::StaticField {
+                        field: write.field.clone(),
+                    },
+                };
+                let Some((multiplier, addend)) =
+                    affine_recurrence_for_target(&target, &write.value)
+                else {
+                    continue;
+                };
+                recurrences.push(JimpleAffineFieldRecurrence {
+                    loop_header_statement_id: fixed_loop.header_statement_id,
+                    loop_iterations: fixed_loop.iterations,
+                    statement_id: write.statement_id,
+                    target,
+                    multiplier,
+                    addend,
+                });
+            }
+        }
+        recurrences.sort_by_key(|item| (item.loop_header_statement_id, item.statement_id));
+        recurrences
+    }
+
+    /// Recover fixed-loop affine selectors whose call arguments are masked right-shift slices
+    /// of the loop-carried recurrence state.
+    ///
+    /// This is source-neutral: it does not identify a particular RNG or callback API. A caller can
+    /// bind the recovered selector method separately and retain argument order as component order.
+    #[must_use]
+    pub fn fixed_loop_affine_bit_selectors(&self) -> Vec<JimpleAffineBitSelectorCandidate> {
+        let loops = self.fixed_trip_loops();
+        let recurrences = self.fixed_loop_affine_field_recurrences();
+        let invocations: Vec<_> = self
+            .effect_summary()
+            .effects
+            .into_iter()
+            .filter_map(|effect| match effect {
+                JimpleDirectEffect::Invocation(invocation) => Some(invocation),
+                JimpleDirectEffect::FieldWrite(_) => None,
+            })
+            .collect();
+        let mut candidates = Vec::new();
+        for recurrence in recurrences {
+            let Some(fixed_loop) = loops
+                .iter()
+                .find(|item| item.header_statement_id == recurrence.loop_header_statement_id)
+            else {
+                continue;
+            };
+            for invocation in invocations
+                .iter()
+                .filter(|item| fixed_loop.statement_ids.contains(&item.statement_id))
+            {
+                if invocation.arguments.len() < 2 {
+                    continue;
+                }
+                let slices = invocation
+                    .arguments
+                    .iter()
+                    .enumerate()
+                    .map(|(argument_index, argument)| {
+                        masked_right_shift_of(&recurrence.target, argument).map(|(shift, mask)| {
+                            JimpleAffineBitSlice {
+                                argument_index,
+                                shift,
+                                mask,
+                            }
+                        })
+                    })
+                    .collect::<Option<Vec<_>>>();
+                let Some(slices) = slices else {
+                    continue;
+                };
+                let candidate = JimpleAffineBitSelectorCandidate {
+                    loop_header_statement_id: recurrence.loop_header_statement_id,
+                    loop_iterations: recurrence.loop_iterations,
+                    recurrence_statement_id: recurrence.statement_id,
+                    state: recurrence.target.clone(),
+                    multiplier: recurrence.multiplier,
+                    addend: recurrence.addend,
+                    selector_statement_id: invocation.statement_id,
+                    selector_method: invocation.method.clone(),
+                    slices,
+                };
+                if !candidates.contains(&candidate) {
+                    candidates.push(candidate);
+                }
+            }
+        }
+        candidates.sort_by_key(|item| {
+            (
+                item.loop_header_statement_id,
+                item.selector_statement_id,
+                item.selector_method.owner.clone(),
+                item.selector_method.name.clone(),
+            )
+        });
+        candidates
     }
 
     fn loop_condition_statement(
@@ -1958,6 +2116,94 @@ fn local_step(statement: &JimpleStatement, name: &str) -> Option<i64> {
         return Some(value);
     }
     None
+}
+
+fn masked_right_shift_of(target: &SymbolicValue, value: &SymbolicValue) -> Option<(u32, i64)> {
+    let SymbolicValue::Binary {
+        operator,
+        left,
+        right,
+    } = value
+    else {
+        return None;
+    };
+    if operator != "&" {
+        return None;
+    }
+    shifted_target(target, left)
+        .and_then(|shift| symbolic_integer(right).map(|mask| (shift, mask)))
+        .or_else(|| {
+            shifted_target(target, right)
+                .and_then(|shift| symbolic_integer(left).map(|mask| (shift, mask)))
+        })
+        .filter(|(_, mask)| *mask >= 0)
+}
+
+fn shifted_target(target: &SymbolicValue, value: &SymbolicValue) -> Option<u32> {
+    if value == target {
+        return Some(0);
+    }
+    let SymbolicValue::Binary {
+        operator,
+        left,
+        right,
+    } = value
+    else {
+        return None;
+    };
+    if operator != ">>" {
+        return None;
+    }
+    let shift = u32::try_from(symbolic_integer(right)?).ok()?;
+    if shift >= i32::BITS {
+        return None;
+    }
+    let accumulated = shifted_target(target, left)?.checked_add(shift)?;
+    (accumulated < i32::BITS).then_some(accumulated)
+}
+
+fn affine_recurrence_for_target(
+    target: &SymbolicValue,
+    value: &SymbolicValue,
+) -> Option<(i64, i64)> {
+    let SymbolicValue::Binary {
+        operator,
+        left,
+        right,
+    } = value
+    else {
+        return None;
+    };
+    if operator != "+" {
+        return None;
+    }
+    affine_product_for_target(target, left)
+        .and_then(|multiplier| symbolic_integer(right).map(|addend| (multiplier, addend)))
+        .or_else(|| {
+            affine_product_for_target(target, right)
+                .and_then(|multiplier| symbolic_integer(left).map(|addend| (multiplier, addend)))
+        })
+}
+
+fn affine_product_for_target(target: &SymbolicValue, value: &SymbolicValue) -> Option<i64> {
+    let SymbolicValue::Binary {
+        operator,
+        left,
+        right,
+    } = value
+    else {
+        return None;
+    };
+    if operator != "*" {
+        return None;
+    }
+    if left.as_ref() == target {
+        symbolic_integer(right)
+    } else if right.as_ref() == target {
+        symbolic_integer(left)
+    } else {
+        None
+    }
 }
 
 fn fixed_trip_count(
@@ -3360,6 +3606,34 @@ mod tests {
         }
     }
 
+    fn invocation(
+        owner: &str,
+        name: &str,
+        return_type: &str,
+        parameter_types: Vec<&str>,
+        base: Option<super::JimpleValue>,
+        arguments: Vec<super::JimpleValue>,
+    ) -> super::JimpleValue {
+        super::JimpleValue {
+            jimple_kind: String::from("JVirtualInvokeExpr"),
+            type_name: return_type.to_owned(),
+            text: format!("{owner}.{name}"),
+            kind: super::JimpleValueKind::Invoke {
+                invoke_kind: String::from("JVirtualInvokeExpr"),
+                method: super::JimpleMethodSignature {
+                    owner: owner.to_owned(),
+                    name: name.to_owned(),
+                    return_type: return_type.to_owned(),
+                    parameter_types: parameter_types.into_iter().map(str::to_owned).collect(),
+                },
+                base: base.map(Box::new),
+                arguments,
+                bootstrap_method: None,
+                bootstrap_arguments: Vec::new(),
+            },
+        }
+    }
+
     fn statement(
         id: usize,
         successors: Vec<usize>,
@@ -3941,6 +4215,185 @@ mod tests {
         ));
         assert_eq!(recovered.iterations, None);
         assert_eq!(method.fixed_trip_loops().len(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn fixed_loop_recovers_affine_field_recurrence() -> anyhow::Result<()> {
+        let this_local = local("this", "demo.Selector");
+        let index = local("i", "int");
+        let state = instance_field(this_local.clone(), "demo.Selector", "state");
+        let method = super::JimpleMethod {
+            signature: super::JimpleMethodSignature {
+                owner: String::from("demo.Selector"),
+                name: String::from("run"),
+                return_type: String::from("void"),
+                parameter_types: Vec::new(),
+            },
+            display_signature: String::from("<demo.Selector: void run()>"),
+            declaring_superclass: None,
+            declaring_interfaces: Vec::new(),
+            statements: vec![
+                statement(
+                    0,
+                    vec![1],
+                    super::JimpleOperation::Identity {
+                        left: this_local,
+                        right: this_value("demo.Selector"),
+                    },
+                ),
+                statement(
+                    1,
+                    vec![2],
+                    super::JimpleOperation::Assign {
+                        left: index.clone(),
+                        right: integer(0),
+                    },
+                ),
+                statement(
+                    2,
+                    vec![3, 6],
+                    super::JimpleOperation::If {
+                        condition: binary(">=", index.clone(), integer(3)),
+                    },
+                ),
+                statement(
+                    3,
+                    vec![4],
+                    super::JimpleOperation::Assign {
+                        left: state.clone(),
+                        right: binary("+", binary("*", state, integer(3)), integer(7)),
+                    },
+                ),
+                statement(
+                    4,
+                    vec![5],
+                    super::JimpleOperation::Assign {
+                        left: index.clone(),
+                        right: binary("+", index, integer(1)),
+                    },
+                ),
+                statement(5, vec![2], super::JimpleOperation::Goto),
+                statement(6, Vec::new(), super::JimpleOperation::ReturnVoid),
+            ],
+        };
+        let recurrences = method.fixed_loop_affine_field_recurrences();
+        let [recovered] = recurrences.as_slice() else {
+            return Err(anyhow::anyhow!("expected one affine field recurrence"));
+        };
+        assert_eq!(recovered.loop_header_statement_id, 2);
+        assert_eq!(recovered.loop_iterations, 3);
+        assert_eq!(recovered.statement_id, 3);
+        assert_eq!(recovered.multiplier, 3);
+        assert_eq!(recovered.addend, 7);
+        let SymbolicValue::InstanceField { field, .. } = &recovered.target else {
+            return Err(anyhow::anyhow!("expected instance-field recurrence target"));
+        };
+        assert_eq!(field.name, "state");
+        Ok(())
+    }
+
+    #[test]
+    fn fixed_loop_recovers_affine_masked_bit_selector() -> anyhow::Result<()> {
+        let this_local = local("this", "demo.Selector");
+        let index = local("i", "int");
+        let state = instance_field(this_local.clone(), "demo.Selector", "state");
+        let sample = local("sample", "int");
+        let method = super::JimpleMethod {
+            signature: super::JimpleMethodSignature {
+                owner: String::from("demo.Selector"),
+                name: String::from("run"),
+                return_type: String::from("void"),
+                parameter_types: Vec::new(),
+            },
+            display_signature: String::from("<demo.Selector: void run()>"),
+            declaring_superclass: None,
+            declaring_interfaces: Vec::new(),
+            statements: vec![
+                statement(
+                    0,
+                    vec![1],
+                    super::JimpleOperation::Identity {
+                        left: this_local.clone(),
+                        right: this_value("demo.Selector"),
+                    },
+                ),
+                statement(
+                    1,
+                    vec![2],
+                    super::JimpleOperation::Assign {
+                        left: index.clone(),
+                        right: integer(0),
+                    },
+                ),
+                statement(
+                    2,
+                    vec![3, 7],
+                    super::JimpleOperation::If {
+                        condition: binary(">=", index.clone(), integer(3)),
+                    },
+                ),
+                statement(
+                    3,
+                    vec![4],
+                    super::JimpleOperation::Assign {
+                        left: state.clone(),
+                        right: binary("+", binary("*", state.clone(), integer(3)), integer(7)),
+                    },
+                ),
+                statement(
+                    4,
+                    vec![5],
+                    super::JimpleOperation::Assign {
+                        left: sample.clone(),
+                        right: binary(">>", state.clone(), integer(2)),
+                    },
+                ),
+                statement(
+                    5,
+                    vec![6],
+                    super::JimpleOperation::Invoke {
+                        expression: Some(invocation(
+                            "demo.Grid",
+                            "select",
+                            "void",
+                            vec!["int", "int", "int"],
+                            Some(this_local),
+                            vec![
+                                binary("&", sample.clone(), integer(15)),
+                                binary("&", binary(">>", sample.clone(), integer(16)), integer(15)),
+                                binary("&", binary(">>", sample, integer(8)), integer(15)),
+                            ],
+                        )),
+                    },
+                ),
+                statement(
+                    6,
+                    vec![2],
+                    super::JimpleOperation::Assign {
+                        left: index.clone(),
+                        right: binary("+", index, integer(1)),
+                    },
+                ),
+                statement(7, Vec::new(), super::JimpleOperation::ReturnVoid),
+            ],
+        };
+        let candidates = method.fixed_loop_affine_bit_selectors();
+        let [candidate] = candidates.as_slice() else {
+            return Err(anyhow::anyhow!("expected one affine bit selector"));
+        };
+        assert_eq!(candidate.loop_iterations, 3);
+        assert_eq!(candidate.multiplier, 3);
+        assert_eq!(candidate.addend, 7);
+        assert_eq!(candidate.selector_method.name, "select");
+        assert_eq!(
+            candidate
+                .slices
+                .iter()
+                .map(|slice| (slice.argument_index, slice.shift, slice.mask))
+                .collect::<Vec<_>>(),
+            vec![(0, 2, 15), (1, 18, 15), (2, 10, 15)]
+        );
         Ok(())
     }
 

@@ -1,5 +1,9 @@
 //! Adapter between source-neutral Redox transactions and Quiescence atom-state reactions.
 
+mod dense_selector;
+
+pub use dense_selector::{AffineBitSelector, AffineBitSelectorError, AffineBitSelectorSpec};
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,

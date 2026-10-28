@@ -96,6 +96,12 @@ fn main() -> Result<()> {
         }
         [_, command, path] if command == "jimple-temporal" => print_jimple_temporal(path),
         [_, command, path, method] if command == "jimple-loops" => print_jimple_loops(path, method),
+        [_, command, path, method] if command == "jimple-loop-recurrences" => {
+            print_jimple_loop_recurrences(path, method)
+        }
+        [_, command, path, method] if command == "jimple-affine-selectors" => {
+            print_jimple_affine_selectors(path, method)
+        }
         [_, command, path, method] if command == "jimple-local-counters" => {
             print_jimple_local_counters(path, method)
         }
@@ -560,6 +566,52 @@ fn print_jimple_loops(path: &str, method_filter: &str) -> Result<()> {
     println!(
         "{}",
         serde_json::to_string_pretty(&method.induction_loops())?
+    );
+    Ok(())
+}
+
+fn print_jimple_loop_recurrences(path: &str, method_filter: &str) -> Result<()> {
+    let json = fs::read_to_string(path).with_context(|| format!("failed to read {path}"))?;
+    let methods = parse_methods(&json)?;
+    let matching: Vec<_> = methods
+        .iter()
+        .filter(|method| {
+            method.signature.name == method_filter
+                || method.display_signature.contains(method_filter)
+        })
+        .collect();
+    let [method] = matching.as_slice() else {
+        bail!(
+            "method filter {method_filter:?} matched {} methods; expected exactly one",
+            matching.len()
+        );
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&method.fixed_loop_affine_field_recurrences())?
+    );
+    Ok(())
+}
+
+fn print_jimple_affine_selectors(path: &str, method_filter: &str) -> Result<()> {
+    let json = fs::read_to_string(path).with_context(|| format!("failed to read {path}"))?;
+    let methods = parse_methods(&json)?;
+    let matching: Vec<_> = methods
+        .iter()
+        .filter(|method| {
+            method.signature.name == method_filter
+                || method.display_signature.contains(method_filter)
+        })
+        .collect();
+    let [method] = matching.as_slice() else {
+        bail!(
+            "method filter {method_filter:?} matched {} methods; expected exactly one",
+            matching.len()
+        );
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&method.fixed_loop_affine_bit_selectors())?
     );
     Ok(())
 }
