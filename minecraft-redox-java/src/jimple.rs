@@ -3672,7 +3672,7 @@ mod tests {
                     0,
                     vec![1],
                     super::JimpleOperation::Identity {
-                        left: this_local.clone(),
+                        left: this_local,
                         right: this_value("demo.Timer"),
                     },
                 ),
@@ -3895,7 +3895,7 @@ mod tests {
                     vec![8],
                     super::JimpleOperation::Assign {
                         left: index.clone(),
-                        right: binary("+", index.clone(), integer(1)),
+                        right: binary("+", index, integer(1)),
                     },
                 ),
                 statement(8, vec![2], super::JimpleOperation::Goto),
@@ -4346,7 +4346,7 @@ mod tests {
                     vec![5],
                     super::JimpleOperation::Assign {
                         left: sample.clone(),
-                        right: binary(">>", state.clone(), integer(2)),
+                        right: binary(">>", state, integer(2)),
                     },
                 ),
                 statement(
@@ -4425,7 +4425,7 @@ mod tests {
                     0,
                     vec![1],
                     super::JimpleOperation::Assign {
-                        left: array.clone(),
+                        left: array,
                         right: super::JimpleValue {
                             jimple_kind: String::from("JNewArrayExpr"),
                             type_name: String::from("int[]"),

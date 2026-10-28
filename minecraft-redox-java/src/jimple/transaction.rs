@@ -2109,9 +2109,7 @@ mod tests {
         let static_value = value(
             "int[]",
             "demo.Constants.VALUES",
-            JimpleValueKind::StaticField {
-                field: field.clone(),
-            },
+            JimpleValueKind::StaticField { field },
         );
         let entry = JimpleMethodSignature {
             owner: String::from("demo.Reader"),
