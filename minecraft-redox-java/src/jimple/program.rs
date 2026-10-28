@@ -192,6 +192,22 @@ pub struct JimpleHostQueryCandidate {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum JimpleStaticConstantValue {
+    Integer { value: i64 },
+    Boolean { value: bool },
+    String { value: String },
+    Null,
+    Sequence { values: Vec<Self> },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct JimpleStaticConstantBinding {
+    pub field: super::JimpleFieldSignature,
+    pub value: JimpleStaticConstantValue,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub struct JimpleValueComponentBinding {
     pub field: super::JimpleFieldSignature,
     pub component: String,
@@ -233,6 +249,10 @@ pub struct JimpleTransactionBindings {
     pub capabilities: Vec<JimpleCapabilityBinding>,
     #[serde(default)]
     pub host_queries: Vec<JimpleHostQueryBinding>,
+    #[serde(default)]
+    pub schedule_once: Vec<JimpleScheduleOnceBinding>,
+    #[serde(default)]
+    pub static_constants: Vec<JimpleStaticConstantBinding>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -244,6 +264,7 @@ pub struct JimpleIndexedStoreTransactionCoverage {
     pub store_queries: Vec<JimpleIndexedStoreQueryCandidate>,
     pub state_writes: Vec<JimpleObjectStateWriteCandidate>,
     pub host_queries: Vec<JimpleHostQueryCandidate>,
+    pub schedule_once: Vec<JimpleScheduleOnceCandidate>,
     pub loops: Vec<JimpleTransactionLoopCandidate>,
     pub unaccounted_field_writes: Vec<JimpleProgramFieldWrite>,
     pub unaccounted_calls: Vec<JimpleProgramCall>,
@@ -273,6 +294,7 @@ pub enum JimplePureValueOperation {
     Component { component: String },
     Equal,
     Min,
+    Max,
     Sequence,
     Length,
     Index,
@@ -653,6 +675,14 @@ impl JimpleProgramEffectSummary {
         let store_queries = self.bind_indexed_store_queries(&bindings.store_queries)?;
         let state_writes = self.bind_object_state_writes(&bindings.state_writes)?;
         let host_queries = self.bind_host_queries(&bindings.host_queries)?;
+        let schedule_once = bindings
+            .schedule_once
+            .iter()
+            .map(|binding| self.bind_schedule_once(binding))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
         let loops = self.bind_transaction_loops(bindings)?;
         let unaccounted_field_writes: Vec<_> = self
             .possible_field_writes
@@ -688,6 +718,9 @@ impl JimpleProgramEffectSummary {
                     && !host_queries
                         .iter()
                         .any(|candidate| candidate.call_path == call.call_path)
+                    && !schedule_once
+                        .iter()
+                        .any(|candidate| candidate.call_path == call.call_path)
             })
             .cloned()
             .collect();
@@ -700,6 +733,7 @@ impl JimpleProgramEffectSummary {
             store_queries,
             state_writes,
             host_queries,
+            schedule_once,
             loops,
             unaccounted_field_writes,
             unaccounted_calls,
@@ -1039,6 +1073,10 @@ fn transaction_callee_is_bound(
             .host_queries
             .iter()
             .any(|binding| binding.callee == *callee)
+        || bindings
+            .schedule_once
+            .iter()
+            .any(|binding| binding.callee == *callee)
 }
 
 fn unique_pure_value_binding(
@@ -1061,9 +1099,9 @@ fn pure_value_shape_matches(
         JimplePureValueOperation::Component { .. } => {
             call.receiver.is_some() && call.arguments.is_empty()
         }
-        JimplePureValueOperation::Equal | JimplePureValueOperation::Min => {
-            call.receiver.is_none() && call.arguments.len() == 2
-        }
+        JimplePureValueOperation::Equal
+        | JimplePureValueOperation::Min
+        | JimplePureValueOperation::Max => call.receiver.is_none() && call.arguments.len() == 2,
         JimplePureValueOperation::Sequence => call.receiver.is_none(),
         JimplePureValueOperation::Length => call.receiver.is_some() && call.arguments.is_empty(),
         JimplePureValueOperation::Index => call.receiver.is_some() && call.arguments.len() == 1,
@@ -1706,7 +1744,11 @@ impl JimpleProgram {
         declared: &JimpleMethodSignature,
     ) -> std::result::Result<&JimpleMethod, JimpleUnresolvedEffectReason> {
         match invoke_kind {
-            "JStaticInvokeExpr" | "JSpecialInvokeExpr" => self
+            "JStaticInvokeExpr" => self
+                .method(declared)
+                .or_else(|| self.dispatched_method_in_hierarchy(&declared.owner, declared))
+                .ok_or(JimpleUnresolvedEffectReason::MissingMethod),
+            "JSpecialInvokeExpr" => self
                 .method(declared)
                 .ok_or(JimpleUnresolvedEffectReason::MissingMethod),
             "JVirtualInvokeExpr" | "JInterfaceInvokeExpr" => {

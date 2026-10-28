@@ -10,7 +10,7 @@ mod memory;
 mod runtime;
 pub use memory::{
     MemoryTransactionHost, MemoryTransactionHostQuery, MemoryTransactionObject,
-    MemoryTransactionState, MemoryTransactionStore,
+    MemoryTransactionScheduleOnce, MemoryTransactionState, MemoryTransactionStore,
 };
 pub use runtime::{
     TransactionDatum, TransactionDraft, TransactionExecution, TransactionExecutionError,
@@ -48,6 +48,12 @@ pub struct TransactionStatement {
     pub operation: TransactionOperation,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TransactionSwitchCase {
+    pub value: i64,
+    pub target: TransactionStatementId,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TransactionOperation {
@@ -74,6 +80,11 @@ pub enum TransactionOperation {
         condition: TransactionValue,
         when_false: TransactionStatementId,
         when_true: TransactionStatementId,
+    },
+    Switch {
+        key: TransactionValue,
+        cases: Vec<TransactionSwitchCase>,
+        default_target: TransactionStatementId,
     },
     Jump {
         target: TransactionStatementId,
@@ -116,6 +127,11 @@ pub enum TransactionEffect {
         target: TransactionValue,
         state: String,
         value: TransactionValue,
+    },
+    ScheduleOnce {
+        key: Vec<TransactionValue>,
+        delay: TransactionValue,
+        priority: TransactionValue,
     },
     Call {
         function: TransactionFunctionId,
@@ -204,6 +220,10 @@ pub enum TransactionValue {
         right: Box<TransactionValue>,
     },
     Min {
+        left: Box<TransactionValue>,
+        right: Box<TransactionValue>,
+    },
+    Max {
         left: Box<TransactionValue>,
         right: Box<TransactionValue>,
     },

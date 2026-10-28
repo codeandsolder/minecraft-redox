@@ -9,12 +9,13 @@ use std::{
 
 use minecraft_redox_core::transaction::{
     MemoryTransactionHost, MemoryTransactionHostQuery, MemoryTransactionObject,
-    MemoryTransactionState, MemoryTransactionStore, TransactionDatum, TransactionDraft,
-    TransactionExecution, TransactionExecutionError, TransactionExecutionLimits, TransactionHost,
-    TransactionProgram, TransactionStoreQueryKind, execute_transaction,
+    MemoryTransactionScheduleOnce, MemoryTransactionState, MemoryTransactionStore,
+    TransactionDatum, TransactionDraft, TransactionExecution, TransactionExecutionError,
+    TransactionExecutionLimits, TransactionHost, TransactionProgram, TransactionStoreQueryKind,
+    execute_transaction,
 };
-use quiescence_core::NodeId;
-use quiescence_runtime::{EvalContext, EvalError, StateWrite};
+use quiescence_core::{NodeId, ReactionId, SimDuration};
+use quiescence_runtime::{EvalContext, EvalError, ReactionOutput, StateWrite};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -114,6 +115,27 @@ impl SnapshotInterner {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.snapshots.is_empty()
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct ScheduleKeyInterner {
+    ids: BTreeMap<Vec<CanonicalDatumKey>, u64>,
+}
+
+impl ScheduleKeyInterner {
+    fn intern(&mut self, key: Vec<CanonicalDatumKey>) -> Result<u64, String> {
+        if let Some(id) = self.ids.get(&key) {
+            return Ok(*id);
+        }
+        let next = self
+            .ids
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| String::from("schedule key count overflow"))?;
+        let id = u64::try_from(next).map_err(|_| String::from("schedule key ID exceeds u64"))?;
+        self.ids.insert(key, id);
+        Ok(id)
     }
 }
 
@@ -358,6 +380,17 @@ impl TransactionDraft for DemandTransactionDraft<'_> {
             .map_err(DemandHostError::Inner)
     }
 
+    fn schedule_once(
+        &mut self,
+        key: &[TransactionDatum],
+        delay: &TransactionDatum,
+        priority: &TransactionDatum,
+    ) -> Result<(), Self::Error> {
+        self.inner
+            .schedule_once(key, delay, priority)
+            .map_err(DemandHostError::Inner)
+    }
+
     fn state_write(
         &mut self,
         target: &TransactionDatum,
@@ -388,6 +421,16 @@ pub struct TransactionReactionAdapter {
     receiver: Option<ReactionArgument>,
     quantity_component: String,
     host_preparer: Option<Arc<HostPreparer>>,
+    schedule_unit: Option<SimDuration>,
+    schedule_identity_component: Option<String>,
+    schedule_keys: Arc<Mutex<ScheduleKeyInterner>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TransactionScheduleRequest {
+    pub key: u64,
+    pub after: SimDuration,
+    pub priority: i32,
 }
 
 #[derive(Clone, Debug)]
@@ -395,6 +438,32 @@ pub struct TransactionReactionResult {
     pub execution: TransactionExecution,
     pub writes: Vec<StateWrite>,
     pub state_values: BTreeMap<u64, BTreeMap<String, TransactionDatum>>,
+    pub schedule_requests: Vec<TransactionScheduleRequest>,
+}
+
+impl TransactionReactionResult {
+    /// Convert committed writes plus source schedule requests into one graph transition whose
+    /// keyed callbacks target `callback_reaction` rather than re-running the producer reaction.
+    #[must_use]
+    pub fn into_reaction_output_for_callback(
+        self,
+        callback_reaction: ReactionId,
+    ) -> ReactionOutput {
+        let mut output = if self.writes.is_empty() {
+            ReactionOutput::idle()
+        } else {
+            ReactionOutput::immediate(self.writes)
+        };
+        for request in self.schedule_requests {
+            output = output.and_schedule_reaction_once_after(
+                callback_reaction,
+                request.after,
+                request.key,
+                request.priority,
+            );
+        }
+        output
+    }
 }
 
 impl TransactionReactionAdapter {
@@ -415,6 +484,9 @@ impl TransactionReactionAdapter {
             receiver,
             quantity_component: quantity_component.into(),
             host_preparer: None,
+            schedule_unit: None,
+            schedule_identity_component: None,
+            schedule_keys: Arc::new(Mutex::new(ScheduleKeyInterner::default())),
         }
     }
 
@@ -427,6 +499,18 @@ impl TransactionReactionAdapter {
             + 'static,
     {
         self.host_preparer = Some(Arc::new(preparer));
+        self
+    }
+
+    #[must_use]
+    pub fn with_schedule_unit(mut self, unit: SimDuration) -> Self {
+        self.schedule_unit = Some(unit);
+        self
+    }
+
+    #[must_use]
+    pub fn with_schedule_identity_component(mut self, component: impl Into<String>) -> Self {
+        self.schedule_identity_component = Some(component.into());
         self
     }
 
@@ -546,12 +630,18 @@ fn execute_resolved_transaction(
     ) {
         Ok(execution) => {
             let state_values = host.inner.state.state_values.clone();
+            let schedule_requests = lower_schedule_requests(
+                adapter,
+                &host.inner.state,
+                &host.inner.state.scheduled_once,
+            )?;
             let writes = publish_stores(&mut interner, stores, snapshot_ids, &host.inner.state)
                 .map_err(EvalError::Message)?;
             Ok(DemandExecution::Complete(TransactionReactionResult {
                 execution,
                 writes,
                 state_values,
+                schedule_requests,
             }))
         }
         Err(TransactionExecutionError::Host(DemandHostError::NeedStore(handle))) => lazy_stores
@@ -563,6 +653,76 @@ fn execute_resolved_transaction(
             }),
         Err(error) => Err(EvalError::Message(error.to_string())),
     }
+}
+
+fn lower_schedule_requests(
+    adapter: &TransactionReactionAdapter,
+    state: &MemoryTransactionState,
+    requests: &[MemoryTransactionScheduleOnce],
+) -> Result<Vec<TransactionScheduleRequest>, EvalError> {
+    if requests.is_empty() {
+        return Ok(Vec::new());
+    }
+    let unit = adapter.schedule_unit.ok_or_else(|| {
+        EvalError::Message(String::from(
+            "transaction emitted schedule_once without a configured source-time unit",
+        ))
+    })?;
+    let mut keys = adapter
+        .schedule_keys
+        .lock()
+        .map_err(|_| EvalError::Message(String::from("schedule-key interner lock poisoned")))?;
+    requests
+        .iter()
+        .map(|request| {
+            if request.delay_units < 0 {
+                return Err(EvalError::Message(format!(
+                    "negative source schedule delay {} is not yet supported",
+                    request.delay_units
+                )));
+            }
+            let nanos = unit
+                .as_nanos()
+                .checked_mul(request.delay_units)
+                .ok_or_else(|| EvalError::Message(String::from("schedule delay overflow")))?;
+            let canonical_key = request
+                .key
+                .iter()
+                .map(|value| canonical_schedule_datum(adapter, state, value))
+                .collect::<Result<Vec<_>, _>>()?;
+            let key = keys.intern(canonical_key).map_err(EvalError::Message)?;
+            Ok(TransactionScheduleRequest {
+                key,
+                after: SimDuration::from_nanos(nanos),
+                priority: request.priority,
+            })
+        })
+        .collect()
+}
+
+fn canonical_schedule_datum(
+    adapter: &TransactionReactionAdapter,
+    state: &MemoryTransactionState,
+    value: &TransactionDatum,
+) -> Result<CanonicalDatumKey, EvalError> {
+    if let TransactionDatum::Handle(handle) = value {
+        let component = adapter.schedule_identity_component.as_deref().ok_or_else(|| {
+            EvalError::Message(format!(
+                "schedule key contains ephemeral handle {handle} without a stable identity component"
+            ))
+        })?;
+        let identity = state
+            .objects
+            .get(handle)
+            .and_then(|object| object.components.get(component))
+            .ok_or_else(|| {
+                EvalError::Message(format!(
+                    "schedule key handle {handle} has no stable identity component {component:?}"
+                ))
+            })?;
+        return canonical_datum_key(identity).map_err(EvalError::Message);
+    }
+    canonical_datum_key(value).map_err(EvalError::Message)
 }
 
 fn lower_argument(
@@ -921,6 +1081,26 @@ mod tests {
         )
     }
 
+    fn schedule_program(key: TransactionValue) -> TransactionProgram {
+        program(
+            vec![
+                statement(
+                    0,
+                    TransactionOperation::Effect {
+                        effect: TransactionEffect::ScheduleOnce {
+                            key: vec![key],
+                            delay: TransactionValue::Integer { value: 4 },
+                            priority: TransactionValue::Integer { value: -1 },
+                        },
+                        next: TransactionStatementId(1),
+                    },
+                ),
+                statement(1, TransactionOperation::Return { value: None }),
+            ],
+            0,
+        )
+    }
+
     fn store_read_program() -> TransactionProgram {
         program(
             vec![
@@ -1136,6 +1316,180 @@ mod tests {
                 .and_then(|value| value.components.get("quantity")),
             Some(&TransactionDatum::Integer(4))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn schedule_requests_convert_source_units_and_reuse_exact_keys()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let interner = Arc::new(Mutex::new(SnapshotInterner::new()));
+        let adapter = TransactionReactionAdapter::new(
+            Arc::new(schedule_program(TransactionValue::String {
+                value: String::from("block:repeater"),
+            })),
+            interner,
+            Vec::new(),
+            vec![ReactionArgument::Datum(TransactionDatum::Integer(0))],
+            None,
+            "quantity",
+        )
+        .with_schedule_unit(SimDuration::from_millis(50));
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&observed);
+        let mut graph = Graph::new(RuntimeConfig::default());
+        let reaction = graph.add_reaction("schedule bridge", move |context| {
+            let result = adapter.execute(context)?;
+            captured
+                .lock()
+                .map_err(|_| EvalError::Message(String::from("capture lock poisoned")))?
+                .push(result.schedule_requests[0]);
+            Ok(ReactionOutput::idle())
+        })?;
+        graph.settle()?;
+        graph.schedule_reaction_event(reaction, SimTime::from_millis(10), 0)?;
+        graph.advance_to(SimTime::from_millis(10))?;
+        let observed = observed
+            .lock()
+            .map_err(|_| String::from("capture lock poisoned"))?;
+        assert_eq!(observed.len(), 2);
+        assert_eq!(observed[0].key, observed[1].key);
+        assert_eq!(observed[0].after, SimDuration::from_millis(200));
+        assert_eq!(observed[0].priority, -1);
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_transaction_schedules_preserve_first_pending_callback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let adapter = TransactionReactionAdapter::new(
+            Arc::new(schedule_program(TransactionValue::String {
+                value: String::from("block:repeater"),
+            })),
+            Arc::new(Mutex::new(SnapshotInterner::new())),
+            Vec::new(),
+            vec![ReactionArgument::Datum(TransactionDatum::Integer(0))],
+            None,
+            "quantity",
+        )
+        .with_schedule_unit(SimDuration::from_millis(50));
+        let producer_evaluations = Arc::new(AtomicUsize::new(0));
+        let observed_producer = Arc::clone(&producer_evaluations);
+        let callback_evaluations = Arc::new(AtomicUsize::new(0));
+        let observed_callback = Arc::clone(&callback_evaluations);
+        let mut graph = Graph::new(RuntimeConfig::default());
+        let callback = graph.add_reaction("transaction callback target", move |context| {
+            if context.now() != SimTime::ZERO {
+                observed_callback.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(ReactionOutput::idle())
+        })?;
+        let producer = graph.add_reaction("transaction schedule producer", move |context| {
+            let evaluation = observed_producer.fetch_add(1, Ordering::Relaxed);
+            if evaluation >= 2 {
+                return Ok(ReactionOutput::idle());
+            }
+            Ok(adapter
+                .execute(context)?
+                .into_reaction_output_for_callback(callback))
+        })?;
+
+        graph.settle()?;
+        graph.schedule_reaction_event(producer, SimTime::from_millis(50), 0)?;
+        graph.advance_to(SimTime::from_millis(50))?;
+        assert_eq!(producer_evaluations.load(Ordering::Relaxed), 2);
+        assert_eq!(callback_evaluations.load(Ordering::Relaxed), 0);
+        graph.advance_to(SimTime::from_millis(199))?;
+        assert_eq!(callback_evaluations.load(Ordering::Relaxed), 0);
+        graph.advance_to(SimTime::from_millis(200))?;
+        assert_eq!(callback_evaluations.load(Ordering::Relaxed), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn schedule_key_handles_use_configured_stable_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let adapter = TransactionReactionAdapter::new(
+            Arc::new(schedule_program(TransactionValue::Parameter { index: 0 })),
+            Arc::new(Mutex::new(SnapshotInterner::new())),
+            Vec::new(),
+            vec![ReactionArgument::Datum(TransactionDatum::Handle(99))],
+            None,
+            "quantity",
+        )
+        .with_schedule_unit(SimDuration::from_millis(50))
+        .with_schedule_identity_component("semantic_id")
+        .with_host_preparer(|_| {
+            Ok(ReactionHostPreparation {
+                objects: [(
+                    99,
+                    MemoryTransactionObject {
+                        components: [(
+                            String::from("semantic_id"),
+                            TransactionDatum::String(String::from("minecraft:unpowered_repeater")),
+                        )]
+                        .into_iter()
+                        .collect(),
+                        semantic_tag: None,
+                    },
+                )]
+                .into_iter()
+                .collect(),
+                ..ReactionHostPreparation::default()
+            })
+        });
+        let observed = Arc::new(Mutex::new(None));
+        let captured = Arc::clone(&observed);
+        let mut graph = Graph::new(RuntimeConfig::default());
+        graph.add_reaction("stable schedule identity", move |context| {
+            let result = adapter.execute(context)?;
+            *captured
+                .lock()
+                .map_err(|_| EvalError::Message(String::from("capture lock poisoned")))? =
+                Some(result.schedule_requests[0]);
+            Ok(ReactionOutput::idle())
+        })?;
+        graph.settle()?;
+        let scheduled = observed
+            .lock()
+            .map_err(|_| String::from("capture lock poisoned"))?
+            .ok_or_else(|| String::from("schedule result missing"))?;
+        assert_eq!(scheduled.after, SimDuration::from_millis(200));
+        assert_eq!(scheduled.priority, -1);
+        Ok(())
+    }
+
+    #[test]
+    fn schedule_keys_reject_ephemeral_transaction_handles() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let adapter = TransactionReactionAdapter::new(
+            Arc::new(schedule_program(TransactionValue::Parameter { index: 0 })),
+            Arc::new(Mutex::new(SnapshotInterner::new())),
+            Vec::new(),
+            vec![ReactionArgument::Datum(TransactionDatum::Handle(99))],
+            None,
+            "quantity",
+        )
+        .with_schedule_unit(SimDuration::from_millis(50));
+        let rejected = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&rejected);
+        let mut graph = Graph::new(RuntimeConfig::default());
+        graph.add_reaction("invalid persistent key", move |context| {
+            match adapter.execute(context) {
+                Ok(_) => Err(EvalError::Message(String::from(
+                    "ephemeral schedule key accepted",
+                ))),
+                Err(error) => {
+                    if error.to_string().contains("ephemeral handle 99") {
+                        observed.store(1, Ordering::Relaxed);
+                        Ok(ReactionOutput::idle())
+                    } else {
+                        Err(error)
+                    }
+                }
+            }
+        })?;
+        graph.settle()?;
+        assert_eq!(rejected.load(Ordering::Relaxed), 1);
         Ok(())
     }
 

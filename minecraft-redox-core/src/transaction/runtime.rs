@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     TransactionEffect, TransactionFunction, TransactionFunctionId, TransactionLocalId,
-    TransactionNumericType, TransactionOperation, TransactionProgram, TransactionStoreQueryKind,
-    TransactionValue,
+    TransactionNumericType, TransactionOperation, TransactionProgram, TransactionStatementId,
+    TransactionStoreQueryKind, TransactionSwitchCase, TransactionValue,
 };
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -156,6 +156,17 @@ pub trait TransactionDraft {
         value: Option<&TransactionDatum>,
         context: &[TransactionDatum],
     ) -> Result<TransactionDatum, Self::Error>;
+
+    /// Request one deduplicated future callback in source time units.
+    ///
+    /// # Errors
+    /// Returns a host-defined error when the key, delay, or priority is invalid.
+    fn schedule_once(
+        &mut self,
+        key: &[TransactionDatum],
+        delay: &TransactionDatum,
+        priority: &TransactionDatum,
+    ) -> Result<(), Self::Error>;
 
     /// Write one semantic object-state value in the draft.
     ///
@@ -364,6 +375,14 @@ impl<D: TransactionDraft> Executor<'_, D> {
                         *when_false
                     };
                 }
+                TransactionOperation::Switch {
+                    key,
+                    cases,
+                    default_target,
+                } => {
+                    let key = self.evaluate(&frame, key, depth)?;
+                    pc = switch_target(&key, cases, *default_target)?;
+                }
                 TransactionOperation::Jump { target } => pc = *target,
                 TransactionOperation::Return { value } => {
                     return value
@@ -432,6 +451,11 @@ impl<D: TransactionDraft> Executor<'_, D> {
                 let left = self.evaluate(frame, left, depth)?;
                 let right = self.evaluate(frame, right, depth)?;
                 min_value(left, right)
+            }
+            TransactionValue::Max { left, right } => {
+                let left = self.evaluate(frame, left, depth)?;
+                let right = self.evaluate(frame, right, depth)?;
+                max_value(left, right)
             }
             TransactionValue::HasCapability { .. }
             | TransactionValue::HostQuery { .. }
@@ -583,6 +607,18 @@ impl<D: TransactionDraft> Executor<'_, D> {
                     .state_write(&target, state, value)
                     .map_err(TransactionExecutionError::host)
             }
+            TransactionEffect::ScheduleOnce {
+                key,
+                delay,
+                priority,
+            } => {
+                let key = self.evaluate_many(frame, key, depth)?;
+                let delay = self.evaluate(frame, delay, depth)?;
+                let priority = self.evaluate(frame, priority, depth)?;
+                self.draft
+                    .schedule_once(&key, &delay, &priority)
+                    .map_err(TransactionExecutionError::host)
+            }
             TransactionEffect::Call {
                 function,
                 receiver,
@@ -690,8 +726,8 @@ fn binary<E>(
     match operator {
         "==" => Ok(TransactionDatum::Boolean(cfg_equal(&left, &right))),
         "!=" => Ok(TransactionDatum::Boolean(!cfg_equal(&left, &right))),
-        "+" | "-" | "*" | "/" | "%" | "&" | "|" | "^" | "<" | "<=" | ">" | ">=" | "cmpg"
-        | "cmpl" => binary_numeric(operator, left, right),
+        "+" | "-" | "*" | "/" | "%" | "&" | "|" | "^" | "<<" | ">>" | ">>>" | "<" | "<=" | ">"
+        | ">=" | "cmpg" | "cmpl" => binary_numeric(operator, left, right),
         _ => Err(TransactionExecutionError::InvalidValue(format!(
             "unsupported binary operator {operator:?}"
         ))),
@@ -740,6 +776,14 @@ fn integer_binary<E>(
         "&" => TransactionDatum::Integer(left & right),
         "|" => TransactionDatum::Integer(left | right),
         "^" => TransactionDatum::Integer(left ^ right),
+        "<<" => TransactionDatum::Integer(left.wrapping_shl(shift_count(right)?)),
+        ">>" => TransactionDatum::Integer(left.wrapping_shr(shift_count(right)?)),
+        ">>>" => {
+            let bits = u64::from_ne_bytes(left.to_ne_bytes());
+            TransactionDatum::Integer(i64::from_ne_bytes(
+                bits.wrapping_shr(shift_count(right)?).to_ne_bytes(),
+            ))
+        }
         "<" => TransactionDatum::Boolean(left < right),
         "<=" => TransactionDatum::Boolean(left <= right),
         ">" => TransactionDatum::Boolean(left > right),
@@ -756,6 +800,12 @@ fn integer_binary<E>(
         }
     };
     Ok(value)
+}
+
+fn shift_count<E>(right: i64) -> Result<u32, TransactionExecutionError<E>> {
+    u32::try_from(right & 63).map_err(|_| {
+        TransactionExecutionError::InvalidValue(String::from("shift count conversion failed"))
+    })
 }
 
 fn float_binary<E>(
@@ -856,6 +906,22 @@ fn java_f64_to_i32(value: f64) -> i64 {
     if negative { -magnitude } else { magnitude }
 }
 
+fn switch_target<E>(
+    key: &TransactionDatum,
+    cases: &[TransactionSwitchCase],
+    default_target: TransactionStatementId,
+) -> Result<TransactionStatementId, TransactionExecutionError<E>> {
+    let TransactionDatum::Integer(key) = key else {
+        return Err(TransactionExecutionError::InvalidValue(format!(
+            "switch key is not an integer: {key:?}"
+        )));
+    };
+    Ok(cases
+        .iter()
+        .find(|case| case.value == *key)
+        .map_or(default_target, |case| case.target))
+}
+
 fn unary<E>(
     operator: &str,
     value: TransactionDatum,
@@ -924,12 +990,47 @@ fn min_value<E>(
     }
 }
 
+fn max_value<E>(
+    left: TransactionDatum,
+    right: TransactionDatum,
+) -> Result<TransactionDatum, TransactionExecutionError<E>> {
+    match (left, right) {
+        (TransactionDatum::Integer(left), TransactionDatum::Integer(right)) => {
+            Ok(TransactionDatum::Integer(left.max(right)))
+        }
+        (TransactionDatum::Float(left), TransactionDatum::Float(right)) => {
+            Ok(TransactionDatum::Float(left.max(right)))
+        }
+        (left, right) => Err(TransactionExecutionError::InvalidValue(format!(
+            "max received {left:?} and {right:?}"
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
     use crate::transaction::{TransactionStatement, TransactionStatementId};
+
+    #[test]
+    fn integer_shift_operators_are_explicitly_supported()
+    -> Result<(), TransactionExecutionError<String>> {
+        assert_eq!(
+            integer_binary::<String>(">>", 12, 2)?,
+            TransactionDatum::Integer(3)
+        );
+        assert_eq!(
+            integer_binary::<String>("<<", 3, 2)?,
+            TransactionDatum::Integer(12)
+        );
+        assert_eq!(
+            integer_binary::<String>(">>>", -1, 1)?,
+            TransactionDatum::Integer(i64::MAX)
+        );
+        Ok(())
+    }
 
     #[derive(Clone, Debug, PartialEq)]
     struct TestItem {
@@ -1140,6 +1241,15 @@ mod tests {
                 }
                 _ => Err(String::from("query not implemented by test host")),
             }
+        }
+
+        fn schedule_once(
+            &mut self,
+            _key: &[TransactionDatum],
+            _delay: &TransactionDatum,
+            _priority: &TransactionDatum,
+        ) -> Result<(), Self::Error> {
+            Ok(())
         }
 
         fn state_write(

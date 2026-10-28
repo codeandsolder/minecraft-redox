@@ -6,14 +6,15 @@ use anyhow::{Context, Result, bail};
 use minecraft_redox_core::transaction::{
     TransactionEffect, TransactionFunction, TransactionFunctionId, TransactionLocalId,
     TransactionNumericType, TransactionOperation, TransactionProgram, TransactionStatement,
-    TransactionStatementId, TransactionStoreQueryKind, TransactionValue,
+    TransactionStatementId, TransactionStoreQueryKind, TransactionSwitchCase, TransactionValue,
 };
 
 use super::{
     AbstractArrayIdentity, AbstractValue, JimpleCallOperandBinding, JimpleFieldSignature,
     JimpleIndexedStoreOperationKind, JimpleIndexedStoreQueryKind, JimpleMethod,
     JimpleMethodSignature, JimpleOperation, JimpleProgram, JimplePureValueOperation,
-    JimpleStatement, JimpleTransactionBindings, JimpleValue, JimpleValueKind, ProgramExecution,
+    JimpleStatement, JimpleStaticConstantBinding, JimpleStaticConstantValue,
+    JimpleTransactionBindings, JimpleValue, JimpleValueKind, ProgramExecution,
 };
 
 impl JimpleProgram {
@@ -175,10 +176,11 @@ fn resolve_transaction_call_target(
 ) -> Result<(JimpleMethodSignature, Option<String>)> {
     match invoke_kind {
         "JStaticInvokeExpr" => {
-            program
+            let target = program
                 .method(callee)
+                .or_else(|| program.dispatched_method_in_hierarchy(&callee.owner, callee))
                 .with_context(|| format!("unbound external transaction call {callee:?}"))?;
-            Ok((callee.clone(), None))
+            Ok((target.signature.clone(), None))
         }
         "JSpecialInvokeExpr" => {
             program
@@ -359,6 +361,11 @@ fn semantic_call_binding_count(
             .count()
         + bindings
             .host_queries
+            .iter()
+            .filter(|binding| binding.callee == *callee)
+            .count()
+        + bindings
+            .schedule_once
             .iter()
             .filter(|binding| binding.callee == *callee)
             .count()
@@ -684,12 +691,23 @@ impl FunctionLowerer<'_> {
                     statement.id
                 );
             }
-            JimpleOperation::Switch { .. } => {
-                bail!(
-                    "transaction lowering does not yet support switch at {}",
-                    statement.id
-                );
-            }
+            JimpleOperation::Switch {
+                key,
+                cases,
+                default_target,
+            } => TransactionOperation::Switch {
+                key: self.lower_value(key)?,
+                cases: cases
+                    .iter()
+                    .map(|case| {
+                        Ok(TransactionSwitchCase {
+                            value: case.value,
+                            target: statement_id(case.target)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+                default_target: statement_id(*default_target)?,
+            },
             JimpleOperation::Opaque => {
                 bail!(
                     "transaction lowering reached opaque statement {}",
@@ -828,6 +846,9 @@ impl FunctionLowerer<'_> {
     }
 
     fn lower_static_field(&mut self, field: &JimpleFieldSignature) -> Result<TransactionValue> {
+        if let Some(binding) = unique_static_constant(field, &self.bindings.static_constants)? {
+            return lower_static_constant(&binding.value);
+        }
         if let Some(value) = self.static_values.get(field) {
             return Ok(value.clone());
         }
@@ -914,6 +935,9 @@ impl FunctionLowerer<'_> {
         if let Some(lowered) =
             self.lower_state_write_invoke(method, receiver.as_ref(), &arguments)?
         {
+            return Ok(lowered);
+        }
+        if let Some(lowered) = self.lower_schedule_once_invoke(method, &arguments)? {
             return Ok(lowered);
         }
         self.lower_internal_invoke(
@@ -1021,6 +1045,15 @@ impl FunctionLowerer<'_> {
                     right: Box::new(right.clone()),
                 }
             }
+            JimplePureValueOperation::Max => {
+                let [left, right] = arguments else {
+                    bail!("semantic max requires two arguments");
+                };
+                TransactionValue::Max {
+                    left: Box::new(left.clone()),
+                    right: Box::new(right.clone()),
+                }
+            }
             JimplePureValueOperation::Sequence => {
                 if receiver.is_some() {
                     bail!("semantic sequence unexpectedly has a receiver");
@@ -1093,6 +1126,57 @@ impl FunctionLowerer<'_> {
             value,
             context: select_operands(receiver, arguments, &binding.context, "query context")?,
         })))
+    }
+
+    fn lower_schedule_once_invoke(
+        &self,
+        method: &JimpleMethodSignature,
+        arguments: &[TransactionValue],
+    ) -> Result<Option<LoweredInvoke>> {
+        let Some(binding) = self
+            .bindings
+            .schedule_once
+            .iter()
+            .find(|binding| binding.callee == *method)
+        else {
+            return Ok(None);
+        };
+        let key = binding
+            .key_arguments
+            .iter()
+            .map(|index| {
+                arguments
+                    .get(*index)
+                    .cloned()
+                    .with_context(|| format!("schedule key argument {index} is missing"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let delay = arguments
+            .get(binding.delay_argument)
+            .cloned()
+            .with_context(|| {
+                format!(
+                    "schedule delay argument {} is missing",
+                    binding.delay_argument
+                )
+            })?;
+        let priority = binding
+            .priority_argument
+            .map(|index| {
+                arguments
+                    .get(index)
+                    .cloned()
+                    .with_context(|| format!("schedule priority argument {index} is missing"))
+            })
+            .transpose()?
+            .unwrap_or(TransactionValue::Integer { value: 0 });
+        Ok(Some(LoweredInvoke::Effect(
+            TransactionEffect::ScheduleOnce {
+                key,
+                delay,
+                priority,
+            },
+        )))
     }
 
     fn lower_state_write_invoke(
@@ -1180,7 +1264,15 @@ impl FunctionLowerer<'_> {
         arguments: Vec<TransactionValue>,
     ) -> Result<LoweredInvoke> {
         let target = match invoke_kind {
-            "JStaticInvokeExpr" | "JSpecialInvokeExpr" => self
+            "JStaticInvokeExpr" => self
+                .program
+                .method(method)
+                .or_else(|| {
+                    self.program
+                        .dispatched_method_in_hierarchy(&method.owner, method)
+                })
+                .with_context(|| format!("unbound external transaction call {method:?}"))?,
+            "JSpecialInvokeExpr" => self
                 .program
                 .method(method)
                 .with_context(|| format!("unbound external transaction call {method:?}"))?,
@@ -1379,6 +1471,37 @@ fn single_successor(statement: &JimpleStatement) -> Result<TransactionStatementI
     statement_id(*successor)
 }
 
+fn unique_static_constant<'a>(
+    field: &JimpleFieldSignature,
+    bindings: &'a [JimpleStaticConstantBinding],
+) -> Result<Option<&'a JimpleStaticConstantBinding>> {
+    let mut matches = bindings.iter().filter(|binding| binding.field == *field);
+    let first = matches.next();
+    if matches.next().is_some() {
+        bail!("ambiguous transaction static constant binding for {field:?}");
+    }
+    Ok(first)
+}
+
+fn lower_static_constant(value: &JimpleStaticConstantValue) -> Result<TransactionValue> {
+    Ok(match value {
+        JimpleStaticConstantValue::Integer { value } => TransactionValue::Integer { value: *value },
+        JimpleStaticConstantValue::Boolean { value } => TransactionValue::Integer {
+            value: i64::from(*value),
+        },
+        JimpleStaticConstantValue::String { value } => TransactionValue::String {
+            value: value.clone(),
+        },
+        JimpleStaticConstantValue::Null => TransactionValue::Null,
+        JimpleStaticConstantValue::Sequence { values } => TransactionValue::Sequence {
+            values: values
+                .iter()
+                .map(lower_static_constant)
+                .collect::<Result<Vec<_>>>()?,
+        },
+    })
+}
+
 fn statement_id(value: usize) -> Result<TransactionStatementId> {
     Ok(TransactionStatementId(
         u32::try_from(value).context("transaction statement ID exceeds u32")?,
@@ -1389,7 +1512,8 @@ fn statement_id(value: usize) -> Result<TransactionStatementId> {
 mod tests {
     use super::*;
     use crate::jimple::{
-        JimpleCapabilityBinding, JimpleHostQueryBinding, JimpleMethod, JimpleStatement,
+        JimpleCapabilityBinding, JimpleHostQueryBinding, JimpleMethod, JimpleScheduleOnceBinding,
+        JimpleStatement,
     };
 
     fn value(type_name: &str, text: &str, kind: JimpleValueKind) -> JimpleValue {
@@ -1615,6 +1739,157 @@ mod tests {
     }
 
     #[test]
+    fn switch_lowers_to_source_neutral_control_flow() -> Result<()> {
+        let entry = JimpleMethodSignature {
+            owner: String::from("demo.Switcher"),
+            name: String::from("run"),
+            return_type: String::from("int"),
+            parameter_types: vec![String::from("int")],
+        };
+        let key = local("key", "int");
+        let program = JimpleProgram::new(vec![JimpleMethod {
+            signature: entry.clone(),
+            display_signature: String::from("switch fixture"),
+            declaring_superclass: None,
+            declaring_interfaces: Vec::new(),
+            statements: vec![
+                statement(
+                    0,
+                    vec![1],
+                    JimpleOperation::Identity {
+                        left: key.clone(),
+                        right: value(
+                            "int",
+                            "@parameter0",
+                            JimpleValueKind::Parameter { index: 0 },
+                        ),
+                    },
+                ),
+                statement(
+                    1,
+                    vec![2, 3],
+                    JimpleOperation::Switch {
+                        key,
+                        cases: vec![crate::jimple::JimpleSwitchCase {
+                            value: 1,
+                            target: 2,
+                        }],
+                        default_target: 3,
+                    },
+                ),
+                statement(2, Vec::new(), JimpleOperation::Return { value: integer(7) }),
+                statement(3, Vec::new(), JimpleOperation::Return { value: integer(9) }),
+            ],
+        }]);
+        let lowered =
+            program.lower_transaction_program(&entry, &JimpleTransactionBindings::default())?;
+        assert!(matches!(
+            lowered.functions[0].statements[1].operation,
+            TransactionOperation::Switch { ref cases, default_target, .. }
+                if cases == &[TransactionSwitchCase {
+                    value: 1,
+                    target: TransactionStatementId(2),
+                }] && default_target == TransactionStatementId(3)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn schedule_binding_lowers_to_source_neutral_effect() -> Result<()> {
+        let scheduler = JimpleMethodSignature {
+            owner: String::from("demo.SourceWorld"),
+            name: String::from("sourceSchedule"),
+            return_type: String::from("void"),
+            parameter_types: vec![
+                String::from("int"),
+                String::from("int"),
+                String::from("int"),
+                String::from("java.lang.String"),
+                String::from("int"),
+                String::from("int"),
+            ],
+        };
+        let entry = JimpleMethodSignature {
+            owner: String::from("demo.SourceEntry"),
+            name: String::from("schedule"),
+            return_type: String::from("void"),
+            parameter_types: Vec::new(),
+        };
+        let schedule = value(
+            "void",
+            "source schedule",
+            JimpleValueKind::Invoke {
+                invoke_kind: String::from("JStaticInvokeExpr"),
+                method: scheduler.clone(),
+                base: None,
+                arguments: vec![
+                    integer(1),
+                    integer(2),
+                    integer(3),
+                    value(
+                        "java.lang.String",
+                        "block",
+                        JimpleValueKind::StringConstant {
+                            value: String::from("block"),
+                        },
+                    ),
+                    integer(4),
+                    integer(-1),
+                ],
+                bootstrap_method: None,
+                bootstrap_arguments: Vec::new(),
+            },
+        );
+        let program = JimpleProgram::new(vec![JimpleMethod {
+            signature: entry.clone(),
+            display_signature: String::from("schedule fixture"),
+            declaring_superclass: None,
+            declaring_interfaces: Vec::new(),
+            statements: vec![
+                statement(
+                    0,
+                    vec![1],
+                    JimpleOperation::Invoke {
+                        expression: Some(schedule),
+                    },
+                ),
+                statement(1, Vec::new(), JimpleOperation::ReturnVoid),
+            ],
+        }]);
+        let lowered = program.lower_transaction_program(
+            &entry,
+            &JimpleTransactionBindings {
+                schedule_once: vec![JimpleScheduleOnceBinding {
+                    callee: scheduler,
+                    key_arguments: vec![0, 1, 2, 3],
+                    delay_argument: 4,
+                    priority_argument: Some(5),
+                }],
+                ..JimpleTransactionBindings::default()
+            },
+        )?;
+        let TransactionOperation::Effect {
+            effect:
+                TransactionEffect::ScheduleOnce {
+                    key,
+                    delay,
+                    priority,
+                },
+            ..
+        } = &lowered.functions[0].statements[0].operation
+        else {
+            bail!("schedule call did not lower to schedule_once effect");
+        };
+        assert_eq!(key.len(), 4);
+        assert!(matches!(delay, TransactionValue::Integer { value: 4 }));
+        assert!(matches!(priority, TransactionValue::Integer { value: -1 }));
+        let serialized = serde_json::to_string(&lowered)?;
+        assert!(!serialized.contains("SourceWorld"));
+        assert!(!serialized.contains("sourceSchedule"));
+        Ok(())
+    }
+
+    #[test]
     fn host_query_binding_erases_ignored_source_scaffolding() -> Result<()> {
         let (program, entry, query) = host_query_fixture();
         let lowered = program.lower_transaction_program(
@@ -1637,27 +1912,122 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn static_primitive_arrays_lower_from_recovered_class_initialization() -> Result<()> {
-        let field = super::super::JimpleFieldSignature {
+    fn static_array_initializer(static_value: &JimpleValue) -> JimpleMethod {
+        let array = local("array", "int[]");
+        JimpleMethod {
+            signature: JimpleMethodSignature {
+                owner: String::from("demo.Constants"),
+                name: String::from("<clinit>"),
+                return_type: String::from("void"),
+                parameter_types: Vec::new(),
+            },
+            display_signature: String::from("constants clinit"),
+            declaring_superclass: None,
+            declaring_interfaces: Vec::new(),
+            statements: vec![
+                statement(
+                    0,
+                    vec![1],
+                    JimpleOperation::Assign {
+                        left: array.clone(),
+                        right: value(
+                            "int[]",
+                            "new int[3]",
+                            JimpleValueKind::NewArray {
+                                element_type: String::from("int"),
+                                size: Box::new(integer(3)),
+                            },
+                        ),
+                    },
+                ),
+                statement(
+                    1,
+                    vec![2],
+                    JimpleOperation::Assign {
+                        left: value(
+                            "int",
+                            "array[0]",
+                            JimpleValueKind::ArrayRef {
+                                base: Box::new(array.clone()),
+                                index: Box::new(integer(0)),
+                            },
+                        ),
+                        right: integer(4),
+                    },
+                ),
+                statement(
+                    2,
+                    vec![3],
+                    JimpleOperation::Assign {
+                        left: value(
+                            "int",
+                            "array[2]",
+                            JimpleValueKind::ArrayRef {
+                                base: Box::new(array.clone()),
+                                index: Box::new(integer(2)),
+                            },
+                        ),
+                        right: integer(9),
+                    },
+                ),
+                statement(
+                    3,
+                    vec![4],
+                    JimpleOperation::Assign {
+                        left: static_value.clone(),
+                        right: array,
+                    },
+                ),
+                statement(4, Vec::new(), JimpleOperation::ReturnVoid),
+            ],
+        }
+    }
+
+    fn static_array_reader(
+        entry: &JimpleMethodSignature,
+        static_value: JimpleValue,
+    ) -> JimpleMethod {
+        let result = local("result", "int");
+        JimpleMethod {
+            signature: entry.clone(),
+            display_signature: String::from("reader"),
+            declaring_superclass: None,
+            declaring_interfaces: Vec::new(),
+            statements: vec![
+                statement(
+                    0,
+                    vec![1],
+                    JimpleOperation::Assign {
+                        left: local("values", "int[]"),
+                        right: static_value,
+                    },
+                ),
+                statement(
+                    1,
+                    vec![2],
+                    JimpleOperation::Assign {
+                        left: result.clone(),
+                        right: value(
+                            "int",
+                            "values[2]",
+                            JimpleValueKind::ArrayRef {
+                                base: Box::new(local("values", "int[]")),
+                                index: Box::new(integer(2)),
+                            },
+                        ),
+                    },
+                ),
+                statement(2, Vec::new(), JimpleOperation::Return { value: result }),
+            ],
+        }
+    }
+
+    fn static_array_fixture() -> (JimpleProgram, JimpleMethodSignature) {
+        let field = JimpleFieldSignature {
             owner: String::from("demo.Constants"),
             name: String::from("VALUES"),
             type_name: String::from("int[]"),
         };
-        let clinit = JimpleMethodSignature {
-            owner: String::from("demo.Constants"),
-            name: String::from("<clinit>"),
-            return_type: String::from("void"),
-            parameter_types: Vec::new(),
-        };
-        let entry = JimpleMethodSignature {
-            owner: String::from("demo.Reader"),
-            name: String::from("read"),
-            return_type: String::from("int"),
-            parameter_types: Vec::new(),
-        };
-        let array = local("array", "int[]");
-        let result = local("result", "int");
         let static_value = value(
             "int[]",
             "demo.Constants.VALUES",
@@ -1665,102 +2035,22 @@ mod tests {
                 field: field.clone(),
             },
         );
+        let entry = JimpleMethodSignature {
+            owner: String::from("demo.Reader"),
+            name: String::from("read"),
+            return_type: String::from("int"),
+            parameter_types: Vec::new(),
+        };
         let program = JimpleProgram::new(vec![
-            JimpleMethod {
-                signature: clinit,
-                display_signature: String::from("constants clinit"),
-                declaring_superclass: None,
-                declaring_interfaces: Vec::new(),
-                statements: vec![
-                    statement(
-                        0,
-                        vec![1],
-                        JimpleOperation::Assign {
-                            left: array.clone(),
-                            right: value(
-                                "int[]",
-                                "new int[3]",
-                                JimpleValueKind::NewArray {
-                                    element_type: String::from("int"),
-                                    size: Box::new(integer(3)),
-                                },
-                            ),
-                        },
-                    ),
-                    statement(
-                        1,
-                        vec![2],
-                        JimpleOperation::Assign {
-                            left: value(
-                                "int",
-                                "array[0]",
-                                JimpleValueKind::ArrayRef {
-                                    base: Box::new(array.clone()),
-                                    index: Box::new(integer(0)),
-                                },
-                            ),
-                            right: integer(4),
-                        },
-                    ),
-                    statement(
-                        2,
-                        vec![3],
-                        JimpleOperation::Assign {
-                            left: value(
-                                "int",
-                                "array[2]",
-                                JimpleValueKind::ArrayRef {
-                                    base: Box::new(array.clone()),
-                                    index: Box::new(integer(2)),
-                                },
-                            ),
-                            right: integer(9),
-                        },
-                    ),
-                    statement(
-                        3,
-                        vec![4],
-                        JimpleOperation::Assign {
-                            left: static_value.clone(),
-                            right: array,
-                        },
-                    ),
-                    statement(4, Vec::new(), JimpleOperation::ReturnVoid),
-                ],
-            },
-            JimpleMethod {
-                signature: entry.clone(),
-                display_signature: String::from("reader"),
-                declaring_superclass: None,
-                declaring_interfaces: Vec::new(),
-                statements: vec![
-                    statement(
-                        0,
-                        vec![1],
-                        JimpleOperation::Assign {
-                            left: local("values", "int[]"),
-                            right: static_value,
-                        },
-                    ),
-                    statement(
-                        1,
-                        vec![2],
-                        JimpleOperation::Assign {
-                            left: result.clone(),
-                            right: value(
-                                "int",
-                                "values[2]",
-                                JimpleValueKind::ArrayRef {
-                                    base: Box::new(local("values", "int[]")),
-                                    index: Box::new(integer(2)),
-                                },
-                            ),
-                        },
-                    ),
-                    statement(2, Vec::new(), JimpleOperation::Return { value: result }),
-                ],
-            },
+            static_array_initializer(&static_value),
+            static_array_reader(&entry, static_value),
         ]);
+        (program, entry)
+    }
+
+    #[test]
+    fn static_primitive_arrays_lower_from_recovered_class_initialization() -> Result<()> {
+        let (program, entry) = static_array_fixture();
         let lowered =
             program.lower_transaction_program(&entry, &JimpleTransactionBindings::default())?;
         let TransactionOperation::Assign { value, .. } =
@@ -1778,6 +2068,138 @@ mod tests {
                 ]
             }
         );
+        Ok(())
+    }
+
+    #[test]
+    fn static_semantic_constant_binding_avoids_source_initializer() -> Result<()> {
+        let field = JimpleFieldSignature {
+            owner: String::from("demo.Registry"),
+            name: String::from("ITEM"),
+            type_name: String::from("demo.Item"),
+        };
+        let entry = JimpleMethodSignature {
+            owner: String::from("demo.Reader"),
+            name: String::from("read"),
+            return_type: String::from("demo.Item"),
+            parameter_types: Vec::new(),
+        };
+        let program = JimpleProgram::new(vec![JimpleMethod {
+            signature: entry.clone(),
+            display_signature: String::from("reader"),
+            declaring_superclass: None,
+            declaring_interfaces: Vec::new(),
+            statements: vec![statement(
+                0,
+                Vec::new(),
+                JimpleOperation::Return {
+                    value: value(
+                        "demo.Item",
+                        "demo.Registry.ITEM",
+                        JimpleValueKind::StaticField {
+                            field: field.clone(),
+                        },
+                    ),
+                },
+            )],
+        }]);
+        let lowered = program.lower_transaction_program(
+            &entry,
+            &JimpleTransactionBindings {
+                static_constants: vec![JimpleStaticConstantBinding {
+                    field,
+                    value: JimpleStaticConstantValue::String {
+                        value: String::from("semantic:item"),
+                    },
+                }],
+                ..JimpleTransactionBindings::default()
+            },
+        )?;
+        let TransactionOperation::Return { value: Some(value) } =
+            &lowered.functions[0].statements[0].operation
+        else {
+            bail!("static semantic constant did not lower to return value");
+        };
+        assert_eq!(
+            value,
+            &TransactionValue::String {
+                value: String::from("semantic:item")
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn inherited_static_call_resolves_through_declared_owner_hierarchy() -> Result<()> {
+        let entry = JimpleMethodSignature {
+            owner: String::from("demo.Child"),
+            name: String::from("run"),
+            return_type: String::from("int"),
+            parameter_types: Vec::new(),
+        };
+        let declared = JimpleMethodSignature {
+            owner: String::from("demo.Child"),
+            name: String::from("staticValue"),
+            return_type: String::from("int"),
+            parameter_types: Vec::new(),
+        };
+        let implementation = JimpleMethodSignature {
+            owner: String::from("demo.Base"),
+            name: String::from("staticValue"),
+            return_type: String::from("int"),
+            parameter_types: Vec::new(),
+        };
+        let result = local("result", "int");
+        let program = JimpleProgram::new(vec![
+            JimpleMethod {
+                signature: entry.clone(),
+                display_signature: String::from("child run"),
+                declaring_superclass: Some(String::from("demo.Base")),
+                declaring_interfaces: Vec::new(),
+                statements: vec![
+                    statement(
+                        0,
+                        vec![1],
+                        JimpleOperation::Assign {
+                            left: result.clone(),
+                            right: value(
+                                "int",
+                                "static child value",
+                                JimpleValueKind::Invoke {
+                                    invoke_kind: String::from("JStaticInvokeExpr"),
+                                    method: declared,
+                                    base: None,
+                                    arguments: Vec::new(),
+                                    bootstrap_method: None,
+                                    bootstrap_arguments: Vec::new(),
+                                },
+                            ),
+                        },
+                    ),
+                    statement(1, Vec::new(), JimpleOperation::Return { value: result }),
+                ],
+            },
+            JimpleMethod {
+                signature: implementation,
+                display_signature: String::from("base static value"),
+                declaring_superclass: None,
+                declaring_interfaces: Vec::new(),
+                statements: vec![statement(
+                    0,
+                    Vec::new(),
+                    JimpleOperation::Return { value: integer(7) },
+                )],
+            },
+        ]);
+        let lowered =
+            program.lower_transaction_program(&entry, &JimpleTransactionBindings::default())?;
+        assert_eq!(lowered.functions.len(), 2);
+        assert!(matches!(
+            lowered.functions[1].statements[0].operation,
+            TransactionOperation::Return {
+                value: Some(TransactionValue::Integer { value: 7 })
+            }
+        ));
         Ok(())
     }
 

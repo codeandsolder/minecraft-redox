@@ -23,10 +23,11 @@ pub use program::{
     JimpleProgramFieldWrite, JimpleProgramInductionLoop, JimplePureValueBinding,
     JimplePureValueCandidate, JimplePureValueOperation, JimpleScheduleOnceBinding,
     JimpleScheduleOnceCandidate, JimpleSnapshotCloneBinding,
-    JimpleSpeculativeTakeRollbackCandidate, JimpleTransactionBindings, JimpleTransactionLoopBound,
-    JimpleTransactionLoopCandidate, JimpleUniformIntBinding, JimpleUniformIntCandidate,
-    JimpleUnresolvedEffectCall, JimpleUnresolvedEffectReason, JimpleValueComponentBinding,
-    JimpleValueComponentUpdateCandidate, ProgramExecution,
+    JimpleSpeculativeTakeRollbackCandidate, JimpleStaticConstantBinding, JimpleStaticConstantValue,
+    JimpleTransactionBindings, JimpleTransactionLoopBound, JimpleTransactionLoopCandidate,
+    JimpleUniformIntBinding, JimpleUniformIntCandidate, JimpleUnresolvedEffectCall,
+    JimpleUnresolvedEffectReason, JimpleValueComponentBinding, JimpleValueComponentUpdateCandidate,
+    ProgramExecution,
 };
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]

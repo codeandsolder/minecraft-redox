@@ -42,6 +42,13 @@ pub struct MemoryTransactionHostQuery {
     pub consume: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MemoryTransactionScheduleOnce {
+    pub key: Vec<TransactionDatum>,
+    pub delay_units: i64,
+    pub priority: i32,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct MemoryTransactionState {
     #[serde(default)]
@@ -56,6 +63,8 @@ pub struct MemoryTransactionState {
     pub touched_stores: BTreeSet<u64>,
     #[serde(default)]
     pub host_queries: Vec<MemoryTransactionHostQuery>,
+    #[serde(default)]
+    pub scheduled_once: Vec<MemoryTransactionScheduleOnce>,
     pub next_handle: u64,
 }
 
@@ -225,7 +234,11 @@ impl TransactionDraft for MemoryTransactionDraft<'_> {
                     && query.receiver.as_ref() == receiver
                     && query.arguments == arguments
             })
-            .ok_or_else(|| format!("unconfigured host query {operation:?}"))?;
+            .ok_or_else(|| {
+                format!(
+                    "unconfigured host query {operation:?} receiver={receiver:?} arguments={arguments:?}"
+                )
+            })?;
         let query = &self.state.host_queries[index];
         let result = query.result.clone();
         if query.consume {
@@ -398,6 +411,25 @@ impl TransactionDraft for MemoryTransactionDraft<'_> {
         }
     }
 
+    fn schedule_once(
+        &mut self,
+        key: &[TransactionDatum],
+        delay: &TransactionDatum,
+        priority: &TransactionDatum,
+    ) -> Result<(), Self::Error> {
+        let delay_units = Self::integer(delay)?;
+        let priority = i32::try_from(Self::integer(priority)?)
+            .map_err(|_| String::from("schedule priority exceeds i32"))?;
+        self.state
+            .scheduled_once
+            .push(MemoryTransactionScheduleOnce {
+                key: key.to_vec(),
+                delay_units,
+                priority,
+            });
+        Ok(())
+    }
+
     fn state_write(
         &mut self,
         target: &TransactionDatum,
@@ -499,6 +531,49 @@ mod tests {
         assert_eq!(
             draft.store_query(TransactionStoreQueryKind::Full, &store, &[], None, &[])?,
             TransactionDatum::Boolean(false)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn schedule_requests_publish_only_on_draft_commit() -> Result<(), String> {
+        let mut host = MemoryTransactionHost {
+            state: MemoryTransactionState::default(),
+            quantity_component: String::from("quantity"),
+            max_quantity_component: String::from("max_quantity"),
+        };
+        {
+            let mut draft = host.begin()?;
+            draft.schedule_once(
+                &[
+                    TransactionDatum::Integer(1),
+                    TransactionDatum::String(String::from("block")),
+                ],
+                &TransactionDatum::Integer(4),
+                &TransactionDatum::Integer(-1),
+            )?;
+        }
+        assert_eq!(host.state.scheduled_once, Vec::new());
+        let mut draft = host.begin()?;
+        draft.schedule_once(
+            &[
+                TransactionDatum::Integer(1),
+                TransactionDatum::String(String::from("block")),
+            ],
+            &TransactionDatum::Integer(4),
+            &TransactionDatum::Integer(-1),
+        )?;
+        draft.commit()?;
+        assert_eq!(
+            host.state.scheduled_once,
+            vec![MemoryTransactionScheduleOnce {
+                key: vec![
+                    TransactionDatum::Integer(1),
+                    TransactionDatum::String(String::from("block")),
+                ],
+                delay_units: 4,
+                priority: -1,
+            }]
         );
         Ok(())
     }
