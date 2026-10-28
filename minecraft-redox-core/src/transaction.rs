@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 mod memory;
 mod runtime;
 pub use memory::{
-    MemoryTransactionHost, MemoryTransactionObject, MemoryTransactionState, MemoryTransactionStore,
+    MemoryTransactionHost, MemoryTransactionHostQuery, MemoryTransactionObject,
+    MemoryTransactionState, MemoryTransactionStore,
 };
 pub use runtime::{
     TransactionDatum, TransactionDraft, TransactionExecution, TransactionExecutionError,
@@ -84,6 +85,13 @@ pub enum TransactionOperation {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum TransactionNumericType {
+    I32,
+    F64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TransactionStoreQueryKind {
     Extent,
     Keys,
@@ -134,6 +142,13 @@ pub enum TransactionValue {
         value: String,
     },
     Null,
+    Sequence {
+        values: Vec<TransactionValue>,
+    },
+    NumericCast {
+        target: TransactionNumericType,
+        value: Box<TransactionValue>,
+    },
     Binary {
         operator: String,
         left: Box<TransactionValue>,
@@ -153,6 +168,11 @@ pub enum TransactionValue {
     HasCapability {
         value: Box<TransactionValue>,
         capability: String,
+    },
+    HostQuery {
+        operation: String,
+        receiver: Option<Box<TransactionValue>>,
+        arguments: Vec<TransactionValue>,
     },
     StoreRead {
         store: Box<TransactionValue>,

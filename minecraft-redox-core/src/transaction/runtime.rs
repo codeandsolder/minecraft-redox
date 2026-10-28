@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     TransactionEffect, TransactionFunction, TransactionFunctionId, TransactionLocalId,
-    TransactionOperation, TransactionProgram, TransactionStoreQueryKind, TransactionValue,
+    TransactionNumericType, TransactionOperation, TransactionProgram, TransactionStoreQueryKind,
+    TransactionValue,
 };
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -90,6 +91,20 @@ pub trait TransactionDraft {
         left: &TransactionDatum,
         right: &TransactionDatum,
     ) -> Result<bool, Self::Error>;
+
+    /// Execute one source-neutral semantic host query.
+    ///
+    /// Queries may be stateful (for example an RNG draw), so the draft is mutable even when a
+    /// particular operation is observational.
+    ///
+    /// # Errors
+    /// Returns a host-defined error when the operation or operands are unsupported.
+    fn host_query(
+        &mut self,
+        operation: &str,
+        receiver: Option<&TransactionDatum>,
+        arguments: &[TransactionDatum],
+    ) -> Result<TransactionDatum, Self::Error>;
 
     /// Read one indexed store value from the draft.
     ///
@@ -384,6 +399,13 @@ impl<D: TransactionDraft> Executor<'_, D> {
             TransactionValue::Float { value } => Ok(TransactionDatum::Float(*value)),
             TransactionValue::String { value } => Ok(TransactionDatum::String(value.clone())),
             TransactionValue::Null => Ok(TransactionDatum::Null),
+            TransactionValue::Sequence { values } => self
+                .evaluate_many(frame, values, depth)
+                .map(TransactionDatum::Sequence),
+            TransactionValue::NumericCast { target, value } => {
+                let value = self.evaluate(frame, value, depth)?;
+                numeric_cast(*target, value)
+            }
             TransactionValue::Binary {
                 operator,
                 left,
@@ -412,6 +434,7 @@ impl<D: TransactionDraft> Executor<'_, D> {
                 min_value(left, right)
             }
             TransactionValue::HasCapability { .. }
+            | TransactionValue::HostQuery { .. }
             | TransactionValue::StoreRead { .. }
             | TransactionValue::StoreTake { .. }
             | TransactionValue::StoreQuery { .. }
@@ -429,6 +452,20 @@ impl<D: TransactionDraft> Executor<'_, D> {
         depth: usize,
     ) -> Result<TransactionDatum, TransactionExecutionError<D::Error>> {
         match value {
+            TransactionValue::HostQuery {
+                operation,
+                receiver,
+                arguments,
+            } => {
+                let receiver = receiver
+                    .as_ref()
+                    .map(|receiver| self.evaluate(frame, receiver, depth))
+                    .transpose()?;
+                let arguments = self.evaluate_many(frame, arguments, depth)?;
+                self.draft
+                    .host_query(operation, receiver.as_ref(), &arguments)
+                    .map_err(TransactionExecutionError::host)
+            }
             TransactionValue::HasCapability { value, capability } => {
                 let value = self.evaluate(frame, value, depth)?;
                 let has = self
@@ -651,14 +688,24 @@ fn binary<E>(
     right: TransactionDatum,
 ) -> Result<TransactionDatum, TransactionExecutionError<E>> {
     match operator {
-        "==" => Ok(TransactionDatum::Boolean(left == right)),
-        "!=" => Ok(TransactionDatum::Boolean(left != right)),
-        "+" | "-" | "*" | "/" | "%" | "<" | "<=" | ">" | ">=" => {
+        "==" => Ok(TransactionDatum::Boolean(cfg_equal(&left, &right))),
+        "!=" => Ok(TransactionDatum::Boolean(!cfg_equal(&left, &right))),
+        "+" | "-" | "*" | "/" | "%" | "<" | "<=" | ">" | ">=" | "cmpg" | "cmpl" => {
             binary_numeric(operator, left, right)
         }
         _ => Err(TransactionExecutionError::InvalidValue(format!(
             "unsupported binary operator {operator:?}"
         ))),
+    }
+}
+
+fn cfg_equal(left: &TransactionDatum, right: &TransactionDatum) -> bool {
+    match (left, right) {
+        (TransactionDatum::Boolean(left), TransactionDatum::Integer(right))
+        | (TransactionDatum::Integer(right), TransactionDatum::Boolean(left)) => {
+            *right == i64::from(*left)
+        }
+        _ => left == right,
     }
 }
 
@@ -724,6 +771,8 @@ fn float_binary<E>(
         "<=" => TransactionDatum::Boolean(left <= right),
         ">" => TransactionDatum::Boolean(left > right),
         ">=" => TransactionDatum::Boolean(left >= right),
+        "cmpg" => TransactionDatum::Integer(i64::from(float_compare(left, right, 1))),
+        "cmpl" => TransactionDatum::Integer(i64::from(float_compare(left, right, -1))),
         _ => {
             return Err(TransactionExecutionError::InvalidValue(format!(
                 "unsupported float operator {operator:?}"
@@ -731,6 +780,78 @@ fn float_binary<E>(
         }
     };
     Ok(value)
+}
+
+fn float_compare(left: f64, right: f64, nan_result: i32) -> i32 {
+    if left.is_nan() || right.is_nan() {
+        nan_result
+    } else if left > right {
+        1
+    } else if left < right {
+        -1
+    } else {
+        0
+    }
+}
+
+fn numeric_cast<E>(
+    target: TransactionNumericType,
+    value: TransactionDatum,
+) -> Result<TransactionDatum, TransactionExecutionError<E>> {
+    match (target, value) {
+        (TransactionNumericType::I32, TransactionDatum::Integer(value)) => {
+            let low = value & 0xffff_ffff;
+            let narrowed = if low >= 0x8000_0000 {
+                low - 0x1_0000_0000
+            } else {
+                low
+            };
+            Ok(TransactionDatum::Integer(narrowed))
+        }
+        (TransactionNumericType::I32, TransactionDatum::Float(value)) => {
+            Ok(TransactionDatum::Integer(java_f64_to_i32(value)))
+        }
+        (TransactionNumericType::F64, TransactionDatum::Integer(value)) => {
+            let value = i32::try_from(value).map_err(|_| {
+                TransactionExecutionError::InvalidValue(String::from(
+                    "i64-to-f64 transaction cast requires an i32 source",
+                ))
+            })?;
+            Ok(TransactionDatum::Float(f64::from(value)))
+        }
+        (TransactionNumericType::F64, TransactionDatum::Float(value)) => {
+            Ok(TransactionDatum::Float(value))
+        }
+        (target, value) => Err(TransactionExecutionError::InvalidValue(format!(
+            "unsupported numeric cast {target:?} for {value:?}"
+        ))),
+    }
+}
+
+fn java_f64_to_i32(value: f64) -> i64 {
+    if value.is_nan() {
+        return 0;
+    }
+    if value >= f64::from(i32::MAX) {
+        return i64::from(i32::MAX);
+    }
+    if value <= f64::from(i32::MIN) {
+        return i64::from(i32::MIN);
+    }
+    let bits = value.to_bits();
+    let negative = (bits >> 63) != 0;
+    let exponent = i32::try_from((bits >> 52) & 0x7ff).unwrap_or(0) - 1023;
+    if exponent < 0 {
+        return 0;
+    }
+    let significand = (1_u64 << 52) | (bits & ((1_u64 << 52) - 1));
+    let magnitude = if exponent >= 52 {
+        significand << u32::try_from(exponent - 52).unwrap_or(0)
+    } else {
+        significand >> u32::try_from(52 - exponent).unwrap_or(0)
+    };
+    let magnitude = i64::try_from(magnitude).unwrap_or(i64::MAX);
+    if negative { -magnitude } else { magnitude }
 }
 
 fn unary<E>(
@@ -914,6 +1035,15 @@ mod tests {
             Ok(left == right)
         }
 
+        fn host_query(
+            &mut self,
+            operation: &str,
+            _receiver: Option<&TransactionDatum>,
+            _arguments: &[TransactionDatum],
+        ) -> Result<TransactionDatum, Self::Error> {
+            Err(format!("unsupported test host query {operation}"))
+        }
+
         fn store_read(
             &self,
             store: &TransactionDatum,
@@ -1085,6 +1215,63 @@ mod tests {
             key: vec![TransactionValue::Integer { value: 0 }],
             value,
         }
+    }
+
+    #[test]
+    fn java_numeric_casts_and_float_compare_preserve_jvm_edges() -> Result<(), String> {
+        let cast = |value| {
+            numeric_cast::<String>(TransactionNumericType::I32, value)
+                .map_err(|error| error.to_string())
+        };
+        assert_eq!(
+            cast(TransactionDatum::Float(-1.75))?,
+            TransactionDatum::Integer(-1)
+        );
+        assert_eq!(
+            cast(TransactionDatum::Float(f64::NAN))?,
+            TransactionDatum::Integer(0)
+        );
+        assert_eq!(
+            cast(TransactionDatum::Float(f64::INFINITY))?,
+            TransactionDatum::Integer(i64::from(i32::MAX))
+        );
+        assert_eq!(
+            binary::<String>(
+                "cmpg",
+                TransactionDatum::Float(f64::NAN),
+                TransactionDatum::Float(0.0),
+            )
+            .map_err(|error| error.to_string())?,
+            TransactionDatum::Integer(1)
+        );
+        assert_eq!(
+            binary::<String>(
+                "cmpl",
+                TransactionDatum::Float(f64::NAN),
+                TransactionDatum::Float(0.0),
+            )
+            .map_err(|error| error.to_string())?,
+            TransactionDatum::Integer(-1)
+        );
+        assert_eq!(
+            binary::<String>(
+                "==",
+                TransactionDatum::Boolean(false),
+                TransactionDatum::Integer(0),
+            )
+            .map_err(|error| error.to_string())?,
+            TransactionDatum::Boolean(true)
+        );
+        assert_eq!(
+            binary::<String>(
+                "!=",
+                TransactionDatum::Boolean(true),
+                TransactionDatum::Integer(1),
+            )
+            .map_err(|error| error.to_string())?,
+            TransactionDatum::Boolean(false)
+        );
+        Ok(())
     }
 
     #[test]

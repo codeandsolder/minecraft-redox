@@ -171,6 +171,25 @@ pub struct JimpleCapabilityBinding {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct JimpleHostQueryBinding {
+    pub callee: JimpleMethodSignature,
+    pub operation: String,
+    pub receiver: Option<JimpleCallOperandBinding>,
+    #[serde(default)]
+    pub arguments: Vec<JimpleCallOperandBinding>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct JimpleHostQueryCandidate {
+    pub call_path: Vec<JimpleEffectCallFrame>,
+    pub guards: Vec<JimpleEffectGuard>,
+    pub resolution: JimpleProgramCallResolution,
+    pub operation: String,
+    pub receiver: Option<SymbolicValue>,
+    pub arguments: Vec<SymbolicValue>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub struct JimpleValueComponentBinding {
     pub field: super::JimpleFieldSignature,
     pub component: String,
@@ -210,6 +229,8 @@ pub struct JimpleTransactionBindings {
     pub state_writes: Vec<JimpleObjectStateWriteBinding>,
     #[serde(default)]
     pub capabilities: Vec<JimpleCapabilityBinding>,
+    #[serde(default)]
+    pub host_queries: Vec<JimpleHostQueryBinding>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -220,6 +241,7 @@ pub struct JimpleIndexedStoreTransactionCoverage {
     pub value_operations: Vec<JimplePureValueCandidate>,
     pub store_queries: Vec<JimpleIndexedStoreQueryCandidate>,
     pub state_writes: Vec<JimpleObjectStateWriteCandidate>,
+    pub host_queries: Vec<JimpleHostQueryCandidate>,
     pub loops: Vec<JimpleTransactionLoopCandidate>,
     pub unaccounted_field_writes: Vec<JimpleProgramFieldWrite>,
     pub unaccounted_calls: Vec<JimpleProgramCall>,
@@ -249,6 +271,9 @@ pub enum JimplePureValueOperation {
     Component { component: String },
     Equal,
     Min,
+    Sequence,
+    Length,
+    Index,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -626,30 +651,21 @@ impl JimpleProgramEffectSummary {
         let value_operations = self.bind_pure_value_operations(&bindings.pure_values);
         let store_queries = self.bind_indexed_store_queries(&bindings.store_queries)?;
         let state_writes = self.bind_object_state_writes(&bindings.state_writes)?;
+        let host_queries = self.bind_host_queries(&bindings.host_queries)?;
         let loops = self.bind_transaction_loops(bindings)?;
-        let accounted_callees: Vec<_> = bindings
-            .indexed_stores
-            .iter()
-            .map(|binding| binding.callee.clone())
-            .chain(
-                bindings
-                    .snapshot_clones
-                    .iter()
-                    .map(|binding| binding.callee.clone()),
-            )
-            .collect();
         let unaccounted_field_writes: Vec<_> = self
             .possible_field_writes
             .iter()
             .filter(|write| {
-                !component_updates.iter().any(|update| {
-                    update.statement_id == write.statement_id
-                        && update.call_path == write.call_path
-                        && bindings
-                            .value_components
-                            .iter()
-                            .any(|binding| binding.field == write.field)
-                })
+                !call_path_crosses_transaction_boundary(&write.call_path, bindings)
+                    && !component_updates.iter().any(|update| {
+                        update.statement_id == write.statement_id
+                            && update.call_path == write.call_path
+                            && bindings
+                                .value_components
+                                .iter()
+                                .any(|binding| binding.field == write.field)
+                    })
             })
             .cloned()
             .collect();
@@ -658,6 +674,7 @@ impl JimpleProgramEffectSummary {
             .iter()
             .filter(|call| {
                 call.resolution != JimpleProgramCallResolution::Expanded
+                    && !call_path_crosses_transaction_boundary(&call.call_path, bindings)
                     && !value_operations
                         .iter()
                         .any(|candidate| candidate.call_path == call.call_path)
@@ -667,10 +684,9 @@ impl JimpleProgramEffectSummary {
                     && !state_writes
                         .iter()
                         .any(|candidate| candidate.call_path == call.call_path)
-                    && call
-                        .call_path
-                        .last()
-                        .is_none_or(|frame| !accounted_callees.contains(&frame.callee))
+                    && !host_queries
+                        .iter()
+                        .any(|candidate| candidate.call_path == call.call_path)
             })
             .cloned()
             .collect();
@@ -682,11 +698,55 @@ impl JimpleProgramEffectSummary {
             value_operations,
             store_queries,
             state_writes,
+            host_queries,
             loops,
             unaccounted_field_writes,
             unaccounted_calls,
             complete,
         })
+    }
+
+    /// Bind source calls to source-neutral host queries.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a binding is ambiguous or references a missing operand.
+    pub fn bind_host_queries(
+        &self,
+        bindings: &[JimpleHostQueryBinding],
+    ) -> Result<Vec<JimpleHostQueryCandidate>> {
+        let mut candidates = Vec::new();
+        for call in &self.calls {
+            let Some(callee) = call.call_path.last().map(|frame| &frame.callee) else {
+                continue;
+            };
+            let mut matching = bindings.iter().filter(|binding| binding.callee == *callee);
+            let Some(binding) = matching.next() else {
+                continue;
+            };
+            if matching.next().is_some() {
+                bail!("ambiguous host-query binding for {callee:?}");
+            }
+            let receiver = binding
+                .receiver
+                .as_ref()
+                .map(|selector| select_call_operand(call, selector, "host query receiver", callee))
+                .transpose()?;
+            let arguments = binding
+                .arguments
+                .iter()
+                .map(|selector| select_call_operand(call, selector, "host query argument", callee))
+                .collect::<Result<Vec<_>>>()?;
+            candidates.push(JimpleHostQueryCandidate {
+                call_path: call.call_path.clone(),
+                guards: call.guards.clone(),
+                resolution: call.resolution,
+                operation: binding.operation.clone(),
+                receiver,
+                arguments,
+            });
+        }
+        Ok(candidates)
     }
 
     /// Bind source calls to typed pure value operations.
@@ -929,15 +989,55 @@ fn select_call_operand(
     callee: &JimpleMethodSignature,
 ) -> Result<SymbolicValue> {
     match selector {
-        JimpleCallOperandBinding::Receiver => call.receiver.clone().with_context(|| {
-            format!("indexed-store {role} receiver missing from call to {callee:?}")
-        }),
+        JimpleCallOperandBinding::Receiver => call
+            .receiver
+            .clone()
+            .with_context(|| format!("semantic {role} receiver missing from call to {callee:?}")),
         JimpleCallOperandBinding::Argument { index } => {
             call.arguments.get(*index).cloned().with_context(|| {
-                format!("indexed-store {role} argument {index} missing from call to {callee:?}")
+                format!("semantic {role} argument {index} missing from call to {callee:?}")
             })
         }
     }
+}
+
+fn call_path_crosses_transaction_boundary(
+    call_path: &[JimpleEffectCallFrame],
+    bindings: &JimpleTransactionBindings,
+) -> bool {
+    call_path
+        .iter()
+        .any(|frame| transaction_callee_is_bound(&frame.callee, bindings))
+}
+
+fn transaction_callee_is_bound(
+    callee: &JimpleMethodSignature,
+    bindings: &JimpleTransactionBindings,
+) -> bool {
+    bindings
+        .indexed_stores
+        .iter()
+        .any(|binding| binding.callee == *callee)
+        || bindings
+            .snapshot_clones
+            .iter()
+            .any(|binding| binding.callee == *callee)
+        || bindings
+            .pure_values
+            .iter()
+            .any(|binding| binding.callee == *callee)
+        || bindings
+            .store_queries
+            .iter()
+            .any(|binding| binding.callee == *callee)
+        || bindings
+            .state_writes
+            .iter()
+            .any(|binding| binding.callee == *callee)
+        || bindings
+            .host_queries
+            .iter()
+            .any(|binding| binding.callee == *callee)
 }
 
 fn unique_pure_value_binding(
@@ -963,6 +1063,9 @@ fn pure_value_shape_matches(
         JimplePureValueOperation::Equal | JimplePureValueOperation::Min => {
             call.receiver.is_none() && call.arguments.len() == 2
         }
+        JimplePureValueOperation::Sequence => call.receiver.is_none(),
+        JimplePureValueOperation::Length => call.receiver.is_some() && call.arguments.is_empty(),
+        JimplePureValueOperation::Index => call.receiver.is_some() && call.arguments.len() == 1,
     }
 }
 

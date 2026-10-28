@@ -185,11 +185,29 @@ The real 6-function/132-statement Hopper pull program now crosses the complete p
 
 The next hard frontier is therefore **resource discovery/topology**, not transaction execution or publication. The current acceptance feeds the pull helper its source/destination stores explicitly. Vanilla's outer Hopper logic discovers neighboring inventories/world objects and chooses push/pull paths. Those world/topology queries should become typed semantic bindings that resolve to graph-owned topology/resource handles while preserving the same dynamic-dependency discipline.
 
+## Source-neutral world/topology discovery
+
+The transaction boundary now covers resource discovery as well as resource mutation. `TransactionValue::HostQuery` carries only a semantic operation ID, optional receiver, and source-neutral operands; `TransactionDraft::host_query` is allowed to be stateful so topology reads and RNG draws can share one mechanism without pretending randomness is pure. `TransactionValue::Sequence` plus ordinary length/index operations represent bounded regions and query result collections without carrying `AxisAlignedBB` or `java.util.List` into the target.
+
+Jimple bindings are declarative and selective. A host-query binding names the source signature and exactly which receiver/arguments survive semantically. Unselected source operands are not lowered. A binding-aware liveness pass then removes pure local scaffolding that exists only to prepare discarded source arguments; this is what erases `IEntitySelector.selectInventories` from the real Hopper discovery path rather than inventing a target selector constant for it.
+
+Primitive JVM casts are now separate from reference-capability casts. The source-neutral IR has explicit `i32`/`f64` numeric casts, and the executor implements Java's `double -> int` narrowing edge cases plus Jimple `cmpg`/`cmpl`. CFG equality also preserves the JVM boolean/integer convention (`false == 0`, `true == 1`) while semantic item/value equality remains a separate host operation.
+
+Applied to real vanilla `TileEntityHopper.func_145893_b`, one descriptor lowers the helper to **2 anonymous functions / 45 transaction statements** with zero source-name leakage. Its five host operations are `topology.object_at`, `topology.block_at`, `topology.composite_store_at`, `topology.inventory_objects_in_region`, and `random.uniform_int`; AABB construction lowers to a six-element sequence and list `size/get` lower to length/index. Semantic-bound source implementations are treated as transitive coverage boundaries, so AABB constructor field writes and `Object.<init>` do not reappear as false blockers. The resulting coverage is `complete=true` with zero unaccounted calls or writes.
+
+The generic memory host executes all three recovered branches:
+
+- direct inventory tile hit -> returned store handle `2` in 38 transaction statements;
+- chest-like tile + block normalization -> returned composite store handle `4` in 43 statements;
+- no inventory tile -> region query returns two inventory candidates, the source RNG stream selects index 1, and handle `4` is returned in 47 statements.
+
+Topology queries are repeatable by default in the reference draft; the configured RNG query is consumable and disappears after one draw. The next step is to lower the outer Hopper pull orchestration so its recovered discovery result feeds the existing sided-slot scan and one-item transfer transaction automatically rather than supplying source/destination stores by hand.
+
 ## Missing pieces exposed by vanilla
 
 The current graph runtime proves the scheduling model but intentionally still has prototype numeric state. Exact Minecraft lowering needs:
 
-- semantic world/topology query bindings for resource discovery (neighbor stores, sided access, block/object identity) so outer machine orchestration can feed transactions without hand-wired store arguments;
+- outer machine orchestration that composes the now-bound topology discovery result with sided-slot scans and resource transactions, removing the remaining hand-wired store arguments;
 - adapter lowering for block/chunk revalidation, chunk policy, and source-time conversion around already-bound transaction/scheduler primitives;
 - production persistent/native store implementations behind the source-neutral transaction host interface; the current memory host is a reference/differential implementation;
 - source/runtime-type evidence for polymorphic world objects and modded subclasses wherever static bytecode alone cannot prove dispatch;

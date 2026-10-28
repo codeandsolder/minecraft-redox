@@ -1,10 +1,12 @@
 //! Lower structured Jimple into the source-neutral transaction CFG.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use anyhow::{Context, Result, bail};
 use minecraft_redox_core::transaction::{
     TransactionEffect, TransactionFunction, TransactionFunctionId, TransactionLocalId,
-    TransactionOperation, TransactionProgram, TransactionStatement, TransactionStatementId,
-    TransactionStoreQueryKind, TransactionValue,
+    TransactionNumericType, TransactionOperation, TransactionProgram, TransactionStatement,
+    TransactionStatementId, TransactionStoreQueryKind, TransactionValue,
 };
 
 use super::{
@@ -208,6 +210,11 @@ fn semantic_call_binding_count(
             .iter()
             .filter(|binding| binding.callee == *callee)
             .count()
+        + bindings
+            .host_queries
+            .iter()
+            .filter(|binding| binding.callee == *callee)
+            .count()
 }
 
 struct FunctionLowerer<'a> {
@@ -215,6 +222,7 @@ struct FunctionLowerer<'a> {
     bindings: &'a JimpleTransactionBindings,
     function_ids: &'a [(JimpleMethodSignature, TransactionFunctionId)],
     locals: Vec<String>,
+    elided_assignments: BTreeSet<usize>,
 }
 
 fn lower_transaction_function(
@@ -234,6 +242,7 @@ fn lower_transaction_function(
         bindings,
         function_ids,
         locals: Vec::new(),
+        elided_assignments: elidable_local_assignments(method, bindings),
     };
     let statements = method
         .statements
@@ -251,9 +260,230 @@ fn lower_transaction_function(
     })
 }
 
+fn elidable_local_assignments(
+    method: &JimpleMethod,
+    bindings: &JimpleTransactionBindings,
+) -> BTreeSet<usize> {
+    let index_by_id: BTreeMap<_, _> = method
+        .statements
+        .iter()
+        .enumerate()
+        .map(|(index, statement)| (statement.id, index))
+        .collect();
+    let uses: Vec<_> = method
+        .statements
+        .iter()
+        .map(|statement| semantic_statement_local_uses(statement, bindings))
+        .collect();
+    let defs: Vec<_> = method.statements.iter().map(local_definition).collect();
+    let mut live_in = vec![BTreeSet::new(); method.statements.len()];
+    let mut live_out = vec![BTreeSet::new(); method.statements.len()];
+    loop {
+        let mut changed = false;
+        for index in (0..method.statements.len()).rev() {
+            let statement = &method.statements[index];
+            let mut next_out = BTreeSet::new();
+            for successor in &statement.successors {
+                if let Some(successor_index) = index_by_id.get(successor) {
+                    next_out.extend(live_in[*successor_index].iter().cloned());
+                }
+            }
+            let mut next_in = uses[index].clone();
+            let mut surviving = next_out.clone();
+            if let Some(definition) = &defs[index] {
+                surviving.remove(definition);
+            }
+            next_in.extend(surviving);
+            if next_out != live_out[index] || next_in != live_in[index] {
+                live_out[index] = next_out;
+                live_in[index] = next_in;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    method
+        .statements
+        .iter()
+        .enumerate()
+        .filter_map(|(index, statement)| {
+            let JimpleOperation::Assign { left, right } = &statement.operation else {
+                return None;
+            };
+            let JimpleValueKind::Local { name } = &left.kind else {
+                return None;
+            };
+            (!live_out[index].contains(name) && !value_contains_invoke(right))
+                .then_some(statement.id)
+        })
+        .collect()
+}
+
+fn local_definition(statement: &JimpleStatement) -> Option<String> {
+    match &statement.operation {
+        JimpleOperation::Assign { left, .. } | JimpleOperation::Identity { left, .. } => {
+            let JimpleValueKind::Local { name } = &left.kind else {
+                return None;
+            };
+            Some(name.clone())
+        }
+        _ => None,
+    }
+}
+
+fn semantic_statement_local_uses(
+    statement: &JimpleStatement,
+    bindings: &JimpleTransactionBindings,
+) -> BTreeSet<String> {
+    let mut uses = BTreeSet::new();
+    match &statement.operation {
+        JimpleOperation::Assign { right, .. } | JimpleOperation::Identity { right, .. } => {
+            collect_semantic_local_uses(right, bindings, &mut uses);
+        }
+        JimpleOperation::If { condition }
+        | JimpleOperation::Return { value: condition }
+        | JimpleOperation::Throw { value: condition } => {
+            collect_semantic_local_uses(condition, bindings, &mut uses);
+        }
+        JimpleOperation::Invoke {
+            expression: Some(expression),
+        } => collect_semantic_local_uses(expression, bindings, &mut uses),
+        JimpleOperation::Switch { key, .. } => {
+            collect_semantic_local_uses(key, bindings, &mut uses);
+        }
+        JimpleOperation::Invoke { expression: None }
+        | JimpleOperation::ReturnVoid
+        | JimpleOperation::Goto
+        | JimpleOperation::Opaque => {}
+    }
+    uses
+}
+
+fn collect_semantic_local_uses(
+    value: &JimpleValue,
+    bindings: &JimpleTransactionBindings,
+    uses: &mut BTreeSet<String>,
+) {
+    match &value.kind {
+        JimpleValueKind::Local { name } => {
+            uses.insert(name.clone());
+        }
+        JimpleValueKind::Invoke {
+            method,
+            base,
+            arguments,
+            bootstrap_arguments,
+            ..
+        } => {
+            let matching: Vec<_> = bindings
+                .host_queries
+                .iter()
+                .filter(|binding| binding.callee == *method)
+                .collect();
+            if let [binding] = matching.as_slice() {
+                if let Some(selector) = &binding.receiver
+                    && let Some(selected) = select_raw_operand(base.as_deref(), arguments, selector)
+                {
+                    collect_semantic_local_uses(selected, bindings, uses);
+                }
+                for selector in &binding.arguments {
+                    if let Some(selected) = select_raw_operand(base.as_deref(), arguments, selector)
+                    {
+                        collect_semantic_local_uses(selected, bindings, uses);
+                    }
+                }
+                return;
+            }
+            if let Some(base) = base {
+                collect_semantic_local_uses(base, bindings, uses);
+            }
+            for argument in arguments.iter().chain(bootstrap_arguments) {
+                collect_semantic_local_uses(argument, bindings, uses);
+            }
+        }
+        JimpleValueKind::ArrayRef { base, index }
+        | JimpleValueKind::Binary {
+            left: base,
+            right: index,
+            ..
+        } => {
+            collect_semantic_local_uses(base, bindings, uses);
+            collect_semantic_local_uses(index, bindings, uses);
+        }
+        JimpleValueKind::InstanceField { base, .. }
+        | JimpleValueKind::Cast { value: base, .. }
+        | JimpleValueKind::InstanceOf { value: base, .. }
+        | JimpleValueKind::Unary { value: base, .. }
+        | JimpleValueKind::ArrayLength { value: base }
+        | JimpleValueKind::NewArray { size: base, .. } => {
+            collect_semantic_local_uses(base, bindings, uses);
+        }
+        JimpleValueKind::NewMultiArray { sizes, .. } | JimpleValueKind::Phi { values: sizes } => {
+            for item in sizes {
+                collect_semantic_local_uses(item, bindings, uses);
+            }
+        }
+        JimpleValueKind::IntegerConstant { .. }
+        | JimpleValueKind::FloatConstant { .. }
+        | JimpleValueKind::StringConstant { .. }
+        | JimpleValueKind::ClassConstant { .. }
+        | JimpleValueKind::MethodHandle { .. }
+        | JimpleValueKind::MethodType { .. }
+        | JimpleValueKind::NullConstant
+        | JimpleValueKind::Parameter { .. }
+        | JimpleValueKind::This
+        | JimpleValueKind::StaticField { .. }
+        | JimpleValueKind::New { .. }
+        | JimpleValueKind::Opaque => {}
+    }
+}
+
+fn select_raw_operand<'a>(
+    receiver: Option<&'a JimpleValue>,
+    arguments: &'a [JimpleValue],
+    selector: &JimpleCallOperandBinding,
+) -> Option<&'a JimpleValue> {
+    match selector {
+        JimpleCallOperandBinding::Receiver => receiver,
+        JimpleCallOperandBinding::Argument { index } => arguments.get(*index),
+    }
+}
+
+fn value_contains_invoke(value: &JimpleValue) -> bool {
+    match &value.kind {
+        JimpleValueKind::Invoke { .. } => true,
+        JimpleValueKind::ArrayRef { base, index }
+        | JimpleValueKind::Binary {
+            left: base,
+            right: index,
+            ..
+        } => value_contains_invoke(base) || value_contains_invoke(index),
+        JimpleValueKind::InstanceField { base, .. }
+        | JimpleValueKind::Cast { value: base, .. }
+        | JimpleValueKind::InstanceOf { value: base, .. }
+        | JimpleValueKind::Unary { value: base, .. }
+        | JimpleValueKind::ArrayLength { value: base }
+        | JimpleValueKind::NewArray { size: base, .. } => value_contains_invoke(base),
+        JimpleValueKind::NewMultiArray { sizes, .. } | JimpleValueKind::Phi { values: sizes } => {
+            sizes.iter().any(value_contains_invoke)
+        }
+        _ => false,
+    }
+}
+
 impl FunctionLowerer<'_> {
     fn lower_statement(&mut self, statement: &JimpleStatement) -> Result<TransactionStatement> {
         let id = statement_id(statement.id)?;
+        if self.elided_assignments.contains(&statement.id) {
+            return Ok(TransactionStatement {
+                id,
+                operation: TransactionOperation::Jump {
+                    target: single_successor(statement)?,
+                },
+            });
+        }
         let operation = match &statement.operation {
             JimpleOperation::Assign { left, right } | JimpleOperation::Identity { left, right } => {
                 self.lower_assignment(statement, left, right)?
@@ -385,10 +615,20 @@ impl FunctionLowerer<'_> {
             JimpleValueKind::Cast {
                 cast_type,
                 value: inner,
-            } => {
-                unique_capability(cast_type, self.bindings)?;
-                self.lower_value(inner)
-            }
+            } => match cast_type.as_str() {
+                "int" => Ok(TransactionValue::NumericCast {
+                    target: TransactionNumericType::I32,
+                    value: Box::new(self.lower_value(inner)?),
+                }),
+                "double" => Ok(TransactionValue::NumericCast {
+                    target: TransactionNumericType::F64,
+                    value: Box::new(self.lower_value(inner)?),
+                }),
+                _ => {
+                    unique_capability(cast_type, self.bindings)?;
+                    self.lower_value(inner)
+                }
+            },
             JimpleValueKind::InstanceOf {
                 value: inner,
                 check_type,
@@ -444,6 +684,14 @@ impl FunctionLowerer<'_> {
         else {
             bail!("expected invocation value, got {}", value.text);
         };
+        if semantic_call_binding_count(method, self.bindings) > 1 {
+            bail!("ambiguous transaction semantic bindings for {method:?}");
+        }
+        if let Some(lowered) =
+            self.lower_raw_host_query_invoke(method, base.as_deref(), arguments)?
+        {
+            return Ok(lowered);
+        }
         let receiver = base
             .as_deref()
             .map(|base| self.lower_value(base))
@@ -452,10 +700,6 @@ impl FunctionLowerer<'_> {
             .iter()
             .map(|argument| self.lower_value(argument))
             .collect::<Result<Vec<_>>>()?;
-
-        if semantic_call_binding_count(method, self.bindings) > 1 {
-            bail!("ambiguous transaction semantic bindings for {method:?}");
-        }
         if let Some(lowered) = self.lower_store_invoke(method, receiver.as_ref(), &arguments)? {
             return Ok(lowered);
         }
@@ -586,6 +830,33 @@ impl FunctionLowerer<'_> {
                     right: Box::new(right.clone()),
                 }
             }
+            JimplePureValueOperation::Sequence => {
+                if receiver.is_some() {
+                    bail!("semantic sequence unexpectedly has a receiver");
+                }
+                TransactionValue::Sequence {
+                    values: arguments.to_vec(),
+                }
+            }
+            JimplePureValueOperation::Length => {
+                let receiver = receiver.context("semantic length is missing receiver")?;
+                if !arguments.is_empty() {
+                    bail!("semantic length unexpectedly has arguments");
+                }
+                TransactionValue::Length {
+                    sequence: Box::new(receiver.clone()),
+                }
+            }
+            JimplePureValueOperation::Index => {
+                let receiver = receiver.context("semantic index is missing receiver")?;
+                let [index] = arguments else {
+                    bail!("semantic index requires one argument");
+                };
+                TransactionValue::Index {
+                    sequence: Box::new(receiver.clone()),
+                    index: Box::new(index.clone()),
+                }
+            }
         };
         Ok(Some(LoweredInvoke::Value(lowered)))
     }
@@ -650,6 +921,61 @@ impl FunctionLowerer<'_> {
             state: binding.state.clone(),
             value: select_operand(receiver, arguments, &binding.value, "state value")?,
         })))
+    }
+
+    fn lower_raw_host_query_invoke(
+        &mut self,
+        method: &JimpleMethodSignature,
+        receiver: Option<&JimpleValue>,
+        arguments: &[JimpleValue],
+    ) -> Result<Option<LoweredInvoke>> {
+        let Some(binding) = self
+            .bindings
+            .host_queries
+            .iter()
+            .find(|binding| binding.callee == *method)
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let query_receiver = binding
+            .receiver
+            .as_ref()
+            .map(|selector| {
+                self.lower_raw_operand(receiver, arguments, selector, "host query receiver")
+            })
+            .transpose()?
+            .map(Box::new);
+        let query_arguments = binding
+            .arguments
+            .iter()
+            .map(|selector| {
+                self.lower_raw_operand(receiver, arguments, selector, "host query argument")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some(LoweredInvoke::Value(TransactionValue::HostQuery {
+            operation: binding.operation,
+            receiver: query_receiver,
+            arguments: query_arguments,
+        })))
+    }
+
+    fn lower_raw_operand(
+        &mut self,
+        receiver: Option<&JimpleValue>,
+        arguments: &[JimpleValue],
+        selector: &JimpleCallOperandBinding,
+        role: &str,
+    ) -> Result<TransactionValue> {
+        let value = match selector {
+            JimpleCallOperandBinding::Receiver => {
+                receiver.with_context(|| format!("transaction {role} receiver is missing"))?
+            }
+            JimpleCallOperandBinding::Argument { index } => arguments
+                .get(*index)
+                .with_context(|| format!("transaction {role} argument {index} is missing"))?,
+        };
+        self.lower_value(value)
     }
 
     fn lower_internal_invoke(
@@ -788,7 +1114,9 @@ fn statement_id(value: usize) -> Result<TransactionStatementId> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jimple::{JimpleCapabilityBinding, JimpleMethod, JimpleStatement};
+    use crate::jimple::{
+        JimpleCapabilityBinding, JimpleHostQueryBinding, JimpleMethod, JimpleStatement,
+    };
 
     fn value(type_name: &str, text: &str, kind: JimpleValueKind) -> JimpleValue {
         JimpleValue {
@@ -926,6 +1254,113 @@ mod tests {
             },
         ];
         (JimpleProgram::new(methods), entry)
+    }
+
+    fn host_query_fixture() -> (JimpleProgram, JimpleMethodSignature, JimpleMethodSignature) {
+        let query = JimpleMethodSignature {
+            owner: String::from("demo.SourceWorld"),
+            name: String::from("sourceOnlyLookup"),
+            return_type: String::from("int"),
+            parameter_types: vec![String::from("int"), String::from("demo.SourceSelector")],
+        };
+        let entry = JimpleMethodSignature {
+            owner: String::from("demo.SourceEntry"),
+            name: String::from("query"),
+            return_type: String::from("int"),
+            parameter_types: vec![String::from("demo.SourceWorld"), String::from("int")],
+        };
+        let world = local("world", "demo.SourceWorld");
+        let selector = local("selector", "demo.SourceSelector");
+        let result = local("result", "int");
+        let method = JimpleMethod {
+            signature: entry.clone(),
+            display_signature: String::from("source query"),
+            declaring_superclass: None,
+            declaring_interfaces: Vec::new(),
+            statements: vec![
+                statement(
+                    0,
+                    vec![1],
+                    JimpleOperation::Identity {
+                        left: world.clone(),
+                        right: value(
+                            "demo.SourceWorld",
+                            "@parameter0",
+                            JimpleValueKind::Parameter { index: 0 },
+                        ),
+                    },
+                ),
+                statement(
+                    1,
+                    vec![2],
+                    JimpleOperation::Assign {
+                        left: selector.clone(),
+                        right: value(
+                            "demo.SourceSelector",
+                            "source selector",
+                            JimpleValueKind::StaticField {
+                                field: super::super::JimpleFieldSignature {
+                                    owner: String::from("demo.SourceSelector"),
+                                    name: String::from("ALL"),
+                                    type_name: String::from("demo.SourceSelector"),
+                                },
+                            },
+                        ),
+                    },
+                ),
+                statement(
+                    2,
+                    vec![3],
+                    JimpleOperation::Assign {
+                        left: result.clone(),
+                        right: value(
+                            "int",
+                            "dynamic source query",
+                            JimpleValueKind::Invoke {
+                                invoke_kind: String::from("JVirtualInvokeExpr"),
+                                method: query.clone(),
+                                base: Some(Box::new(world)),
+                                arguments: vec![
+                                    value(
+                                        "int",
+                                        "@parameter1",
+                                        JimpleValueKind::Parameter { index: 1 },
+                                    ),
+                                    selector,
+                                ],
+                                bootstrap_method: None,
+                                bootstrap_arguments: Vec::new(),
+                            },
+                        ),
+                    },
+                ),
+                statement(3, Vec::new(), JimpleOperation::Return { value: result }),
+            ],
+        };
+        (JimpleProgram::new(vec![method]), entry, query)
+    }
+
+    #[test]
+    fn host_query_binding_erases_ignored_source_scaffolding() -> Result<()> {
+        let (program, entry, query) = host_query_fixture();
+        let lowered = program.lower_transaction_program(
+            &entry,
+            &JimpleTransactionBindings {
+                host_queries: vec![JimpleHostQueryBinding {
+                    callee: query,
+                    operation: String::from("topology.lookup"),
+                    receiver: Some(JimpleCallOperandBinding::Receiver),
+                    arguments: vec![JimpleCallOperandBinding::Argument { index: 0 }],
+                }],
+                ..JimpleTransactionBindings::default()
+            },
+        )?;
+        let serialized = serde_json::to_string(&lowered)?;
+        assert!(serialized.contains("topology.lookup"));
+        assert!(!serialized.contains("demo.SourceWorld"));
+        assert!(!serialized.contains("demo.SourceSelector"));
+        assert!(!serialized.contains("sourceOnlyLookup"));
+        Ok(())
     }
 
     #[test]

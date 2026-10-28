@@ -31,6 +31,17 @@ const fn default_true() -> bool {
     true
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MemoryTransactionHostQuery {
+    pub operation: String,
+    pub receiver: Option<TransactionDatum>,
+    #[serde(default)]
+    pub arguments: Vec<TransactionDatum>,
+    pub result: TransactionDatum,
+    #[serde(default)]
+    pub consume: bool,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct MemoryTransactionState {
     #[serde(default)]
@@ -43,6 +54,8 @@ pub struct MemoryTransactionState {
     pub state_values: BTreeMap<u64, BTreeMap<String, TransactionDatum>>,
     #[serde(default)]
     pub touched_stores: BTreeSet<u64>,
+    #[serde(default)]
+    pub host_queries: Vec<MemoryTransactionHostQuery>,
     pub next_handle: u64,
 }
 
@@ -187,6 +200,30 @@ impl TransactionDraft for MemoryTransactionDraft<'_> {
             }
             _ => Ok(left == right),
         }
+    }
+
+    fn host_query(
+        &mut self,
+        operation: &str,
+        receiver: Option<&TransactionDatum>,
+        arguments: &[TransactionDatum],
+    ) -> Result<TransactionDatum, Self::Error> {
+        let index = self
+            .state
+            .host_queries
+            .iter()
+            .position(|query| {
+                query.operation == operation
+                    && query.receiver.as_ref() == receiver
+                    && query.arguments == arguments
+            })
+            .ok_or_else(|| format!("unconfigured host query {operation:?}"))?;
+        let query = &self.state.host_queries[index];
+        let result = query.result.clone();
+        if query.consume {
+            self.state.host_queries.remove(index);
+        }
+        Ok(result)
     }
 
     fn store_read(
@@ -345,6 +382,60 @@ impl TransactionDraft for MemoryTransactionDraft<'_> {
 
     fn commit(self) -> Result<(), Self::Error> {
         self.host.state = self.state;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn query(
+        operation: &str,
+        result: TransactionDatum,
+        consume: bool,
+    ) -> MemoryTransactionHostQuery {
+        MemoryTransactionHostQuery {
+            operation: operation.to_owned(),
+            receiver: Some(TransactionDatum::Handle(1)),
+            arguments: vec![TransactionDatum::Integer(2)],
+            result,
+            consume,
+        }
+    }
+
+    #[test]
+    fn host_queries_can_be_repeatable_or_consumed() -> Result<(), String> {
+        let mut host = MemoryTransactionHost {
+            state: MemoryTransactionState {
+                host_queries: vec![
+                    query("topology.lookup", TransactionDatum::Handle(7), false),
+                    query("random.draw", TransactionDatum::Integer(3), true),
+                ],
+                ..MemoryTransactionState::default()
+            },
+            quantity_component: String::from("quantity"),
+        };
+        let receiver = TransactionDatum::Handle(1);
+        let arguments = [TransactionDatum::Integer(2)];
+        let mut draft = host.begin()?;
+        assert_eq!(
+            draft.host_query("topology.lookup", Some(&receiver), &arguments)?,
+            TransactionDatum::Handle(7)
+        );
+        assert_eq!(
+            draft.host_query("topology.lookup", Some(&receiver), &arguments)?,
+            TransactionDatum::Handle(7)
+        );
+        assert_eq!(
+            draft.host_query("random.draw", Some(&receiver), &arguments)?,
+            TransactionDatum::Integer(3)
+        );
+        assert!(
+            draft
+                .host_query("random.draw", Some(&receiver), &arguments)
+                .is_err()
+        );
         Ok(())
     }
 }
