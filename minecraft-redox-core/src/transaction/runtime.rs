@@ -106,6 +106,20 @@ pub trait TransactionDraft {
         arguments: &[TransactionDatum],
     ) -> Result<TransactionDatum, Self::Error>;
 
+    /// Execute one source-neutral semantic host call with externally visible draft-local effects.
+    ///
+    /// Unlike `host_query`, a call denotes a semantic action whose occurrence matters. The host
+    /// must stage that action inside the transaction draft so dropping the draft publishes nothing.
+    ///
+    /// # Errors
+    /// Returns a host-defined error when the operation or operands are unsupported.
+    fn host_call(
+        &mut self,
+        operation: &str,
+        receiver: Option<&TransactionDatum>,
+        arguments: &[TransactionDatum],
+    ) -> Result<TransactionDatum, Self::Error>;
+
     /// Read one indexed store value from the draft.
     ///
     /// # Errors
@@ -287,6 +301,8 @@ struct Frame {
     locals: Vec<Option<TransactionDatum>>,
 }
 
+type EvaluatedInvocation = (Option<TransactionDatum>, Vec<TransactionDatum>);
+
 impl<D: TransactionDraft> Executor<'_, D> {
     fn execute_function(
         &mut self,
@@ -459,6 +475,7 @@ impl<D: TransactionDraft> Executor<'_, D> {
             }
             TransactionValue::HasCapability { .. }
             | TransactionValue::HostQuery { .. }
+            | TransactionValue::HostCall { .. }
             | TransactionValue::StoreRead { .. }
             | TransactionValue::StoreTake { .. }
             | TransactionValue::StoreQuery { .. }
@@ -481,13 +498,29 @@ impl<D: TransactionDraft> Executor<'_, D> {
                 receiver,
                 arguments,
             } => {
-                let receiver = receiver
-                    .as_ref()
-                    .map(|receiver| self.evaluate(frame, receiver, depth))
-                    .transpose()?;
-                let arguments = self.evaluate_many(frame, arguments, depth)?;
+                let (receiver, arguments) = self.evaluate_receiver_and_arguments(
+                    frame,
+                    receiver.as_deref(),
+                    arguments,
+                    depth,
+                )?;
                 self.draft
                     .host_query(operation, receiver.as_ref(), &arguments)
+                    .map_err(TransactionExecutionError::host)
+            }
+            TransactionValue::HostCall {
+                operation,
+                receiver,
+                arguments,
+            } => {
+                let (receiver, arguments) = self.evaluate_receiver_and_arguments(
+                    frame,
+                    receiver.as_deref(),
+                    arguments,
+                    depth,
+                )?;
+                self.draft
+                    .host_call(operation, receiver.as_ref(), &arguments)
                     .map_err(TransactionExecutionError::host)
             }
             TransactionValue::HasCapability { value, capability } => {
@@ -513,23 +546,8 @@ impl<D: TransactionDraft> Executor<'_, D> {
                     .store_take(&store, &key, &amount)
                     .map_err(TransactionExecutionError::host)
             }
-            TransactionValue::StoreQuery {
-                operation,
-                store,
-                key,
-                value,
-                context,
-            } => {
-                let store = self.evaluate(frame, store, depth)?;
-                let key = self.evaluate_many(frame, key, depth)?;
-                let value = value
-                    .as_ref()
-                    .map(|value| self.evaluate(frame, value, depth))
-                    .transpose()?;
-                let context = self.evaluate_many(frame, context, depth)?;
-                self.draft
-                    .store_query(*operation, &store, &key, value.as_ref(), &context)
-                    .map_err(TransactionExecutionError::host)
+            TransactionValue::StoreQuery { .. } => {
+                self.evaluate_store_query_value(frame, value, depth)
             }
             TransactionValue::Component { value, component } => {
                 let value = self.evaluate(frame, value, depth)?;
@@ -552,27 +570,81 @@ impl<D: TransactionDraft> Executor<'_, D> {
                     .map_err(TransactionExecutionError::host)?;
                 Ok(TransactionDatum::Boolean(equal))
             }
-            TransactionValue::Call {
-                function,
-                receiver,
-                arguments,
-            } => {
-                let receiver = receiver
-                    .as_ref()
-                    .map(|receiver| self.evaluate(frame, receiver, depth))
-                    .transpose()?;
-                let arguments = self.evaluate_many(frame, arguments, depth)?;
-                self.execute_function(*function, receiver, arguments, depth + 1)?
-                    .ok_or_else(|| {
-                        TransactionExecutionError::InvalidProgram(format!(
-                            "value call to function {function:?} returned void"
-                        ))
-                    })
-            }
+            TransactionValue::Call { .. } => self.evaluate_call_value(frame, value, depth),
             _ => Err(TransactionExecutionError::InvalidProgram(String::from(
                 "non-host transaction value reached host evaluator",
             ))),
         }
+    }
+
+    fn evaluate_receiver_and_arguments(
+        &mut self,
+        frame: &Frame,
+        receiver: Option<&TransactionValue>,
+        arguments: &[TransactionValue],
+        depth: usize,
+    ) -> Result<EvaluatedInvocation, TransactionExecutionError<D::Error>> {
+        let receiver = receiver
+            .map(|receiver| self.evaluate(frame, receiver, depth))
+            .transpose()?;
+        let arguments = self.evaluate_many(frame, arguments, depth)?;
+        Ok((receiver, arguments))
+    }
+
+    fn evaluate_store_query_value(
+        &mut self,
+        frame: &Frame,
+        value: &TransactionValue,
+        depth: usize,
+    ) -> Result<TransactionDatum, TransactionExecutionError<D::Error>> {
+        let TransactionValue::StoreQuery {
+            operation,
+            store,
+            key,
+            value,
+            context,
+        } = value
+        else {
+            return Err(TransactionExecutionError::InvalidProgram(String::from(
+                "non-store-query value reached store-query evaluator",
+            )));
+        };
+        let store = self.evaluate(frame, store, depth)?;
+        let key = self.evaluate_many(frame, key, depth)?;
+        let value = value
+            .as_deref()
+            .map(|value| self.evaluate(frame, value, depth))
+            .transpose()?;
+        let context = self.evaluate_many(frame, context, depth)?;
+        self.draft
+            .store_query(*operation, &store, &key, value.as_ref(), &context)
+            .map_err(TransactionExecutionError::host)
+    }
+
+    fn evaluate_call_value(
+        &mut self,
+        frame: &Frame,
+        value: &TransactionValue,
+        depth: usize,
+    ) -> Result<TransactionDatum, TransactionExecutionError<D::Error>> {
+        let TransactionValue::Call {
+            function,
+            receiver,
+            arguments,
+        } = value
+        else {
+            return Err(TransactionExecutionError::InvalidProgram(String::from(
+                "non-call value reached call evaluator",
+            )));
+        };
+        let (receiver, arguments) =
+            self.evaluate_receiver_and_arguments(frame, receiver.as_deref(), arguments, depth)?;
+        self.execute_function(*function, receiver, arguments, depth + 1)?
+            .ok_or_else(|| {
+                TransactionExecutionError::InvalidProgram(format!(
+                    "value call to function {function:?} returned void"
+                ))
+            })
     }
 
     fn execute_effect(
@@ -1145,6 +1217,15 @@ mod tests {
             _arguments: &[TransactionDatum],
         ) -> Result<TransactionDatum, Self::Error> {
             Err(format!("unsupported test host query {operation}"))
+        }
+
+        fn host_call(
+            &mut self,
+            _operation: &str,
+            _receiver: Option<&TransactionDatum>,
+            _arguments: &[TransactionDatum],
+        ) -> Result<TransactionDatum, Self::Error> {
+            Ok(TransactionDatum::Null)
         }
 
         fn store_read(

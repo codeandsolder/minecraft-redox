@@ -140,6 +140,18 @@ The Quiescence bridge converts those four source ticks with the configured 50 ms
 
 Comparator specialization independently confirms that the same scheduler binding is polymorphic rather than repeater-specific. For exact runtime type `BlockRedstoneComparator`, the real neighbor-change helper yields two guarded schedule candidates with the same `(x, y, z, this)` key, literal delay **2** source ticks (**100 ms** at the vanilla tick unit), and priorities **-1** or **0** according to the comparator's source branch.
 
+The callback body now crosses the same semantic boundary without treating world mutation as a read-shaped host query. `TransactionValue::HostCall` and `TransactionDraft::host_call` represent source-neutral calls whose externally visible occurrence matters. The reference host records such calls only in the isolated draft; dropping or retrying the draft discards them, and successful top-level commit publishes the performed-call log. The Redox→Quiescence adapter requires an explicit host-call publisher whenever a committed call exists, so a world mutation cannot silently disappear. Publishers translate committed calls into ordinary `StateWrite`s that share the same immediate reaction transition as store writes, while the performed call remains available for diagnostics.
+
+With `World.setBlock` bound as transactional `world.set_block`, the real repeater `BlockRedstoneDiode.updateTick` lowers completely for exact runtime type `BlockRedstoneRepeater`: **12 anonymous transaction functions / 137 CFG statements**. Its semantic coverage is `complete=true`: **20** bound host-query call sites, **2** bound transactional host-call sites, **1** schedule-once site, **3** pure-value operations, and zero unaccounted calls or field writes. Both source `setBlock` sites carry the original flag literal `2`, so the recovered semantic call distinguishes the state replacement from vanilla flag-bit-1 neighbor-physics notification.
+
+Differential execution of the same recovered callback CFG covers all meaningful repeater state/input branches at `(10,64,20)`, metadata `4`:
+
+- unpowered + input present: **108 statements**, one committed `world.set_block(..., powered_repeater, 4, 2)`, no schedule;
+- unpowered + input absent: **130 statements**, the same powered-state write plus one `(x,y,z,powered_repeater)` schedule request for **4 ticks / priority -1**;
+- powered + input absent: **111 statements**, one committed `world.set_block(..., unpowered_repeater, 4, 2)`, no schedule.
+
+The graph acceptance maps the 130-statement path's committed host call to a block-state atom. In one causal reaction output the atom changes unpowered→powered immediately and the source-derived follow-up request targets a distinct callback at 200 ms; no callback fires at 199 ms and exactly one fires at 200 ms. Thus world-state mutation and future callback publication are atomic at the graph boundary rather than two independently observable adapter operations.
+
 ## Stochastic opportunity evidence
 
 Crop growth confirms a third execution family distinct from polling clocks and keyed scheduled callbacks. Vanilla random ticks have two separate randomness sources that must not be conflated:

@@ -365,6 +365,11 @@ fn semantic_call_binding_count(
             .filter(|binding| binding.callee == *callee)
             .count()
         + bindings
+            .host_calls
+            .iter()
+            .filter(|binding| binding.callee == *callee)
+            .count()
+        + bindings
             .schedule_once
             .iter()
             .filter(|binding| binding.callee == *callee)
@@ -538,18 +543,26 @@ fn collect_semantic_local_uses(
             bootstrap_arguments,
             ..
         } => {
-            let matching: Vec<_> = bindings
+            let query_matches: Vec<_> = bindings
                 .host_queries
                 .iter()
                 .filter(|binding| binding.callee == *method)
+                .map(|binding| (binding.receiver.as_ref(), binding.arguments.as_slice()))
                 .collect();
-            if let [binding] = matching.as_slice() {
-                if let Some(selector) = &binding.receiver
+            let call_matches: Vec<_> = bindings
+                .host_calls
+                .iter()
+                .filter(|binding| binding.callee == *method)
+                .map(|binding| (binding.receiver.as_ref(), binding.arguments.as_slice()))
+                .collect();
+            let semantic_matches: Vec<_> = query_matches.into_iter().chain(call_matches).collect();
+            if let [(receiver_selector, argument_selectors)] = semantic_matches.as_slice() {
+                if let Some(selector) = receiver_selector
                     && let Some(selected) = select_raw_operand(base.as_deref(), arguments, selector)
                 {
                     collect_semantic_local_uses(selected, bindings, uses);
                 }
-                for selector in &binding.arguments {
+                for selector in *argument_selectors {
                     if let Some(selected) = select_raw_operand(base.as_deref(), arguments, selector)
                     {
                         collect_semantic_local_uses(selected, bindings, uses);
@@ -893,6 +906,11 @@ impl FunctionLowerer<'_> {
             bail!("ambiguous transaction semantic bindings for {method:?}");
         }
         if let Some(lowered) =
+            self.lower_raw_host_call_invoke(method, base.as_deref(), arguments)?
+        {
+            return Ok(lowered);
+        }
+        if let Some(lowered) =
             self.lower_raw_host_query_invoke(method, base.as_deref(), arguments)?
         {
             return Ok(lowered);
@@ -1197,6 +1215,43 @@ impl FunctionLowerer<'_> {
             target: select_operand(receiver, arguments, &binding.target, "state target")?,
             state: binding.state.clone(),
             value: select_operand(receiver, arguments, &binding.value, "state value")?,
+        })))
+    }
+
+    fn lower_raw_host_call_invoke(
+        &mut self,
+        method: &JimpleMethodSignature,
+        receiver: Option<&JimpleValue>,
+        arguments: &[JimpleValue],
+    ) -> Result<Option<LoweredInvoke>> {
+        let Some(binding) = self
+            .bindings
+            .host_calls
+            .iter()
+            .find(|binding| binding.callee == *method)
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let call_receiver = binding
+            .receiver
+            .as_ref()
+            .map(|selector| {
+                self.lower_raw_operand(receiver, arguments, selector, "host call receiver")
+            })
+            .transpose()?
+            .map(Box::new);
+        let call_arguments = binding
+            .arguments
+            .iter()
+            .map(|selector| {
+                self.lower_raw_operand(receiver, arguments, selector, "host call argument")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some(LoweredInvoke::Value(TransactionValue::HostCall {
+            operation: binding.operation,
+            receiver: call_receiver,
+            arguments: call_arguments,
         })))
     }
 
@@ -1512,8 +1567,8 @@ fn statement_id(value: usize) -> Result<TransactionStatementId> {
 mod tests {
     use super::*;
     use crate::jimple::{
-        JimpleCapabilityBinding, JimpleHostQueryBinding, JimpleMethod, JimpleScheduleOnceBinding,
-        JimpleStatement,
+        JimpleCapabilityBinding, JimpleHostCallBinding, JimpleHostQueryBinding, JimpleMethod,
+        JimpleScheduleOnceBinding, JimpleStatement,
     };
 
     fn value(type_name: &str, text: &str, kind: JimpleValueKind) -> JimpleValue {
@@ -1886,6 +1941,29 @@ mod tests {
         let serialized = serde_json::to_string(&lowered)?;
         assert!(!serialized.contains("SourceWorld"));
         assert!(!serialized.contains("sourceSchedule"));
+        Ok(())
+    }
+
+    #[test]
+    fn host_call_binding_lowers_to_transactional_host_call() -> Result<()> {
+        let (program, entry, query) = host_query_fixture();
+        let lowered = program.lower_transaction_program(
+            &entry,
+            &JimpleTransactionBindings {
+                host_calls: vec![JimpleHostCallBinding {
+                    callee: query,
+                    operation: String::from("world.write"),
+                    receiver: Some(JimpleCallOperandBinding::Receiver),
+                    arguments: vec![JimpleCallOperandBinding::Argument { index: 0 }],
+                }],
+                ..JimpleTransactionBindings::default()
+            },
+        )?;
+        let serialized = serde_json::to_string(&lowered)?;
+        assert!(serialized.contains("host_call"));
+        assert!(serialized.contains("world.write"));
+        assert!(!serialized.contains("SourceWorld"));
+        assert!(!serialized.contains("SourceSelector"));
         Ok(())
     }
 

@@ -14,9 +14,10 @@ mod transaction;
 pub use program::{
     AbstractMapEntry, AbstractMapSnapshot, AbstractOpaqueCallShape, AbstractStaticFieldValue,
     JimpleCallOperandBinding, JimpleCapabilityBinding, JimpleClockedStateCandidate,
-    JimpleEffectCallFrame, JimpleEffectGuard, JimpleHostQueryBinding, JimpleHostQueryCandidate,
-    JimpleIndexedStoreBinding, JimpleIndexedStoreOperation, JimpleIndexedStoreOperationKind,
-    JimpleIndexedStoreQueryBinding, JimpleIndexedStoreQueryCandidate, JimpleIndexedStoreQueryKind,
+    JimpleEffectCallFrame, JimpleEffectGuard, JimpleHostCallBinding, JimpleHostCallCandidate,
+    JimpleHostQueryBinding, JimpleHostQueryCandidate, JimpleIndexedStoreBinding,
+    JimpleIndexedStoreOperation, JimpleIndexedStoreOperationKind, JimpleIndexedStoreQueryBinding,
+    JimpleIndexedStoreQueryCandidate, JimpleIndexedStoreQueryKind,
     JimpleIndexedStoreTransactionCoverage, JimpleIndexedStoreValueOrigin,
     JimpleObjectStateWriteBinding, JimpleObjectStateWriteCandidate, JimpleProgram,
     JimpleProgramCall, JimpleProgramCallResolution, JimpleProgramEffectSummary,

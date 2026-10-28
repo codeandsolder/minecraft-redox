@@ -43,6 +43,25 @@ pub struct MemoryTransactionHostQuery {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MemoryTransactionHostCall {
+    pub operation: String,
+    pub receiver: Option<TransactionDatum>,
+    #[serde(default)]
+    pub arguments: Vec<TransactionDatum>,
+    pub result: TransactionDatum,
+    #[serde(default)]
+    pub consume: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MemoryTransactionPerformedHostCall {
+    pub operation: String,
+    pub receiver: Option<TransactionDatum>,
+    pub arguments: Vec<TransactionDatum>,
+    pub result: TransactionDatum,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MemoryTransactionScheduleOnce {
     pub key: Vec<TransactionDatum>,
     pub delay_units: i64,
@@ -63,6 +82,10 @@ pub struct MemoryTransactionState {
     pub touched_stores: BTreeSet<u64>,
     #[serde(default)]
     pub host_queries: Vec<MemoryTransactionHostQuery>,
+    #[serde(default)]
+    pub host_calls: Vec<MemoryTransactionHostCall>,
+    #[serde(default)]
+    pub performed_host_calls: Vec<MemoryTransactionPerformedHostCall>,
     #[serde(default)]
     pub scheduled_once: Vec<MemoryTransactionScheduleOnce>,
     pub next_handle: u64,
@@ -245,6 +268,41 @@ impl TransactionDraft for MemoryTransactionDraft<'_> {
             self.state.host_queries.remove(index);
         }
         Ok(result)
+    }
+
+    fn host_call(
+        &mut self,
+        operation: &str,
+        receiver: Option<&TransactionDatum>,
+        arguments: &[TransactionDatum],
+    ) -> Result<TransactionDatum, Self::Error> {
+        let index = self
+            .state
+            .host_calls
+            .iter()
+            .position(|call| {
+                call.operation == operation
+                    && call.receiver.as_ref() == receiver
+                    && call.arguments == arguments
+            })
+            .ok_or_else(|| {
+                format!(
+                    "unconfigured host call {operation:?} receiver={receiver:?} arguments={arguments:?}"
+                )
+            })?;
+        let call = self.state.host_calls[index].clone();
+        self.state
+            .performed_host_calls
+            .push(MemoryTransactionPerformedHostCall {
+                operation: call.operation.clone(),
+                receiver: call.receiver.clone(),
+                arguments: call.arguments.clone(),
+                result: call.result.clone(),
+            });
+        if call.consume {
+            self.state.host_calls.remove(index);
+        }
+        Ok(call.result)
     }
 
     fn store_read(
@@ -575,6 +633,46 @@ mod tests {
                 priority: -1,
             }]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn host_calls_record_only_after_draft_commit() -> Result<(), String> {
+        let call = MemoryTransactionHostCall {
+            operation: String::from("world.write"),
+            receiver: Some(TransactionDatum::Handle(1)),
+            arguments: vec![TransactionDatum::Integer(2)],
+            result: TransactionDatum::Boolean(true),
+            consume: false,
+        };
+        let mut host = MemoryTransactionHost {
+            state: MemoryTransactionState {
+                host_calls: vec![call],
+                ..MemoryTransactionState::default()
+            },
+            quantity_component: String::from("quantity"),
+            max_quantity_component: String::from("max_quantity"),
+        };
+        {
+            let mut draft = host.begin()?;
+            assert_eq!(
+                draft.host_call(
+                    "world.write",
+                    Some(&TransactionDatum::Handle(1)),
+                    &[TransactionDatum::Integer(2)],
+                )?,
+                TransactionDatum::Boolean(true)
+            );
+        }
+        assert_eq!(host.state.performed_host_calls, Vec::new());
+        let mut draft = host.begin()?;
+        draft.host_call(
+            "world.write",
+            Some(&TransactionDatum::Handle(1)),
+            &[TransactionDatum::Integer(2)],
+        )?;
+        draft.commit()?;
+        assert_eq!(host.state.performed_host_calls.len(), 1);
         Ok(())
     }
 

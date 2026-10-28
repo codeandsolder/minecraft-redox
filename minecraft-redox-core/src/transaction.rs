@@ -9,8 +9,9 @@ use serde::{Deserialize, Serialize};
 mod memory;
 mod runtime;
 pub use memory::{
-    MemoryTransactionHost, MemoryTransactionHostQuery, MemoryTransactionObject,
-    MemoryTransactionScheduleOnce, MemoryTransactionState, MemoryTransactionStore,
+    MemoryTransactionHost, MemoryTransactionHostCall, MemoryTransactionHostQuery,
+    MemoryTransactionObject, MemoryTransactionPerformedHostCall, MemoryTransactionScheduleOnce,
+    MemoryTransactionState, MemoryTransactionStore,
 };
 pub use runtime::{
     TransactionDatum, TransactionDraft, TransactionExecution, TransactionExecutionError,
@@ -188,6 +189,11 @@ pub enum TransactionValue {
         capability: String,
     },
     HostQuery {
+        operation: String,
+        receiver: Option<Box<TransactionValue>>,
+        arguments: Vec<TransactionValue>,
+    },
+    HostCall {
         operation: String,
         receiver: Option<Box<TransactionValue>>,
         arguments: Vec<TransactionValue>,

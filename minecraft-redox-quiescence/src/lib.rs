@@ -8,11 +8,11 @@ use std::{
 };
 
 use minecraft_redox_core::transaction::{
-    MemoryTransactionHost, MemoryTransactionHostQuery, MemoryTransactionObject,
-    MemoryTransactionScheduleOnce, MemoryTransactionState, MemoryTransactionStore,
-    TransactionDatum, TransactionDraft, TransactionExecution, TransactionExecutionError,
-    TransactionExecutionLimits, TransactionHost, TransactionProgram, TransactionStoreQueryKind,
-    execute_transaction,
+    MemoryTransactionHost, MemoryTransactionHostCall, MemoryTransactionHostQuery,
+    MemoryTransactionObject, MemoryTransactionPerformedHostCall, MemoryTransactionScheduleOnce,
+    MemoryTransactionState, MemoryTransactionStore, TransactionDatum, TransactionDraft,
+    TransactionExecution, TransactionExecutionError, TransactionExecutionLimits, TransactionHost,
+    TransactionProgram, TransactionStoreQueryKind, execute_transaction,
 };
 use quiescence_core::{NodeId, ReactionId, SimDuration};
 use quiescence_runtime::{EvalContext, EvalError, ReactionOutput, StateWrite};
@@ -206,6 +206,7 @@ pub struct ReactionHostPreparation {
     pub objects: BTreeMap<u64, MemoryTransactionObject>,
     pub capabilities: BTreeMap<u64, BTreeSet<String>>,
     pub host_queries: Vec<MemoryTransactionHostQuery>,
+    pub host_calls: Vec<MemoryTransactionHostCall>,
 }
 
 #[derive(Debug)]
@@ -324,6 +325,17 @@ impl TransactionDraft for DemandTransactionDraft<'_> {
             .map_err(DemandHostError::Inner)
     }
 
+    fn host_call(
+        &mut self,
+        operation: &str,
+        receiver: Option<&TransactionDatum>,
+        arguments: &[TransactionDatum],
+    ) -> Result<TransactionDatum, Self::Error> {
+        self.inner
+            .host_call(operation, receiver, arguments)
+            .map_err(DemandHostError::Inner)
+    }
+
     fn store_read(
         &self,
         store: &TransactionDatum,
@@ -411,6 +423,10 @@ type HostPreparer = dyn for<'a> Fn(&EvalContext<'a>) -> Result<ReactionHostPrepa
     + Send
     + Sync
     + 'static;
+type HostCallPublisher = dyn Fn(&MemoryTransactionPerformedHostCall) -> Result<Vec<StateWrite>, EvalError>
+    + Send
+    + Sync
+    + 'static;
 
 #[derive(Clone)]
 pub struct TransactionReactionAdapter {
@@ -421,6 +437,7 @@ pub struct TransactionReactionAdapter {
     receiver: Option<ReactionArgument>,
     quantity_component: String,
     host_preparer: Option<Arc<HostPreparer>>,
+    host_call_publisher: Option<Arc<HostCallPublisher>>,
     schedule_unit: Option<SimDuration>,
     schedule_identity_component: Option<String>,
     schedule_keys: Arc<Mutex<ScheduleKeyInterner>>,
@@ -439,6 +456,7 @@ pub struct TransactionReactionResult {
     pub writes: Vec<StateWrite>,
     pub state_values: BTreeMap<u64, BTreeMap<String, TransactionDatum>>,
     pub schedule_requests: Vec<TransactionScheduleRequest>,
+    pub performed_host_calls: Vec<MemoryTransactionPerformedHostCall>,
 }
 
 impl TransactionReactionResult {
@@ -484,6 +502,7 @@ impl TransactionReactionAdapter {
             receiver,
             quantity_component: quantity_component.into(),
             host_preparer: None,
+            host_call_publisher: None,
             schedule_unit: None,
             schedule_identity_component: None,
             schedule_keys: Arc::new(Mutex::new(ScheduleKeyInterner::default())),
@@ -499,6 +518,18 @@ impl TransactionReactionAdapter {
             + 'static,
     {
         self.host_preparer = Some(Arc::new(preparer));
+        self
+    }
+
+    #[must_use]
+    pub fn with_host_call_publisher<F>(mut self, publisher: F) -> Self
+    where
+        F: Fn(&MemoryTransactionPerformedHostCall) -> Result<Vec<StateWrite>, EvalError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.host_call_publisher = Some(Arc::new(publisher));
         self
     }
 
@@ -630,18 +661,21 @@ fn execute_resolved_transaction(
     ) {
         Ok(execution) => {
             let state_values = host.inner.state.state_values.clone();
+            let performed_host_calls = host.inner.state.performed_host_calls.clone();
+            let mut writes = publish_stores(&mut interner, stores, snapshot_ids, &host.inner.state)
+                .map_err(EvalError::Message)?;
+            writes.extend(publish_host_calls(adapter, &performed_host_calls)?);
             let schedule_requests = lower_schedule_requests(
                 adapter,
                 &host.inner.state,
                 &host.inner.state.scheduled_once,
             )?;
-            let writes = publish_stores(&mut interner, stores, snapshot_ids, &host.inner.state)
-                .map_err(EvalError::Message)?;
             Ok(DemandExecution::Complete(TransactionReactionResult {
                 execution,
                 writes,
                 state_values,
                 schedule_requests,
+                performed_host_calls,
             }))
         }
         Err(TransactionExecutionError::Host(DemandHostError::NeedStore(handle))) => lazy_stores
@@ -653,6 +687,25 @@ fn execute_resolved_transaction(
             }),
         Err(error) => Err(EvalError::Message(error.to_string())),
     }
+}
+
+fn publish_host_calls(
+    adapter: &TransactionReactionAdapter,
+    calls: &[MemoryTransactionPerformedHostCall],
+) -> Result<Vec<StateWrite>, EvalError> {
+    if calls.is_empty() {
+        return Ok(Vec::new());
+    }
+    let publisher = adapter.host_call_publisher.as_ref().ok_or_else(|| {
+        EvalError::Message(String::from(
+            "transaction committed host calls without a configured host-call publisher",
+        ))
+    })?;
+    let mut writes = Vec::new();
+    for call in calls {
+        writes.extend(publisher(call)?);
+    }
+    Ok(writes)
 }
 
 fn lower_schedule_requests(
@@ -830,6 +883,7 @@ fn apply_preparation(state: &mut MemoryTransactionState, preparation: ReactionHo
             .extend(capabilities);
     }
     state.host_queries.extend(preparation.host_queries);
+    state.host_calls.extend(preparation.host_calls);
 }
 
 fn materialize_store(
@@ -1081,6 +1135,26 @@ mod tests {
         )
     }
 
+    fn host_call_program() -> TransactionProgram {
+        program(
+            vec![
+                statement(
+                    0,
+                    TransactionOperation::Evaluate {
+                        value: TransactionValue::HostCall {
+                            operation: String::from("world.write"),
+                            receiver: None,
+                            arguments: vec![TransactionValue::Integer { value: 7 }],
+                        },
+                        next: TransactionStatementId(1),
+                    },
+                ),
+                statement(1, TransactionOperation::Return { value: None }),
+            ],
+            0,
+        )
+    }
+
     fn schedule_program(key: TransactionValue) -> TransactionProgram {
         program(
             vec![
@@ -1315,6 +1389,91 @@ mod tests {
                 .as_ref()
                 .and_then(|value| value.components.get("quantity")),
             Some(&TransactionDatum::Integer(4))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn committed_host_calls_publish_graph_writes_atomically()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut graph = Graph::new(RuntimeConfig::default());
+        let world_state = graph.add_atom_input("world state", 1)?;
+        let adapter = TransactionReactionAdapter::new(
+            Arc::new(host_call_program()),
+            Arc::new(Mutex::new(SnapshotInterner::new())),
+            Vec::new(),
+            vec![ReactionArgument::Datum(TransactionDatum::Integer(0))],
+            None,
+            "quantity",
+        )
+        .with_host_preparer(|_| {
+            Ok(ReactionHostPreparation {
+                host_calls: vec![MemoryTransactionHostCall {
+                    operation: String::from("world.write"),
+                    receiver: None,
+                    arguments: vec![TransactionDatum::Integer(7)],
+                    result: TransactionDatum::Boolean(true),
+                    consume: false,
+                }],
+                ..ReactionHostPreparation::default()
+            })
+        })
+        .with_host_call_publisher(move |call| {
+            if call.operation != "world.write"
+                || call.arguments != [TransactionDatum::Integer(7)]
+                || call.result != TransactionDatum::Boolean(true)
+            {
+                return Err(EvalError::Message(String::from(
+                    "unexpected published host call",
+                )));
+            }
+            Ok(vec![StateWrite::atom(world_state, 42)])
+        });
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&captured);
+        graph.add_reaction("host call bridge", move |context| {
+            let result = adapter.execute(context)?;
+            *observed
+                .lock()
+                .map_err(|_| EvalError::Message(String::from("capture lock poisoned")))? =
+                result.performed_host_calls.clone();
+            Ok(ReactionOutput::immediate(result.writes))
+        })?;
+        graph.settle()?;
+        assert_eq!(graph.value_atom(world_state)?, 42);
+        let captured = captured
+            .lock()
+            .map_err(|_| String::from("capture lock poisoned"))?;
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].operation, "world.write");
+        Ok(())
+    }
+
+    #[test]
+    fn committed_host_calls_require_a_publisher() -> Result<(), Box<dyn std::error::Error>> {
+        let adapter = TransactionReactionAdapter::new(
+            Arc::new(host_call_program()),
+            Arc::new(Mutex::new(SnapshotInterner::new())),
+            Vec::new(),
+            vec![ReactionArgument::Datum(TransactionDatum::Integer(0))],
+            None,
+            "quantity",
+        );
+        let error = publish_host_calls(
+            &adapter,
+            &[MemoryTransactionPerformedHostCall {
+                operation: String::from("world.write"),
+                receiver: None,
+                arguments: vec![TransactionDatum::Integer(7)],
+                result: TransactionDatum::Boolean(true),
+            }],
+        )
+        .err()
+        .ok_or_else(|| String::from("host calls disappeared without a publisher"))?;
+        assert!(
+            error
+                .to_string()
+                .contains("without a configured host-call publisher")
         );
         Ok(())
     }

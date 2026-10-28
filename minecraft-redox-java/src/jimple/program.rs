@@ -181,6 +181,25 @@ pub struct JimpleHostQueryBinding {
     pub arguments: Vec<JimpleCallOperandBinding>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct JimpleHostCallBinding {
+    pub callee: JimpleMethodSignature,
+    pub operation: String,
+    pub receiver: Option<JimpleCallOperandBinding>,
+    #[serde(default)]
+    pub arguments: Vec<JimpleCallOperandBinding>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct JimpleHostCallCandidate {
+    pub call_path: Vec<JimpleEffectCallFrame>,
+    pub guards: Vec<JimpleEffectGuard>,
+    pub resolution: JimpleProgramCallResolution,
+    pub operation: String,
+    pub receiver: Option<SymbolicValue>,
+    pub arguments: Vec<SymbolicValue>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct JimpleHostQueryCandidate {
     pub call_path: Vec<JimpleEffectCallFrame>,
@@ -250,6 +269,8 @@ pub struct JimpleTransactionBindings {
     #[serde(default)]
     pub host_queries: Vec<JimpleHostQueryBinding>,
     #[serde(default)]
+    pub host_calls: Vec<JimpleHostCallBinding>,
+    #[serde(default)]
     pub schedule_once: Vec<JimpleScheduleOnceBinding>,
     #[serde(default)]
     pub static_constants: Vec<JimpleStaticConstantBinding>,
@@ -264,6 +285,7 @@ pub struct JimpleIndexedStoreTransactionCoverage {
     pub store_queries: Vec<JimpleIndexedStoreQueryCandidate>,
     pub state_writes: Vec<JimpleObjectStateWriteCandidate>,
     pub host_queries: Vec<JimpleHostQueryCandidate>,
+    pub host_calls: Vec<JimpleHostCallCandidate>,
     pub schedule_once: Vec<JimpleScheduleOnceCandidate>,
     pub loops: Vec<JimpleTransactionLoopCandidate>,
     pub unaccounted_field_writes: Vec<JimpleProgramFieldWrite>,
@@ -675,6 +697,7 @@ impl JimpleProgramEffectSummary {
         let store_queries = self.bind_indexed_store_queries(&bindings.store_queries)?;
         let state_writes = self.bind_object_state_writes(&bindings.state_writes)?;
         let host_queries = self.bind_host_queries(&bindings.host_queries)?;
+        let host_calls = self.bind_host_calls(&bindings.host_calls)?;
         let schedule_once = bindings
             .schedule_once
             .iter()
@@ -718,6 +741,9 @@ impl JimpleProgramEffectSummary {
                     && !host_queries
                         .iter()
                         .any(|candidate| candidate.call_path == call.call_path)
+                    && !host_calls
+                        .iter()
+                        .any(|candidate| candidate.call_path == call.call_path)
                     && !schedule_once
                         .iter()
                         .any(|candidate| candidate.call_path == call.call_path)
@@ -733,6 +759,7 @@ impl JimpleProgramEffectSummary {
             store_queries,
             state_writes,
             host_queries,
+            host_calls,
             schedule_once,
             loops,
             unaccounted_field_writes,
@@ -773,6 +800,49 @@ impl JimpleProgramEffectSummary {
                 .map(|selector| select_call_operand(call, selector, "host query argument", callee))
                 .collect::<Result<Vec<_>>>()?;
             candidates.push(JimpleHostQueryCandidate {
+                call_path: call.call_path.clone(),
+                guards: call.guards.clone(),
+                resolution: call.resolution,
+                operation: binding.operation.clone(),
+                receiver,
+                arguments,
+            });
+        }
+        Ok(candidates)
+    }
+
+    /// Bind source calls to source-neutral transactional host calls.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a binding is ambiguous or references a missing operand.
+    pub fn bind_host_calls(
+        &self,
+        bindings: &[JimpleHostCallBinding],
+    ) -> Result<Vec<JimpleHostCallCandidate>> {
+        let mut candidates = Vec::new();
+        for call in &self.calls {
+            let Some(callee) = call.call_path.last().map(|frame| &frame.callee) else {
+                continue;
+            };
+            let mut matching = bindings.iter().filter(|binding| binding.callee == *callee);
+            let Some(binding) = matching.next() else {
+                continue;
+            };
+            if matching.next().is_some() {
+                bail!("ambiguous host-call binding for {callee:?}");
+            }
+            let receiver = binding
+                .receiver
+                .as_ref()
+                .map(|selector| select_call_operand(call, selector, "host call receiver", callee))
+                .transpose()?;
+            let arguments = binding
+                .arguments
+                .iter()
+                .map(|selector| select_call_operand(call, selector, "host call argument", callee))
+                .collect::<Result<Vec<_>>>()?;
+            candidates.push(JimpleHostCallCandidate {
                 call_path: call.call_path.clone(),
                 guards: call.guards.clone(),
                 resolution: call.resolution,
@@ -1071,6 +1141,10 @@ fn transaction_callee_is_bound(
             .any(|binding| binding.callee == *callee)
         || bindings
             .host_queries
+            .iter()
+            .any(|binding| binding.callee == *callee)
+        || bindings
+            .host_calls
             .iter()
             .any(|binding| binding.callee == *callee)
         || bindings
