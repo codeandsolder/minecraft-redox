@@ -63,6 +63,30 @@ The graph should encode sparse causal semantics, not historical polling frequenc
 5. **Presentation/effects -> outputs.** Dirty notifications, sounds, particles, and client progress are effects/views of semantic state changes, not reasons to poll the simulation.
 6. **Dense work stays specialized.** Block breaking, bulk spatial edits, rendering, collision/physics inner loops, and similar dense operations should keep specialized representations. Their sparse boundary effects can still feed the graph.
 
+## Quiescent interaction boundary
+
+External domain activity now enters the graph through Quiescence's quiescent interaction ingress rather than direct `Graph::schedule_*` or immediate mutation calls. This is a deliberate ownership rule, not just an API rename:
+
+- one worker owns and mutates `Graph`;
+- foreground/world/network/dense-selector code owns cloneable interaction senders;
+- graph-backed state changes arrive as timestamped atomic state batches;
+- recovered callbacks arrive as timestamped callback events with optional opaque source tokens;
+- the owner processes a finite ingress prefix only at a quiescent boundary and settles every same-time consequence before publishing observable state;
+- when idle with no internal event it wants to advance toward, the owner can block on the inbox instead of polling;
+- readers consume immutable quiescent publications (canonical state plus committed transitions), never a half-settled graph.
+
+The vanilla random-tick selector, repeater schedule producer/callback revalidation, Hopper snapshot changes, and the Quiescence adapter tests all use this ingress. There are intentionally no direct external `schedule_atom`, `schedule_input`, `schedule_reaction_event*`, or `set_*_now` calls left under `minecraft-redox-quiescence`. Internal keyed schedule-once requests emitted by a reaction remain ordinary Quiescence causal output; they do not leave and re-enter the external ingress.
+
+Arbitrary recovered interactions need more than a callback token because receiver/arguments and host evidence may vary per event. `TransactionInteractionSender` therefore keeps a source-neutral `TransactionInvocation` registry in the Redox adapter and puts only an opaque token into Quiescence. An invocation can carry:
+
+- event-local receiver and arguments;
+- event-local `ReactionHostPreparation` (stores, objects/capabilities, host-query evidence and expected transactional host calls);
+- the same static `TransactionReactionAdapter` configuration used by reactive machine/resource paths.
+
+The event-only callback resolves the token, executes the transaction through the normal staged/demand-materialized adapter, and retires the payload only after successful evaluation. A failed invocation remains addressable and can be retried with the same token or explicitly discarded. This prevents a worker/runtime error from silently losing an input interaction while keeping transaction-specific payload types out of Quiescence itself.
+
+This makes foreground/background placement an ownership decision rather than an execution-mode decision: the exact same recovered transaction/callback runs regardless of which thread submitted it.
+
 ## Interprocedural structural effects
 
 The next generic step is now implemented locally: each method exposes an ordered direct effect stream of symbolic field writes and invocations. Program-level composition substitutes `this` and parameters through exact in-program calls, preserves the call path for each possible write, cuts recursive call-graph cycles explicitly, and refuses ambiguous dynamic dispatch. Static/special calls are exact; virtual calls are composed only when the receiver is structurally known to be exactly the declared owner (for example a same-class call on the entry `this`).

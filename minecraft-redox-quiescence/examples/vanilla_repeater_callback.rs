@@ -16,7 +16,10 @@ use minecraft_redox_quiescence::{
     TransactionScheduleRequest,
 };
 use quiescence_core::{NodeId, ReactionId, SimDuration, SimTime};
-use quiescence_runtime::{EvalError, Graph, ReactionOutput, RuntimeConfig, StateWrite};
+use quiescence_runtime::{
+    EvalError, Graph, InteractionInbox, InteractionSender, ReactionOutput, RuntimeConfig,
+    StateWrite, interaction_channel,
+};
 
 const WORLD: u64 = 1;
 const REPEATER: u64 = 10;
@@ -240,6 +243,8 @@ type ExecutionRecord = (
 
 struct Scenario {
     graph: Graph,
+    interactions: InteractionSender,
+    inbox: InteractionInbox,
     block_state: NodeId,
     chunk_available: NodeId,
     callback: ReactionId,
@@ -302,6 +307,7 @@ fn build_adapter(program: TransactionProgram, block_state: NodeId) -> Transactio
 
 fn build_scenario(program: TransactionProgram) -> Result<Scenario, Box<dyn std::error::Error>> {
     let mut graph = Graph::new(RuntimeConfig::default());
+    let (interactions, inbox) = interaction_channel();
     let block_state = graph.add_atom_input("repeater block state", UNPOWERED_STATE)?;
     let chunk_available = graph.add_atom_input("callback chunk available", CHUNK_AVAILABLE)?;
     let adapter = build_adapter(program, block_state);
@@ -355,6 +361,8 @@ fn build_scenario(program: TransactionProgram) -> Result<Scenario, Box<dyn std::
 
     Ok(Scenario {
         graph,
+        interactions,
+        inbox,
         block_state,
         chunk_available,
         callback,
@@ -375,17 +383,18 @@ fn execution_count(scenario: &Scenario) -> Result<usize, io::Error> {
 
 fn run_timeline(scenario: &mut Scenario) -> Result<ScenarioResult, Box<dyn std::error::Error>> {
     scenario
-        .graph
-        .schedule_reaction_event(scenario.callback, SimTime::ZERO, 0)?;
-    scenario.graph.advance_to(SimTime::ZERO)?;
+        .interactions
+        .callback_at(scenario.callback, SimTime::ZERO, 0)?;
+    scenario.graph.process_interactions(&scenario.inbox)?;
     let state_after_initial = scenario.graph.value_atom(scenario.block_state)?;
     let next_after_initial = scenario.graph.next_event_time();
 
-    scenario.graph.schedule_atom(
-        scenario.block_state,
+    scenario.interactions.state_at(
         SimTime::from_millis(100),
-        UNPOWERED_STATE,
+        0,
+        vec![StateWrite::atom(scenario.block_state, UNPOWERED_STATE)],
     )?;
+    scenario.graph.process_interactions(&scenario.inbox)?;
     scenario.graph.advance_to(SimTime::from_millis(199))?;
     let executions_at_199 = execution_count(scenario)?;
     scenario.graph.advance_to(SimTime::from_millis(200))?;
@@ -393,9 +402,12 @@ fn run_timeline(scenario: &mut Scenario) -> Result<ScenarioResult, Box<dyn std::
     let accepted_at_200 = scenario.accepted_callbacks.load(Ordering::Relaxed);
     let rejected_at_200 = scenario.rejected_callbacks.load(Ordering::Relaxed);
 
-    scenario
-        .graph
-        .schedule_atom(scenario.block_state, SimTime::from_millis(300), STONE_STATE)?;
+    scenario.interactions.state_at(
+        SimTime::from_millis(300),
+        0,
+        vec![StateWrite::atom(scenario.block_state, STONE_STATE)],
+    )?;
+    scenario.graph.process_interactions(&scenario.inbox)?;
     scenario.graph.advance_to(SimTime::from_millis(399))?;
     let executions_at_399 = execution_count(scenario)?;
     scenario.graph.advance_to(SimTime::from_millis(400))?;
@@ -403,27 +415,30 @@ fn run_timeline(scenario: &mut Scenario) -> Result<ScenarioResult, Box<dyn std::
     let rejected_at_400 = scenario.rejected_callbacks.load(Ordering::Relaxed);
     let next_after_rejection = scenario.graph.next_event_time();
 
-    scenario.graph.schedule_atom(
-        scenario.block_state,
+    scenario.interactions.state_at(
         SimTime::from_millis(500),
-        UNPOWERED_STATE,
-    )?;
-    scenario.graph.schedule_atom(
-        scenario.chunk_available,
-        SimTime::from_millis(500),
-        CHUNK_AVAILABLE,
+        0,
+        vec![
+            StateWrite::atom(scenario.block_state, UNPOWERED_STATE),
+            StateWrite::atom(scenario.chunk_available, CHUNK_AVAILABLE),
+        ],
     )?;
     scenario
-        .graph
-        .schedule_reaction_event(scenario.callback, SimTime::from_millis(501), 0)?;
+        .interactions
+        .callback_at(scenario.callback, SimTime::from_millis(501), 0)?;
+    scenario.graph.process_interactions(&scenario.inbox)?;
     scenario.graph.advance_to(SimTime::from_millis(501))?;
     let executions_after_reseed = execution_count(scenario)?;
     let next_after_reseed = scenario.graph.next_event_time();
-    scenario.graph.schedule_atom(
-        scenario.chunk_available,
+    scenario.interactions.state_at(
         SimTime::from_millis(600),
-        CHUNK_UNAVAILABLE,
+        0,
+        vec![StateWrite::atom(
+            scenario.chunk_available,
+            CHUNK_UNAVAILABLE,
+        )],
     )?;
+    scenario.graph.process_interactions(&scenario.inbox)?;
     scenario.graph.advance_to(SimTime::from_millis(700))?;
     let unavailable_at_700 = scenario.unavailable_callbacks.load(Ordering::Relaxed);
     scenario.graph.advance_to(SimTime::from_millis(701))?;

@@ -15,7 +15,9 @@ use minecraft_redox_quiescence::{
     ReactionStoreBinding, SnapshotInterner, TransactionReactionAdapter, TransactionReactionResult,
 };
 use quiescence_core::{NodeId, SimDuration, SimTime};
-use quiescence_runtime::{EvalError, Graph, ReactionOutput, RuntimeConfig, StateWrite};
+use quiescence_runtime::{
+    EvalError, Graph, ReactionOutput, RuntimeConfig, StateWrite, interaction_channel,
+};
 
 const TICK_MS: u64 = 50;
 
@@ -250,6 +252,7 @@ fn run(program: TransactionProgram) -> Result<(), Box<dyn std::error::Error>> {
     let snapshots = Arc::new(Mutex::new(interner));
 
     let mut graph = Graph::new(RuntimeConfig::default());
+    let (interactions, inbox) = interaction_channel();
     let nodes = HopperNodes {
         deadline: graph.add_atom_input("hopper.ready_at_ms", 400)?,
         hopper: graph.add_atom_input("hopper.inventory", hopper_initial)?,
@@ -271,12 +274,15 @@ fn run(program: TransactionProgram) -> Result<(), Box<dyn std::error::Error>> {
     print_state("first", &graph, &snapshots, nodes)?;
 
     let after_first = evaluations.load(Ordering::Relaxed);
-    graph.schedule_atom(
-        nodes.destination,
+    interactions.state_at(
         SimTime::from_millis(500),
-        destination_full,
+        0,
+        vec![
+            StateWrite::atom(nodes.destination, destination_full),
+            StateWrite::atom(nodes.source, source_later),
+        ],
     )?;
-    graph.schedule_atom(nodes.source, SimTime::from_millis(500), source_later)?;
+    graph.process_interactions(&inbox)?;
     graph.advance_to(SimTime::from_millis(500))?;
     println!(
         "neighbor_changes_woke_during_cooldown={}",
@@ -287,7 +293,12 @@ fn run(program: TransactionProgram) -> Result<(), Box<dyn std::error::Error>> {
     print_state("second", &graph, &snapshots, nodes)?;
 
     let after_second = evaluations.load(Ordering::Relaxed);
-    graph.schedule_atom(nodes.hopper, SimTime::from_millis(900), hopper_full)?;
+    interactions.state_at(
+        SimTime::from_millis(900),
+        0,
+        vec![StateWrite::atom(nodes.hopper, hopper_full)],
+    )?;
+    graph.process_interactions(&inbox)?;
     graph.advance_to(SimTime::from_millis(900))?;
     println!(
         "hopper_change_woke_during_cooldown={}",
@@ -296,17 +307,23 @@ fn run(program: TransactionProgram) -> Result<(), Box<dyn std::error::Error>> {
 
     graph.advance_to(SimTime::from_millis(1200))?;
     let after_full_block = evaluations.load(Ordering::Relaxed);
-    graph.schedule_atom(nodes.source, SimTime::from_millis(1250), source_newer)?;
+    interactions.state_at(
+        SimTime::from_millis(1250),
+        0,
+        vec![StateWrite::atom(nodes.source, source_newer)],
+    )?;
+    graph.process_interactions(&inbox)?;
     graph.advance_to(SimTime::from_millis(1250))?;
     println!(
         "source_change_woke_while_pull_skipped={}",
         evaluations.load(Ordering::Relaxed) != after_full_block
     );
-    graph.schedule_atom(
-        nodes.destination,
+    interactions.state_at(
         SimTime::from_millis(1260),
-        destination_empty,
+        0,
+        vec![StateWrite::atom(nodes.destination, destination_empty)],
     )?;
+    graph.process_interactions(&inbox)?;
     graph.advance_to(SimTime::from_millis(1260))?;
     println!(
         "destination_change_woke_ready={}",

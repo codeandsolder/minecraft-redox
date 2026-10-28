@@ -15,7 +15,9 @@ use minecraft_redox_quiescence::{
     ReactionStoreBinding, SnapshotInterner, TransactionReactionAdapter, TransactionReactionResult,
 };
 use quiescence_core::{NodeId, SimDuration, SimTime};
-use quiescence_runtime::{EvalError, Graph, ReactionOutput, RuntimeConfig, StateWrite};
+use quiescence_runtime::{
+    EvalError, Graph, ReactionOutput, RuntimeConfig, StateWrite, interaction_channel,
+};
 
 const TICK_MS: u64 = 50;
 const COORDINATES: [i64; 3] = [10, 21, 30];
@@ -133,6 +135,7 @@ fn run(program: TransactionProgram) -> Result<(), Box<dyn std::error::Error>> {
     let later_source_id = interner.intern(source_snapshot(7))?;
     let snapshots = Arc::new(Mutex::new(interner));
     let mut graph = Graph::new(RuntimeConfig::default());
+    let (interactions, inbox) = interaction_channel();
     let deadline = graph.add_atom_input("hopper.ready_at_ms", 400)?;
     let hopper_node = graph.add_atom_input("hopper.inventory", hopper_id)?;
     let source_node = graph.add_atom_input("source.inventory", source_id)?;
@@ -190,7 +193,12 @@ fn run(program: TransactionProgram) -> Result<(), Box<dyn std::error::Error>> {
     );
     println!("first_ready_ms={}", graph.value_atom(deadline)?);
     let after_first = evaluations.load(Ordering::Relaxed);
-    graph.schedule_atom(source_node, SimTime::from_millis(500), later_source_id)?;
+    interactions.state_at(
+        SimTime::from_millis(500),
+        0,
+        vec![StateWrite::atom(source_node, later_source_id)],
+    )?;
+    graph.process_interactions(&inbox)?;
     graph.advance_to(SimTime::from_millis(500))?;
     println!(
         "source_change_woke_during_cooldown={}",

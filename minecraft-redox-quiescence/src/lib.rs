@@ -8,7 +8,10 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
     fmt,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use minecraft_redox_core::transaction::{
@@ -18,8 +21,11 @@ use minecraft_redox_core::transaction::{
     TransactionExecution, TransactionExecutionError, TransactionExecutionLimits, TransactionHost,
     TransactionProgram, TransactionStoreQueryKind, execute_transaction,
 };
-use quiescence_core::{NodeId, ReactionId, SimDuration};
-use quiescence_runtime::{EvalContext, EvalError, ReactionOutput, StateWrite};
+use quiescence_core::{NodeId, ReactionId, SimDuration, SimTime};
+use quiescence_runtime::{
+    EvalContext, EvalError, Graph, InteractionIngressError, InteractionSender, ReactionOutput,
+    RuntimeError, StateWrite,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -207,6 +213,35 @@ pub struct ReactionStoreBinding {
 pub enum ReactionArgument {
     Store { binding_index: usize },
     Datum(TransactionDatum),
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct TransactionInvocation {
+    pub receiver: Option<ReactionArgument>,
+    pub arguments: Vec<ReactionArgument>,
+    pub preparation: ReactionHostPreparation,
+}
+
+impl TransactionInvocation {
+    #[must_use]
+    pub fn new(arguments: Vec<ReactionArgument>) -> Self {
+        Self {
+            arguments,
+            ..Self::default()
+        }
+    }
+
+    #[must_use]
+    pub fn with_receiver(mut self, receiver: ReactionArgument) -> Self {
+        self.receiver = Some(receiver);
+        self
+    }
+
+    #[must_use]
+    pub fn with_preparation(mut self, preparation: ReactionHostPreparation) -> Self {
+        self.preparation = preparation;
+        self
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -442,6 +477,183 @@ type HostCallPublisher = dyn Fn(&MemoryTransactionPerformedHostCall) -> Result<V
     + Sync
     + 'static;
 
+#[derive(Debug)]
+pub enum TransactionInteractionError {
+    PayloadLockPoisoned,
+    TokenExhausted,
+    UnknownToken(u64),
+    Ingress(InteractionIngressError),
+}
+
+impl fmt::Display for TransactionInteractionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PayloadLockPoisoned => {
+                f.write_str("transaction interaction payload lock poisoned")
+            }
+            Self::TokenExhausted => f.write_str("transaction interaction token space exhausted"),
+            Self::UnknownToken(token) => write!(f, "unknown transaction interaction token {token}"),
+            Self::Ingress(source) => write!(f, "interaction ingress failed: {source}"),
+        }
+    }
+}
+impl Error for TransactionInteractionError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Ingress(source) => Some(source),
+            Self::PayloadLockPoisoned | Self::TokenExhausted | Self::UnknownToken(_) => None,
+        }
+    }
+}
+impl From<InteractionIngressError> for TransactionInteractionError {
+    fn from(value: InteractionIngressError) -> Self {
+        Self::Ingress(value)
+    }
+}
+
+#[derive(Clone)]
+pub struct TransactionInteractionSender {
+    sender: InteractionSender,
+    reaction: ReactionId,
+    payloads: Arc<Mutex<BTreeMap<u64, TransactionInvocation>>>,
+    next_token: Arc<AtomicU64>,
+}
+
+impl TransactionInteractionSender {
+    fn reserve(
+        &self,
+        invocation: TransactionInvocation,
+    ) -> Result<u64, TransactionInteractionError> {
+        let token = self
+            .next_token
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| TransactionInteractionError::TokenExhausted)?;
+        self.payloads
+            .lock()
+            .map_err(|_| TransactionInteractionError::PayloadLockPoisoned)?
+            .insert(token, invocation);
+        Ok(token)
+    }
+
+    fn rollback_reservation(&self, token: u64) {
+        if let Ok(mut payloads) = self.payloads.lock() {
+            payloads.remove(&token);
+        }
+    }
+
+    /// Enqueue one transaction invocation at the graph owner's next quiescent boundary.
+    ///
+    /// # Errors
+    /// Returns an error if payload storage is unavailable, the token space is exhausted, or the
+    /// underlying Quiescence ingress queue rejects the submission.
+    pub fn submit_now(
+        &self,
+        priority: i32,
+        invocation: TransactionInvocation,
+    ) -> Result<u64, TransactionInteractionError> {
+        let token = self.reserve(invocation)?;
+        if let Err(error) = self
+            .sender
+            .callback_now_with_token(self.reaction, priority, token)
+        {
+            self.rollback_reservation(token);
+            return Err(error.into());
+        }
+        Ok(token)
+    }
+
+    /// Enqueue one transaction invocation at an explicit simulation timestamp.
+    ///
+    /// # Errors
+    /// Returns an error if payload storage is unavailable, the token space is exhausted, or the
+    /// underlying Quiescence ingress queue rejects the submission. A timestamp that has become
+    /// causally stale is reported later by the graph owner when it imports the interaction.
+    pub fn submit_at(
+        &self,
+        at: SimTime,
+        priority: i32,
+        invocation: TransactionInvocation,
+    ) -> Result<u64, TransactionInteractionError> {
+        let token = self.reserve(invocation)?;
+        if let Err(error) = self
+            .sender
+            .callback_at_with_token(self.reaction, at, priority, token)
+        {
+            self.rollback_reservation(token);
+            return Err(error.into());
+        }
+        Ok(token)
+    }
+
+    /// Re-enqueue a retained failed invocation at the next quiescent boundary.
+    ///
+    /// # Errors
+    /// Returns an error for an unknown token, unavailable payload storage, or ingress failure.
+    pub fn retry_now(&self, token: u64, priority: i32) -> Result<(), TransactionInteractionError> {
+        if !self
+            .payloads
+            .lock()
+            .map_err(|_| TransactionInteractionError::PayloadLockPoisoned)?
+            .contains_key(&token)
+        {
+            return Err(TransactionInteractionError::UnknownToken(token));
+        }
+        self.sender
+            .callback_now_with_token(self.reaction, priority, token)
+            .map_err(Into::into)
+    }
+
+    /// Re-enqueue a retained failed invocation at an explicit simulation timestamp.
+    ///
+    /// # Errors
+    /// Returns an error for an unknown token, unavailable payload storage, or ingress failure.
+    pub fn retry_at(
+        &self,
+        token: u64,
+        at: SimTime,
+        priority: i32,
+    ) -> Result<(), TransactionInteractionError> {
+        if !self
+            .payloads
+            .lock()
+            .map_err(|_| TransactionInteractionError::PayloadLockPoisoned)?
+            .contains_key(&token)
+        {
+            return Err(TransactionInteractionError::UnknownToken(token));
+        }
+        self.sender
+            .callback_at_with_token(self.reaction, at, priority, token)
+            .map_err(Into::into)
+    }
+
+    /// Discard a retained invocation payload.
+    ///
+    /// # Errors
+    /// Returns an error if the payload registry lock is poisoned.
+    pub fn discard(&self, token: u64) -> Result<bool, TransactionInteractionError> {
+        Ok(self
+            .payloads
+            .lock()
+            .map_err(|_| TransactionInteractionError::PayloadLockPoisoned)?
+            .remove(&token)
+            .is_some())
+    }
+
+    /// Return the number of submitted invocations not yet committed successfully or discarded.
+    ///
+    /// # Errors
+    /// Returns an error if the payload registry lock is poisoned.
+    pub fn pending_payload_count(&self) -> Result<usize, TransactionInteractionError> {
+        Ok(self
+            .payloads
+            .lock()
+            .map_err(|_| TransactionInteractionError::PayloadLockPoisoned)?
+            .len())
+    }
+}
+
 #[derive(Clone)]
 pub struct TransactionReactionAdapter {
     program: Arc<TransactionProgram>,
@@ -595,14 +807,145 @@ impl TransactionReactionAdapter {
             || Ok(ReactionHostPreparation::default()),
             |prepare| prepare(context),
         )?;
-        execute_prepared_transaction(self, context, &preparation)
+        execute_prepared_transaction(
+            self,
+            context,
+            &preparation,
+            InvocationBindings {
+                receiver: self.receiver.as_ref(),
+                arguments: &self.arguments,
+            },
+        )
     }
+
+    /// Execute one event-local invocation using this adapter's graph/store configuration.
+    ///
+    /// # Errors
+    /// Propagates graph reads, preparation conflicts, transaction execution failures, snapshot
+    /// errors, schedule lowering errors, and host-publication errors as `EvalError`.
+    pub fn execute_invocation(
+        &self,
+        context: &EvalContext<'_>,
+        invocation: &TransactionInvocation,
+    ) -> Result<TransactionReactionResult, EvalError> {
+        let mut preparation = self.host_preparer.as_ref().map_or_else(
+            || Ok(ReactionHostPreparation::default()),
+            |prepare| prepare(context),
+        )?;
+        merge_preparation(&mut preparation, &invocation.preparation)?;
+        execute_prepared_transaction(
+            self,
+            context,
+            &preparation,
+            InvocationBindings {
+                receiver: invocation.receiver.as_ref(),
+                arguments: &invocation.arguments,
+            },
+        )
+    }
+}
+
+/// Install an event-only Quiescence callback that executes token-indexed transaction invocations.
+///
+/// # Errors
+/// Returns a runtime error if the callback reaction cannot be installed in the graph.
+pub fn install_transaction_interaction(
+    graph: &mut Graph,
+    sender: InteractionSender,
+    name: impl Into<String>,
+    adapter: TransactionReactionAdapter,
+    schedule_target: Option<ReactionId>,
+) -> Result<TransactionInteractionSender, RuntimeError> {
+    let payloads = Arc::new(Mutex::new(BTreeMap::<u64, TransactionInvocation>::new()));
+    let callback_payloads = Arc::clone(&payloads);
+    let callback = graph.add_event_callback(name, move |context| {
+        let token = context.external_token().ok_or_else(|| {
+            EvalError::Message(String::from(
+                "transaction interaction callback arrived without a payload token",
+            ))
+        })?;
+        let invocation = callback_payloads
+            .lock()
+            .map_err(|_| {
+                EvalError::Message(String::from(
+                    "transaction interaction payload lock poisoned",
+                ))
+            })?
+            .get(&token)
+            .cloned()
+            .ok_or_else(|| {
+                EvalError::Message(format!("unknown transaction interaction token {token}"))
+            })?;
+        let result = adapter.execute_invocation(context, &invocation)?;
+        let output = if result.schedule_requests.is_empty() {
+            if result.writes.is_empty() {
+                ReactionOutput::idle()
+            } else {
+                ReactionOutput::immediate(result.writes)
+            }
+        } else {
+            let target = schedule_target.ok_or_else(|| {
+                EvalError::Message(String::from(
+                    "transaction interaction emitted schedule requests without a callback target",
+                ))
+            })?;
+            result.into_reaction_output_for_callback(target)
+        };
+        callback_payloads
+            .lock()
+            .map_err(|_| {
+                EvalError::Message(String::from(
+                    "transaction interaction payload lock poisoned",
+                ))
+            })?
+            .remove(&token);
+        Ok(output)
+    })?;
+    Ok(TransactionInteractionSender {
+        sender,
+        reaction: callback,
+        payloads,
+        next_token: Arc::new(AtomicU64::new(1)),
+    })
+}
+
+#[derive(Clone, Copy)]
+struct InvocationBindings<'a> {
+    receiver: Option<&'a ReactionArgument>,
+    arguments: &'a [ReactionArgument],
+}
+
+fn merge_preparation(
+    target: &mut ReactionHostPreparation,
+    extra: &ReactionHostPreparation,
+) -> Result<(), EvalError> {
+    target.stores.extend(extra.stores.iter().copied());
+    for (handle, object) in &extra.objects {
+        if target.objects.insert(*handle, object.clone()).is_some() {
+            return Err(EvalError::Message(format!(
+                "duplicate prepared object handle {handle}"
+            )));
+        }
+    }
+    for (handle, capabilities) in &extra.capabilities {
+        target
+            .capabilities
+            .entry(*handle)
+            .or_default()
+            .extend(capabilities.iter().cloned());
+    }
+    target
+        .host_queries
+        .extend(extra.host_queries.iter().cloned());
+    target.host_calls.extend(extra.host_calls.iter().cloned());
+    Ok(())
 }
 
 fn execute_prepared_transaction(
     adapter: &TransactionReactionAdapter,
     context: &EvalContext<'_>,
     preparation: &ReactionHostPreparation,
+    invocation: InvocationBindings<'_>,
 ) -> Result<TransactionReactionResult, EvalError> {
     let mut all_stores = adapter.stores.clone();
     all_stores.extend(preparation.stores.iter().copied());
@@ -622,6 +965,7 @@ fn execute_prepared_transaction(
             &lazy_stores,
             reserved_handle,
             preparation,
+            invocation,
         )? {
             DemandExecution::Complete(result) => return Ok(result),
             DemandExecution::NeedStore(binding) => {
@@ -644,6 +988,7 @@ fn execute_resolved_transaction(
     lazy_stores: &BTreeMap<u64, ReactionStoreBinding>,
     reserved_handle: u64,
     preparation: &ReactionHostPreparation,
+    invocation: InvocationBindings<'_>,
 ) -> Result<DemandExecution, EvalError> {
     let mut interner = adapter
         .interner
@@ -668,13 +1013,12 @@ fn execute_resolved_transaction(
         unresolved_stores,
     };
     apply_preparation(&mut host.inner.state, preparation.clone());
-    let receiver = adapter
+    let receiver = invocation
         .receiver
-        .as_ref()
         .map(|argument| lower_argument(argument, &adapter.stores))
         .transpose()
         .map_err(EvalError::Message)?;
-    let arguments = adapter
+    let arguments = invocation
         .arguments
         .iter()
         .map(|argument| lower_argument(argument, &adapter.stores))
@@ -1054,7 +1398,7 @@ mod tests {
         TransactionOperation, TransactionStatement, TransactionStatementId, TransactionValue,
     };
     use quiescence_core::{SimDuration, SimTime};
-    use quiescence_runtime::{Graph, ReactionOutput, RuntimeConfig};
+    use quiescence_runtime::{Graph, ReactionOutput, RuntimeConfig, interaction_channel};
 
     use super::*;
 
@@ -1193,6 +1537,26 @@ mod tests {
         )
     }
 
+    fn parameter_host_call_program() -> TransactionProgram {
+        program(
+            vec![
+                statement(
+                    0,
+                    TransactionOperation::Evaluate {
+                        value: TransactionValue::HostCall {
+                            operation: String::from("world.write"),
+                            receiver: None,
+                            arguments: vec![TransactionValue::Parameter { index: 0 }],
+                        },
+                        next: TransactionStatementId(1),
+                    },
+                ),
+                statement(1, TransactionOperation::Return { value: None }),
+            ],
+            0,
+        )
+    }
+
     fn schedule_program(key: TransactionValue) -> TransactionProgram {
         program(
             vec![
@@ -1320,6 +1684,7 @@ mod tests {
         let second = interner.intern(snapshot(6))?;
         let interner = Arc::new(Mutex::new(interner));
         let mut graph = Graph::new(RuntimeConfig::default());
+        let (interactions, inbox) = interaction_channel();
         let used = graph.add_atom_input("used", first)?;
         let unused = graph.add_atom_input("unused", first)?;
         let adapter = TransactionReactionAdapter::new(
@@ -1362,10 +1727,20 @@ mod tests {
 
         graph.settle()?;
         assert_eq!(evaluations.load(Ordering::Relaxed), 1);
-        graph.schedule_atom(unused, SimTime::from_millis(10), second)?;
+        interactions.state_at(
+            SimTime::from_millis(10),
+            0,
+            vec![StateWrite::atom(unused, second)],
+        )?;
+        graph.process_interactions(&inbox)?;
         graph.advance_to(SimTime::from_millis(10))?;
         assert_eq!(evaluations.load(Ordering::Relaxed), 1);
-        graph.schedule_atom(used, SimTime::from_millis(20), second)?;
+        interactions.state_at(
+            SimTime::from_millis(20),
+            0,
+            vec![StateWrite::atom(used, second)],
+        )?;
+        graph.process_interactions(&inbox)?;
         graph.advance_to(SimTime::from_millis(20))?;
         assert_eq!(evaluations.load(Ordering::Relaxed), 2);
         Ok(())
@@ -1428,6 +1803,146 @@ mod tests {
                 .and_then(|value| value.components.get("quantity")),
             Some(&TransactionDatum::Integer(4))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn transaction_interaction_port_carries_event_local_arguments_and_host_evidence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut graph = Graph::new(RuntimeConfig::default());
+        let world_state = graph.add_atom_input("world state", 0)?;
+        let adapter = TransactionReactionAdapter::new(
+            Arc::new(parameter_host_call_program()),
+            Arc::new(Mutex::new(SnapshotInterner::new())),
+            Vec::new(),
+            vec![ReactionArgument::Datum(TransactionDatum::Integer(-1))],
+            None,
+            "quantity",
+        )
+        .with_host_call_publisher(move |call| {
+            let [TransactionDatum::Integer(value)] = call.arguments.as_slice() else {
+                return Err(EvalError::Message(String::from(
+                    "interaction host call did not carry one integer argument",
+                )));
+            };
+            let value = u64::try_from(*value)
+                .map_err(|_| EvalError::Message(String::from("negative world state")))?;
+            Ok(vec![StateWrite::atom(world_state, value)])
+        });
+        let (ingress, inbox) = interaction_channel();
+        let port = install_transaction_interaction(
+            &mut graph,
+            ingress,
+            "transaction interaction",
+            adapter,
+            None,
+        )?;
+        graph.quiesce()?;
+
+        let invocation = |value| {
+            TransactionInvocation::new(vec![ReactionArgument::Datum(TransactionDatum::Integer(
+                value,
+            ))])
+            .with_preparation(ReactionHostPreparation {
+                host_calls: vec![MemoryTransactionHostCall {
+                    operation: String::from("world.write"),
+                    receiver: None,
+                    arguments: vec![TransactionDatum::Integer(value)],
+                    result: TransactionDatum::Boolean(true),
+                    consume: false,
+                }],
+                ..ReactionHostPreparation::default()
+            })
+        };
+
+        let first = port.submit_now(0, invocation(7))?;
+        assert_eq!(port.pending_payload_count()?, 1);
+        assert_eq!(graph.process_interactions(&inbox)?, 1);
+        assert_eq!(graph.value_atom(world_state)?, 7);
+        assert_eq!(port.pending_payload_count()?, 0);
+        assert!(matches!(
+            port.retry_now(first, 0),
+            Err(TransactionInteractionError::UnknownToken(token)) if token == first
+        ));
+
+        let future = port.submit_at(SimTime::from_millis(20), 0, invocation(9))?;
+        assert_eq!(graph.process_interactions(&inbox)?, 1);
+        assert_eq!(graph.value_atom(world_state)?, 7);
+        assert_eq!(port.pending_payload_count()?, 1);
+        graph.advance_to(SimTime::from_millis(20))?;
+        assert_eq!(graph.value_atom(world_state)?, 9);
+        assert_eq!(port.pending_payload_count()?, 0);
+        assert!(matches!(
+            port.retry_at(future, SimTime::from_millis(30), 0),
+            Err(TransactionInteractionError::UnknownToken(token)) if token == future
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn failed_transaction_interaction_payload_can_retry_same_token()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut graph = Graph::new(RuntimeConfig::default());
+        let world_state = graph.add_atom_input("world state", 0)?;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed_attempts = Arc::clone(&attempts);
+        let adapter = TransactionReactionAdapter::new(
+            Arc::new(parameter_host_call_program()),
+            Arc::new(Mutex::new(SnapshotInterner::new())),
+            Vec::new(),
+            vec![ReactionArgument::Datum(TransactionDatum::Integer(-1))],
+            None,
+            "quantity",
+        )
+        .with_host_call_publisher(move |call| {
+            if observed_attempts.fetch_add(1, Ordering::Relaxed) == 0 {
+                return Err(EvalError::Message(String::from(
+                    "transient publisher failure",
+                )));
+            }
+            let [TransactionDatum::Integer(value)] = call.arguments.as_slice() else {
+                return Err(EvalError::Message(String::from("unexpected retry payload")));
+            };
+            Ok(vec![StateWrite::atom(
+                world_state,
+                u64::try_from(*value)
+                    .map_err(|_| EvalError::Message(String::from("negative world state")))?,
+            )])
+        });
+        let (ingress, inbox) = interaction_channel();
+        let port = install_transaction_interaction(
+            &mut graph,
+            ingress,
+            "retryable transaction interaction",
+            adapter,
+            None,
+        )?;
+        graph.quiesce()?;
+        let invocation = TransactionInvocation::new(vec![ReactionArgument::Datum(
+            TransactionDatum::Integer(11),
+        )])
+        .with_preparation(ReactionHostPreparation {
+            host_calls: vec![MemoryTransactionHostCall {
+                operation: String::from("world.write"),
+                receiver: None,
+                arguments: vec![TransactionDatum::Integer(11)],
+                result: TransactionDatum::Boolean(true),
+                consume: false,
+            }],
+            ..ReactionHostPreparation::default()
+        });
+        let token = port.submit_now(0, invocation)?;
+        assert!(matches!(
+            graph.process_interactions(&inbox),
+            Err(RuntimeError::ReactionEvaluation { .. })
+        ));
+        assert_eq!(port.pending_payload_count()?, 1);
+        assert_eq!(graph.value_atom(world_state)?, 0);
+        port.retry_now(token, 0)?;
+        assert_eq!(graph.process_interactions(&inbox)?, 1);
+        assert_eq!(graph.value_atom(world_state)?, 11);
+        assert_eq!(port.pending_payload_count()?, 0);
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
         Ok(())
     }
 
@@ -1535,6 +2050,7 @@ mod tests {
         let observed = Arc::new(Mutex::new(Vec::new()));
         let captured = Arc::clone(&observed);
         let mut graph = Graph::new(RuntimeConfig::default());
+        let (interactions, inbox) = interaction_channel();
         let reaction = graph.add_reaction("schedule bridge", move |context| {
             let result = adapter.execute(context)?;
             captured
@@ -1543,8 +2059,9 @@ mod tests {
                 .push(result.schedule_requests[0]);
             Ok(ReactionOutput::idle())
         })?;
-        graph.settle()?;
-        graph.schedule_reaction_event(reaction, SimTime::from_millis(10), 0)?;
+        graph.quiesce()?;
+        interactions.callback_at(reaction, SimTime::from_millis(10), 0)?;
+        graph.process_interactions(&inbox)?;
         graph.advance_to(SimTime::from_millis(10))?;
         let observed = observed
             .lock()
@@ -1579,6 +2096,7 @@ mod tests {
         let callback_evaluations = Arc::new(AtomicUsize::new(0));
         let observed_callback = Arc::clone(&callback_evaluations);
         let mut graph = Graph::new(RuntimeConfig::default());
+        let (interactions, inbox) = interaction_channel();
         let callback = graph.add_event_callback("transaction callback target", move |_| {
             observed_callback.fetch_add(1, Ordering::Relaxed);
             Ok(ReactionOutput::idle())
@@ -1593,8 +2111,9 @@ mod tests {
                 .into_reaction_output_for_callback(callback))
         })?;
 
-        graph.settle()?;
-        graph.schedule_reaction_event(producer, SimTime::from_millis(50), 0)?;
+        graph.quiesce()?;
+        interactions.callback_at(producer, SimTime::from_millis(50), 0)?;
+        graph.process_interactions(&inbox)?;
         graph.advance_to(SimTime::from_millis(50))?;
         assert_eq!(producer_evaluations.load(Ordering::Relaxed), 2);
         assert_eq!(callback_evaluations.load(Ordering::Relaxed), 0);
@@ -1764,6 +2283,7 @@ mod tests {
         let second = interner.intern(snapshot(4))?;
         let interner = Arc::new(Mutex::new(interner));
         let mut graph = Graph::new(RuntimeConfig::default());
+        let (interactions, inbox) = interaction_channel();
         let store = graph.add_atom_input("store", first)?;
         let adapter = adapter(no_store_access_program(), interner, store);
         let evaluations = Arc::new(AtomicUsize::new(0));
@@ -1776,7 +2296,12 @@ mod tests {
 
         graph.settle()?;
         assert_eq!(evaluations.load(Ordering::Relaxed), 1);
-        graph.schedule_atom(store, SimTime::from_millis(10), second)?;
+        interactions.state_at(
+            SimTime::from_millis(10),
+            0,
+            vec![StateWrite::atom(store, second)],
+        )?;
+        graph.process_interactions(&inbox)?;
         graph.advance_to(SimTime::from_millis(10))?;
         assert_eq!(evaluations.load(Ordering::Relaxed), 1);
         Ok(())
@@ -1789,6 +2314,7 @@ mod tests {
         let second = interner.intern(snapshot(4))?;
         let interner = Arc::new(Mutex::new(interner));
         let mut graph = Graph::new(RuntimeConfig::default());
+        let (interactions, inbox) = interaction_channel();
         let deadline = graph.add_atom_input("deadline_ms", 100)?;
         let store = graph.add_atom_input("store", first)?;
         let adapter = adapter(store_read_program(), interner, store);
@@ -1812,12 +2338,22 @@ mod tests {
 
         graph.settle()?;
         assert_eq!(evaluations.load(Ordering::Relaxed), 1);
-        graph.schedule_atom(store, SimTime::from_millis(50), second)?;
+        interactions.state_at(
+            SimTime::from_millis(50),
+            0,
+            vec![StateWrite::atom(store, second)],
+        )?;
+        graph.process_interactions(&inbox)?;
         graph.advance_to(SimTime::from_millis(50))?;
         assert_eq!(evaluations.load(Ordering::Relaxed), 1);
         graph.advance_to(SimTime::from_millis(100))?;
         assert_eq!(evaluations.load(Ordering::Relaxed), 2);
-        graph.schedule_atom(store, SimTime::from_millis(110), first)?;
+        interactions.state_at(
+            SimTime::from_millis(110),
+            0,
+            vec![StateWrite::atom(store, first)],
+        )?;
+        graph.process_interactions(&inbox)?;
         graph.advance_to(SimTime::from_millis(110))?;
         assert_eq!(evaluations.load(Ordering::Relaxed), 3);
         Ok(())

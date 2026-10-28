@@ -15,7 +15,7 @@ use minecraft_redox_quiescence::{
     TransactionScheduleRequest,
 };
 use quiescence_core::{SimDuration, SimTime};
-use quiescence_runtime::{EvalError, Graph, ReactionOutput, RuntimeConfig};
+use quiescence_runtime::{EvalError, Graph, ReactionOutput, RuntimeConfig, interaction_channel};
 
 fn integer(value: i64) -> TransactionDatum {
     TransactionDatum::Integer(value)
@@ -146,6 +146,7 @@ fn run(program: TransactionProgram) -> Result<(), Box<dyn std::error::Error>> {
     let requests = Arc::new(Mutex::new(Vec::<TransactionScheduleRequest>::new()));
     let observed_requests = Arc::clone(&requests);
     let mut graph = Graph::new(RuntimeConfig::default());
+    let (interactions, inbox) = interaction_channel();
     let callback =
         graph.add_event_callback("recovered repeater updateTick callback", move |_| {
             observed_callback.fetch_add(1, Ordering::Relaxed);
@@ -169,8 +170,9 @@ fn run(program: TransactionProgram) -> Result<(), Box<dyn std::error::Error>> {
         Ok(result.into_reaction_output_for_callback(callback))
     })?;
 
-    graph.settle()?;
-    graph.schedule_reaction_event(producer, SimTime::from_millis(50), 0)?;
+    graph.quiesce()?;
+    interactions.callback_at(producer, SimTime::from_millis(50), 0)?;
+    graph.process_interactions(&inbox)?;
     graph.advance_to(SimTime::from_millis(50))?;
     let producers_at_50 = producer_evaluations.load(Ordering::Relaxed);
     let callbacks_at_50 = callback_evaluations.load(Ordering::Relaxed);

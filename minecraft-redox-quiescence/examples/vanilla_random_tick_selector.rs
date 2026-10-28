@@ -5,7 +5,7 @@ use std::{
 
 use minecraft_redox_quiescence::{AffineBitSelector, AffineBitSelectorSpec};
 use quiescence_core::SimTime;
-use quiescence_runtime::{EvalError, Graph, ReactionOutput, RuntimeConfig};
+use quiescence_runtime::{EvalError, Graph, ReactionOutput, RuntimeConfig, interaction_channel};
 use serde::Deserialize;
 
 const SELECTOR_SEED: i32 = 81_709;
@@ -61,6 +61,7 @@ fn run(evidence: &SelectorEvidence) -> Result<(), Box<dyn std::error::Error>> {
     let mut selector = AffineBitSelector::new(SELECTOR_SEED, spec)?;
 
     let mut graph = Graph::new(RuntimeConfig::default());
+    let (interactions, inbox) = interaction_channel();
     let observed = Arc::new(Mutex::new(Vec::new()));
     let captured = Arc::clone(&observed);
     let callback = graph.add_event_callback("random-tick updateTick", move |context| {
@@ -84,7 +85,7 @@ fn run(evidence: &SelectorEvidence) -> Result<(), Box<dyn std::error::Error>> {
         if accepts_random_tick(position) {
             let token = pack_position(position)?;
             emitted.push(token);
-            graph.schedule_reaction_event_with_token(
+            interactions.callback_at_with_token(
                 callback,
                 SimTime::from_millis(CALLBACK_TIME_MS),
                 0,
@@ -93,6 +94,7 @@ fn run(evidence: &SelectorEvidence) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    graph.process_interactions(&inbox)?;
     graph.advance_to(SimTime::from_millis(CALLBACK_TIME_MS - 1))?;
     let callbacks_before = observed
         .lock()
