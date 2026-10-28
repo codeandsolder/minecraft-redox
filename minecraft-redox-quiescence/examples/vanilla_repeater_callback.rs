@@ -322,7 +322,7 @@ fn build_scenario(program: TransactionProgram) -> Result<Scenario, Box<dyn std::
     let unavailable = Arc::clone(&unavailable_callbacks);
     let observed = Arc::new(Mutex::new(Vec::new()));
     let captured = Arc::clone(&observed);
-    let callback_adapter = adapter.clone();
+    let callback_adapter = adapter;
 
     let callback = graph.add_event_callback("recovered repeater updateTick", move |context| {
         if context.scheduled_key().is_some()
