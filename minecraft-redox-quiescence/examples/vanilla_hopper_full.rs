@@ -156,44 +156,60 @@ fn slot_quantity(
     Ok(Some(*value))
 }
 
-fn run(program: TransactionProgram) -> Result<(), Box<dyn std::error::Error>> {
-    let mut interner = SnapshotInterner::new();
-    let hopper_initial = interner.intern(store(
-        vec![Some(item(5, "iron")), None, None, None, None],
-        true,
-    ))?;
-    let destination_empty = interner.intern(store(vec![None], false))?;
-    let destination_full = interner.intern(store(vec![Some(item(64, "cobble"))], false))?;
-    let source_initial = interner.intern(store(vec![Some(item(5, "iron"))], false))?;
-    let source_later = interner.intern(store(vec![Some(item(7, "iron"))], false))?;
-    let snapshots = Arc::new(Mutex::new(interner));
+#[derive(Clone, Copy)]
+struct HopperNodes {
+    deadline: NodeId,
+    hopper: NodeId,
+    destination: NodeId,
+    source: NodeId,
+}
 
-    let mut graph = Graph::new(RuntimeConfig::default());
-    let deadline = graph.add_atom_input("hopper.ready_at_ms", 400)?;
-    let hopper = graph.add_atom_input("hopper.inventory", hopper_initial)?;
-    let destination = graph.add_atom_input("destination.inventory", destination_empty)?;
-    let source = graph.add_atom_input("source.inventory", source_initial)?;
+fn print_state(
+    label: &str,
+    graph: &Graph,
+    snapshots: &Arc<Mutex<SnapshotInterner>>,
+    nodes: HopperNodes,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!(
+        "{label}_hopper_quantity={:?}",
+        slot_quantity(snapshots, graph.value_atom(nodes.hopper)?)?
+    );
+    println!(
+        "{label}_destination_quantity={:?}",
+        slot_quantity(snapshots, graph.value_atom(nodes.destination)?)?
+    );
+    println!(
+        "{label}_source_quantity={:?}",
+        slot_quantity(snapshots, graph.value_atom(nodes.source)?)?
+    );
+    println!("{label}_ready_ms={}", graph.value_atom(nodes.deadline)?);
+    Ok(())
+}
 
+fn install_reaction(
+    graph: &mut Graph,
+    program: TransactionProgram,
+    snapshots: Arc<Mutex<SnapshotInterner>>,
+    nodes: HopperNodes,
+    evaluations: Arc<AtomicUsize>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let adapter = TransactionReactionAdapter::new(
         Arc::new(program),
-        Arc::clone(&snapshots),
+        snapshots,
         vec![ReactionStoreBinding {
-            node: hopper,
+            node: nodes.hopper,
             local_handle: 1,
         }],
         Vec::new(),
         Some(ReactionArgument::Store { binding_index: 0 }),
         "quantity",
     )
-    .with_host_preparer(move |_| Ok(host_preparation(destination, source)));
-
-    let evaluations = Arc::new(AtomicUsize::new(0));
-    let observed = Arc::clone(&evaluations);
+    .with_host_preparer(move |_| Ok(host_preparation(nodes.destination, nodes.source)));
     graph.add_reaction("recovered full hopper attempt", move |context| {
-        observed.fetch_add(1, Ordering::Relaxed);
+        evaluations.fetch_add(1, Ordering::Relaxed);
         let now_ms = u64::try_from(context.now().as_nanos() / 1_000_000)
             .map_err(|_| EvalError::Message(String::from("negative simulation time")))?;
-        let ready_at = context.read_atom(deadline)?;
+        let ready_at = context.read_atom(nodes.deadline)?;
         if now_ms < ready_at {
             let delay = i64::try_from(ready_at - now_ms)
                 .map_err(|_| EvalError::Message(String::from("deadline delta overflow")))?;
@@ -201,7 +217,6 @@ fn run(program: TransactionProgram) -> Result<(), Box<dyn std::error::Error>> {
                 delay,
             )));
         }
-
         let result = adapter.execute(context)?;
         let cooldown = cooldown_ticks(&result)?;
         let mut writes = result.writes;
@@ -209,7 +224,7 @@ fn run(program: TransactionProgram) -> Result<(), Box<dyn std::error::Error>> {
             let next = now_ms
                 .checked_add(cooldown.saturating_mul(TICK_MS))
                 .ok_or_else(|| EvalError::Message(String::from("deadline overflow")))?;
-            writes.push(StateWrite::atom(deadline, next));
+            writes.push(StateWrite::atom(nodes.deadline, next));
         }
         Ok(if writes.is_empty() {
             ReactionOutput::idle()
@@ -217,26 +232,51 @@ fn run(program: TransactionProgram) -> Result<(), Box<dyn std::error::Error>> {
             ReactionOutput::immediate(writes)
         })
     })?;
+    Ok(())
+}
+
+fn run(program: TransactionProgram) -> Result<(), Box<dyn std::error::Error>> {
+    let mut interner = SnapshotInterner::new();
+    let hopper_initial = interner.intern(store(
+        vec![Some(item(5, "iron")), None, None, None, None],
+        true,
+    ))?;
+    let hopper_full = interner.intern(store(vec![Some(item(64, "iron")); 5], true))?;
+    let destination_empty = interner.intern(store(vec![None], false))?;
+    let destination_full = interner.intern(store(vec![Some(item(64, "cobble"))], false))?;
+    let source_initial = interner.intern(store(vec![Some(item(5, "iron"))], false))?;
+    let source_later = interner.intern(store(vec![Some(item(7, "iron"))], false))?;
+    let source_newer = interner.intern(store(vec![Some(item(9, "iron"))], false))?;
+    let snapshots = Arc::new(Mutex::new(interner));
+
+    let mut graph = Graph::new(RuntimeConfig::default());
+    let nodes = HopperNodes {
+        deadline: graph.add_atom_input("hopper.ready_at_ms", 400)?,
+        hopper: graph.add_atom_input("hopper.inventory", hopper_initial)?,
+        destination: graph.add_atom_input("destination.inventory", destination_empty)?,
+        source: graph.add_atom_input("source.inventory", source_initial)?,
+    };
+
+    let evaluations = Arc::new(AtomicUsize::new(0));
+    install_reaction(
+        &mut graph,
+        program,
+        Arc::clone(&snapshots),
+        nodes,
+        Arc::clone(&evaluations),
+    )?;
 
     graph.settle()?;
     graph.advance_to(SimTime::from_millis(400))?;
-    println!(
-        "first_hopper_quantity={:?}",
-        slot_quantity(&snapshots, graph.value_atom(hopper)?)?
-    );
-    println!(
-        "first_destination_quantity={:?}",
-        slot_quantity(&snapshots, graph.value_atom(destination)?)?
-    );
-    println!(
-        "first_source_quantity={:?}",
-        slot_quantity(&snapshots, graph.value_atom(source)?)?
-    );
-    println!("first_ready_ms={}", graph.value_atom(deadline)?);
+    print_state("first", &graph, &snapshots, nodes)?;
 
     let after_first = evaluations.load(Ordering::Relaxed);
-    graph.schedule_atom(destination, SimTime::from_millis(500), destination_full)?;
-    graph.schedule_atom(source, SimTime::from_millis(500), source_later)?;
+    graph.schedule_atom(
+        nodes.destination,
+        SimTime::from_millis(500),
+        destination_full,
+    )?;
+    graph.schedule_atom(nodes.source, SimTime::from_millis(500), source_later)?;
     graph.advance_to(SimTime::from_millis(500))?;
     println!(
         "neighbor_changes_woke_during_cooldown={}",
@@ -244,19 +284,35 @@ fn run(program: TransactionProgram) -> Result<(), Box<dyn std::error::Error>> {
     );
 
     graph.advance_to(SimTime::from_millis(800))?;
+    print_state("second", &graph, &snapshots, nodes)?;
+
+    let after_second = evaluations.load(Ordering::Relaxed);
+    graph.schedule_atom(nodes.hopper, SimTime::from_millis(900), hopper_full)?;
+    graph.advance_to(SimTime::from_millis(900))?;
     println!(
-        "second_hopper_quantity={:?}",
-        slot_quantity(&snapshots, graph.value_atom(hopper)?)?
+        "hopper_change_woke_during_cooldown={}",
+        evaluations.load(Ordering::Relaxed) != after_second
     );
+
+    graph.advance_to(SimTime::from_millis(1200))?;
+    let after_full_block = evaluations.load(Ordering::Relaxed);
+    graph.schedule_atom(nodes.source, SimTime::from_millis(1250), source_newer)?;
+    graph.advance_to(SimTime::from_millis(1250))?;
     println!(
-        "second_destination_quantity={:?}",
-        slot_quantity(&snapshots, graph.value_atom(destination)?)?
+        "source_change_woke_while_pull_skipped={}",
+        evaluations.load(Ordering::Relaxed) != after_full_block
     );
+    graph.schedule_atom(
+        nodes.destination,
+        SimTime::from_millis(1260),
+        destination_empty,
+    )?;
+    graph.advance_to(SimTime::from_millis(1260))?;
     println!(
-        "second_source_quantity={:?}",
-        slot_quantity(&snapshots, graph.value_atom(source)?)?
+        "destination_change_woke_ready={}",
+        evaluations.load(Ordering::Relaxed) != after_full_block
     );
-    println!("second_ready_ms={}", graph.value_atom(deadline)?);
+    print_state("third", &graph, &snapshots, nodes)?;
     println!(
         "reaction_evaluations={}",
         evaluations.load(Ordering::Relaxed)

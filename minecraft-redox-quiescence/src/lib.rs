@@ -2,13 +2,16 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    error::Error,
+    fmt,
     sync::{Arc, Mutex},
 };
 
 use minecraft_redox_core::transaction::{
     MemoryTransactionHost, MemoryTransactionHostQuery, MemoryTransactionObject,
-    MemoryTransactionState, MemoryTransactionStore, TransactionDatum, TransactionExecution,
-    TransactionExecutionLimits, TransactionProgram, execute_transaction,
+    MemoryTransactionState, MemoryTransactionStore, TransactionDatum, TransactionDraft,
+    TransactionExecution, TransactionExecutionError, TransactionExecutionLimits, TransactionHost,
+    TransactionProgram, TransactionStoreQueryKind, execute_transaction,
 };
 use quiescence_core::NodeId;
 use quiescence_runtime::{EvalContext, EvalError, StateWrite};
@@ -172,10 +175,203 @@ pub enum ReactionArgument {
 
 #[derive(Clone, Debug, Default)]
 pub struct ReactionHostPreparation {
+    /// Graph-backed stores discoverable during this transaction evaluation.
+    ///
+    /// These bindings are demand-materialized: their atom nodes are read only when execution first
+    /// semantically inspects or mutates the corresponding local handle. Untaken branches therefore
+    /// do not become graph dependencies.
     pub stores: Vec<ReactionStoreBinding>,
     pub objects: BTreeMap<u64, MemoryTransactionObject>,
     pub capabilities: BTreeMap<u64, BTreeSet<String>>,
     pub host_queries: Vec<MemoryTransactionHostQuery>,
+}
+
+#[derive(Debug)]
+enum DemandHostError {
+    NeedStore(u64),
+    Inner(String),
+}
+
+impl fmt::Display for DemandHostError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NeedStore(handle) => {
+                write!(formatter, "transaction requires lazy store {handle}")
+            }
+            Self::Inner(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl Error for DemandHostError {}
+
+struct DemandTransactionHost {
+    inner: MemoryTransactionHost,
+    unresolved_stores: BTreeSet<u64>,
+}
+
+struct DemandTransactionDraft<'a> {
+    inner: <MemoryTransactionHost as TransactionHost>::Draft<'a>,
+    unresolved_stores: &'a BTreeSet<u64>,
+}
+
+impl TransactionHost for DemandTransactionHost {
+    type Error = DemandHostError;
+    type Draft<'a> = DemandTransactionDraft<'a>;
+
+    fn begin(&mut self) -> Result<Self::Draft<'_>, Self::Error> {
+        let unresolved_stores = &self.unresolved_stores;
+        let inner = self.inner.begin().map_err(DemandHostError::Inner)?;
+        Ok(DemandTransactionDraft {
+            inner,
+            unresolved_stores,
+        })
+    }
+}
+
+impl DemandTransactionDraft<'_> {
+    fn require_resolved(&self, value: &TransactionDatum) -> Result<(), DemandHostError> {
+        if let TransactionDatum::Handle(handle) = value
+            && self.unresolved_stores.contains(handle)
+        {
+            return Err(DemandHostError::NeedStore(*handle));
+        }
+        Ok(())
+    }
+}
+
+impl TransactionDraft for DemandTransactionDraft<'_> {
+    type Error = DemandHostError;
+
+    fn has_capability(
+        &self,
+        value: &TransactionDatum,
+        capability: &str,
+    ) -> Result<bool, Self::Error> {
+        self.require_resolved(value)?;
+        self.inner
+            .has_capability(value, capability)
+            .map_err(DemandHostError::Inner)
+    }
+
+    fn clone_value(&mut self, value: &TransactionDatum) -> Result<TransactionDatum, Self::Error> {
+        self.inner
+            .clone_value(value)
+            .map_err(DemandHostError::Inner)
+    }
+
+    fn component(
+        &self,
+        value: &TransactionDatum,
+        component: &str,
+    ) -> Result<TransactionDatum, Self::Error> {
+        self.inner
+            .component(value, component)
+            .map_err(DemandHostError::Inner)
+    }
+
+    fn set_component(
+        &mut self,
+        value: &TransactionDatum,
+        component: &str,
+        new_value: TransactionDatum,
+    ) -> Result<(), Self::Error> {
+        self.inner
+            .set_component(value, component, new_value)
+            .map_err(DemandHostError::Inner)
+    }
+
+    fn semantic_equal(
+        &self,
+        left: &TransactionDatum,
+        right: &TransactionDatum,
+    ) -> Result<bool, Self::Error> {
+        self.inner
+            .semantic_equal(left, right)
+            .map_err(DemandHostError::Inner)
+    }
+
+    fn host_query(
+        &mut self,
+        operation: &str,
+        receiver: Option<&TransactionDatum>,
+        arguments: &[TransactionDatum],
+    ) -> Result<TransactionDatum, Self::Error> {
+        self.inner
+            .host_query(operation, receiver, arguments)
+            .map_err(DemandHostError::Inner)
+    }
+
+    fn store_read(
+        &self,
+        store: &TransactionDatum,
+        key: &[TransactionDatum],
+    ) -> Result<TransactionDatum, Self::Error> {
+        self.require_resolved(store)?;
+        self.inner
+            .store_read(store, key)
+            .map_err(DemandHostError::Inner)
+    }
+
+    fn store_take(
+        &mut self,
+        store: &TransactionDatum,
+        key: &[TransactionDatum],
+        amount: &TransactionDatum,
+    ) -> Result<TransactionDatum, Self::Error> {
+        self.require_resolved(store)?;
+        self.inner
+            .store_take(store, key, amount)
+            .map_err(DemandHostError::Inner)
+    }
+
+    fn store_write(
+        &mut self,
+        store: &TransactionDatum,
+        key: &[TransactionDatum],
+        value: TransactionDatum,
+    ) -> Result<(), Self::Error> {
+        self.require_resolved(store)?;
+        self.inner
+            .store_write(store, key, value)
+            .map_err(DemandHostError::Inner)
+    }
+
+    fn store_touch(&mut self, store: &TransactionDatum) -> Result<(), Self::Error> {
+        self.require_resolved(store)?;
+        self.inner
+            .store_touch(store)
+            .map_err(DemandHostError::Inner)
+    }
+
+    fn store_query(
+        &self,
+        operation: TransactionStoreQueryKind,
+        store: &TransactionDatum,
+        key: &[TransactionDatum],
+        value: Option<&TransactionDatum>,
+        context: &[TransactionDatum],
+    ) -> Result<TransactionDatum, Self::Error> {
+        self.require_resolved(store)?;
+        self.inner
+            .store_query(operation, store, key, value, context)
+            .map_err(DemandHostError::Inner)
+    }
+
+    fn state_write(
+        &mut self,
+        target: &TransactionDatum,
+        state: &str,
+        value: TransactionDatum,
+    ) -> Result<(), Self::Error> {
+        self.inner
+            .state_write(target, state, value)
+            .map_err(DemandHostError::Inner)
+    }
+
+    fn commit(self) -> Result<(), Self::Error> {
+        self.inner.commit().map_err(DemandHostError::Inner)
+    }
 }
 
 type HostPreparer = dyn for<'a> Fn(&EvalContext<'a>) -> Result<ReactionHostPreparation, EvalError>
@@ -256,55 +452,116 @@ impl TransactionReactionAdapter {
             || Ok(ReactionHostPreparation::default()),
             |prepare| prepare(context),
         )?;
-        let mut stores = self.stores.clone();
-        stores.extend(preparation.stores.iter().copied());
-        validate_store_bindings(&stores).map_err(EvalError::Message)?;
-        let snapshot_ids = stores
-            .iter()
-            .map(|binding| context.read_atom(binding.node))
-            .collect::<Result<Vec<_>, _>>()?;
-        let reserved_handle = preparation_reserved_handle(&stores, &preparation);
-        let mut interner = self
-            .interner
-            .lock()
-            .map_err(|_| EvalError::Message(String::from("snapshot interner lock poisoned")))?;
-        let mut host = build_host(
-            &interner,
-            &stores,
+        execute_prepared_transaction(self, context, &preparation)
+    }
+}
+
+fn execute_prepared_transaction(
+    adapter: &TransactionReactionAdapter,
+    context: &EvalContext<'_>,
+    preparation: &ReactionHostPreparation,
+) -> Result<TransactionReactionResult, EvalError> {
+    let mut all_stores = adapter.stores.clone();
+    all_stores.extend(preparation.stores.iter().copied());
+    validate_store_bindings(&all_stores).map_err(EvalError::Message)?;
+    let mut resolved_stores = Vec::new();
+    let mut snapshot_ids = Vec::new();
+    let lazy_stores: BTreeMap<_, _> = all_stores
+        .iter()
+        .map(|binding| (binding.local_handle, *binding))
+        .collect();
+    let reserved_handle = preparation_reserved_handle(&all_stores, preparation);
+    loop {
+        match execute_resolved_transaction(
+            adapter,
+            &resolved_stores,
             &snapshot_ids,
-            &self.quantity_component,
+            &lazy_stores,
             reserved_handle,
-        )
+            preparation,
+        )? {
+            DemandExecution::Complete(result) => return Ok(result),
+            DemandExecution::NeedStore(binding) => {
+                snapshot_ids.push(context.read_atom(binding.node)?);
+                resolved_stores.push(binding);
+            }
+        }
+    }
+}
+
+enum DemandExecution {
+    Complete(TransactionReactionResult),
+    NeedStore(ReactionStoreBinding),
+}
+
+fn execute_resolved_transaction(
+    adapter: &TransactionReactionAdapter,
+    stores: &[ReactionStoreBinding],
+    snapshot_ids: &[u64],
+    lazy_stores: &BTreeMap<u64, ReactionStoreBinding>,
+    reserved_handle: u64,
+    preparation: &ReactionHostPreparation,
+) -> Result<DemandExecution, EvalError> {
+    let mut interner = adapter
+        .interner
+        .lock()
+        .map_err(|_| EvalError::Message(String::from("snapshot interner lock poisoned")))?;
+    let inner = build_host(
+        &interner,
+        stores,
+        snapshot_ids,
+        &adapter.quantity_component,
+        reserved_handle,
+    )
+    .map_err(EvalError::Message)?;
+    let resolved_handles: BTreeSet<_> = stores.iter().map(|binding| binding.local_handle).collect();
+    let unresolved_stores = lazy_stores
+        .keys()
+        .filter(|handle| !resolved_handles.contains(handle))
+        .copied()
+        .collect();
+    let mut host = DemandTransactionHost {
+        inner,
+        unresolved_stores,
+    };
+    apply_preparation(&mut host.inner.state, preparation.clone());
+    let receiver = adapter
+        .receiver
+        .as_ref()
+        .map(|argument| lower_argument(argument, &adapter.stores))
+        .transpose()
         .map_err(EvalError::Message)?;
-        apply_preparation(&mut host.state, preparation);
-        let receiver = self
-            .receiver
-            .as_ref()
-            .map(|argument| lower_argument(argument, &self.stores))
-            .transpose()
-            .map_err(EvalError::Message)?;
-        let arguments = self
-            .arguments
-            .iter()
-            .map(|argument| lower_argument(argument, &self.stores))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(EvalError::Message)?;
-        let execution = execute_transaction(
-            &self.program,
-            &mut host,
-            receiver,
-            arguments,
-            TransactionExecutionLimits::default(),
-        )
-        .map_err(|error| EvalError::Message(error.to_string()))?;
-        let state_values = host.state.state_values.clone();
-        let writes = publish_stores(&mut interner, &stores, &snapshot_ids, &host.state)
-            .map_err(EvalError::Message)?;
-        Ok(TransactionReactionResult {
-            execution,
-            writes,
-            state_values,
-        })
+    let arguments = adapter
+        .arguments
+        .iter()
+        .map(|argument| lower_argument(argument, &adapter.stores))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(EvalError::Message)?;
+    match execute_transaction(
+        &adapter.program,
+        &mut host,
+        receiver,
+        arguments,
+        TransactionExecutionLimits::default(),
+    ) {
+        Ok(execution) => {
+            let state_values = host.inner.state.state_values.clone();
+            let writes = publish_stores(&mut interner, stores, snapshot_ids, &host.inner.state)
+                .map_err(EvalError::Message)?;
+            Ok(DemandExecution::Complete(TransactionReactionResult {
+                execution,
+                writes,
+                state_values,
+            }))
+        }
+        Err(TransactionExecutionError::Host(DemandHostError::NeedStore(handle))) => lazy_stores
+            .get(&handle)
+            .copied()
+            .map(DemandExecution::NeedStore)
+            .ok_or_else(|| {
+                EvalError::Message(format!("transaction requested unknown lazy store {handle}"))
+            }),
+        Err(error) => Err(EvalError::Message(error.to_string())),
     }
 }
 
@@ -657,9 +914,28 @@ mod tests {
         )
     }
 
-    fn idle_program() -> TransactionProgram {
+    fn no_store_access_program() -> TransactionProgram {
         program(
             vec![statement(0, TransactionOperation::Return { value: None })],
+            0,
+        )
+    }
+
+    fn store_read_program() -> TransactionProgram {
+        program(
+            vec![
+                statement(
+                    0,
+                    TransactionOperation::Evaluate {
+                        value: TransactionValue::StoreRead {
+                            store: Box::new(TransactionValue::Parameter { index: 0 }),
+                            key: vec![TransactionValue::Integer { value: 0 }],
+                        },
+                        next: TransactionStatementId(1),
+                    },
+                ),
+                statement(1, TransactionOperation::Return { value: None }),
+            ],
             0,
         )
     }
@@ -703,6 +979,104 @@ mod tests {
                 ],
             }],
         }
+    }
+
+    fn prepared_store_read_program() -> TransactionProgram {
+        TransactionProgram {
+            entry: TransactionFunctionId(0),
+            functions: vec![TransactionFunction {
+                id: TransactionFunctionId(0),
+                parameter_count: 0,
+                local_count: 1,
+                entry_statement: TransactionStatementId(0),
+                statements: vec![
+                    statement(
+                        0,
+                        TransactionOperation::Assign {
+                            target: TransactionLocalId(0),
+                            value: TransactionValue::HostQuery {
+                                operation: String::from("topology.used"),
+                                receiver: None,
+                                arguments: Vec::new(),
+                            },
+                            next: TransactionStatementId(1),
+                        },
+                    ),
+                    statement(
+                        1,
+                        TransactionOperation::Evaluate {
+                            value: TransactionValue::StoreRead {
+                                store: Box::new(TransactionValue::Local {
+                                    local: TransactionLocalId(0),
+                                }),
+                                key: vec![TransactionValue::Integer { value: 0 }],
+                            },
+                            next: TransactionStatementId(2),
+                        },
+                    ),
+                    statement(2, TransactionOperation::Return { value: None }),
+                ],
+            }],
+        }
+    }
+
+    #[test]
+    fn prepared_stores_become_dependencies_only_when_touched()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut interner = SnapshotInterner::new();
+        let first = interner.intern(snapshot(5))?;
+        let second = interner.intern(snapshot(6))?;
+        let interner = Arc::new(Mutex::new(interner));
+        let mut graph = Graph::new(RuntimeConfig::default());
+        let used = graph.add_atom_input("used", first)?;
+        let unused = graph.add_atom_input("unused", first)?;
+        let adapter = TransactionReactionAdapter::new(
+            Arc::new(prepared_store_read_program()),
+            interner,
+            Vec::new(),
+            Vec::new(),
+            None,
+            "quantity",
+        )
+        .with_host_preparer(move |_| {
+            Ok(ReactionHostPreparation {
+                stores: vec![
+                    ReactionStoreBinding {
+                        node: used,
+                        local_handle: 2,
+                    },
+                    ReactionStoreBinding {
+                        node: unused,
+                        local_handle: 3,
+                    },
+                ],
+                host_queries: vec![MemoryTransactionHostQuery {
+                    operation: String::from("topology.used"),
+                    receiver: None,
+                    arguments: Vec::new(),
+                    result: TransactionDatum::Handle(2),
+                    consume: false,
+                }],
+                ..ReactionHostPreparation::default()
+            })
+        });
+        let evaluations = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&evaluations);
+        graph.add_reaction("lazy prepared stores", move |context| {
+            observed.fetch_add(1, Ordering::Relaxed);
+            let result = adapter.execute(context)?;
+            Ok(ReactionOutput::immediate(result.writes))
+        })?;
+
+        graph.settle()?;
+        assert_eq!(evaluations.load(Ordering::Relaxed), 1);
+        graph.schedule_atom(unused, SimTime::from_millis(10), second)?;
+        graph.advance_to(SimTime::from_millis(10))?;
+        assert_eq!(evaluations.load(Ordering::Relaxed), 1);
+        graph.schedule_atom(used, SimTime::from_millis(20), second)?;
+        graph.advance_to(SimTime::from_millis(20))?;
+        assert_eq!(evaluations.load(Ordering::Relaxed), 2);
+        Ok(())
     }
 
     #[test]
@@ -822,6 +1196,32 @@ mod tests {
     }
 
     #[test]
+    fn fixed_store_argument_is_lazy_until_semantically_accessed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut interner = SnapshotInterner::new();
+        let first = interner.intern(snapshot(5))?;
+        let second = interner.intern(snapshot(4))?;
+        let interner = Arc::new(Mutex::new(interner));
+        let mut graph = Graph::new(RuntimeConfig::default());
+        let store = graph.add_atom_input("store", first)?;
+        let adapter = adapter(no_store_access_program(), interner, store);
+        let evaluations = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&evaluations);
+        graph.add_reaction("unused fixed store", move |context| {
+            observed.fetch_add(1, Ordering::Relaxed);
+            let result = adapter.execute(context)?;
+            Ok(ReactionOutput::immediate(result.writes))
+        })?;
+
+        graph.settle()?;
+        assert_eq!(evaluations.load(Ordering::Relaxed), 1);
+        graph.schedule_atom(store, SimTime::from_millis(10), second)?;
+        graph.advance_to(SimTime::from_millis(10))?;
+        assert_eq!(evaluations.load(Ordering::Relaxed), 1);
+        Ok(())
+    }
+
+    #[test]
     fn store_dependency_appears_only_after_deadline() -> Result<(), Box<dyn std::error::Error>> {
         let mut interner = SnapshotInterner::new();
         let first = interner.intern(snapshot(5))?;
@@ -830,7 +1230,7 @@ mod tests {
         let mut graph = Graph::new(RuntimeConfig::default());
         let deadline = graph.add_atom_input("deadline_ms", 100)?;
         let store = graph.add_atom_input("store", first)?;
-        let adapter = adapter(idle_program(), interner, store);
+        let adapter = adapter(store_read_program(), interner, store);
         let evaluations = Arc::new(AtomicUsize::new(0));
         let observed = Arc::clone(&evaluations);
         graph.add_reaction("deadline gated transaction", move |context| {

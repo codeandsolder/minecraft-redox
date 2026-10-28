@@ -223,16 +223,21 @@ Differential execution now exercises the full vanilla attempt ordering rather th
 - **push blocked, pull succeeds:** return `1` after 322 statements; full destination unchanged, Hopper stack `5 -> 6`, discovered source `5 -> 4`, cooldown `8`, Hopper and source touched;
 - **both blocked/full:** return `0` after 146 statements with all stores/state untouched.
 
-The `vanilla_hopper_full` graph example executes that same 428-statement transaction behind the deadline gate. At 400 ms it successfully pushes one item and pulls one item in one activation, leaving Hopper quantity `5`, destination `1`, source `4`, and deadline `800`. At 500 ms both neighboring snapshots are replaced; neither wakes the cooling Hopper. At 800 ms the replacement destination is full, so push is blocked, while the latest source is pulled (`Hopper 5 -> 6`, source `7 -> 6`) and deadline advances to `1200`. The complete run still takes only five reaction evaluations.
+The `vanilla_hopper_full` graph example executes that same 428-statement transaction behind the deadline gate. At 400 ms it successfully pushes one item and pulls one item in one activation, leaving Hopper quantity `5`, destination `1`, source `4`, and deadline `800`. At 500 ms both neighboring snapshots are replaced; neither wakes the cooling Hopper. At 800 ms the replacement destination is full, so push is blocked, while the latest source is pulled (`Hopper 5 -> 6`, source `7 -> 6`) and deadline advances to `1200`. The extended dependency-phase run below adds a third ready-state branch test and finishes in eight reaction evaluations.
 
 ## Missing pieces exposed by vanilla
 
 The current graph runtime proves the scheduling model and now covers the complete vanilla Hopper transfer attempt. The next exactness gaps are at the world/adapter boundary rather than in Hopper control flow:
 
-- make topology-to-store resolution **lazy inside an active transaction**. Prepared neighbor stores are currently read eagerly when the transaction starts, so push and pull candidates both become active-phase dependencies even when source control flow skips one branch. A lazy resolver should materialize/read a graph store only when the transaction first dereferences the semantic handle, preserving branch-level dependency precision as well as cooldown-phase precision;
 - adapter lowering for block/chunk revalidation, chunk policy, and source-time conversion around already-bound transaction/scheduler primitives;
 - production persistent/native store implementations behind the source-neutral transaction host interface; the current memory host is a reference/differential implementation;
 - source/runtime-type evidence for polymorphic world objects and modded subclasses wherever static bytecode alone cannot prove dispatch;
 - preservation of source RNG state/order in dense adapters while bound random draws and emitted callbacks cross the semantic IR boundary.
 
 The important result of this spike is that none of these require reintroducing a global tick loop. They are additions to the causal graph/adapter interface.
+
+
+### Demand-driven graph-store dependencies
+
+All graph-backed transaction stores are now demand-materialized inside the adapter rather than read eagerly at the start of a ready-phase transaction. Merely passing a store handle as the transaction receiver/argument does not inspect its atom. Execution runs against an isolated draft; if a store operation, store query, or capability test first touches an unresolved handle, the draft returns a typed `NeedStore(handle)`, the adapter reads exactly that atom (thereby adding the dependency), discards the partial draft, materializes the store, and restarts the transaction. Source-only host-query consumption and speculative mutations are replay-safe because the abandoned draft never commits. Regressions prove both halves: a fixed store argument that is never semantically accessed does not become a dependency, and among two topology-prepared stores only the store actually touched by the taken branch can wake the reaction later.
+The real full-Hopper graph example exercises that branch precision too. After the second successful attempt, the Hopper snapshot is replaced during cooldown by a completely full five-slot inventory; this does not wake the reaction. At the 1200 ms deadline the full destination blocks push and the full Hopper skips pull, so only the destination remains a resource dependency. Replacing the source at 1250 ms does not wake the ready reaction, while replacing the destination at 1260 ms does. That wake executes the same recovered program: one item is pushed, the newly opened Hopper space then permits a pull from the latest source, and the next deadline becomes 1660 ms.
