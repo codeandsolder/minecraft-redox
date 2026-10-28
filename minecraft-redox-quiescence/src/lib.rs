@@ -121,10 +121,15 @@ impl SnapshotInterner {
 #[derive(Clone, Debug, Default)]
 struct ScheduleKeyInterner {
     ids: BTreeMap<Vec<CanonicalDatumKey>, u64>,
+    identities: BTreeMap<u64, Vec<TransactionDatum>>,
 }
 
 impl ScheduleKeyInterner {
-    fn intern(&mut self, key: Vec<CanonicalDatumKey>) -> Result<u64, String> {
+    fn intern(
+        &mut self,
+        key: Vec<CanonicalDatumKey>,
+        identity: Vec<TransactionDatum>,
+    ) -> Result<u64, String> {
         if let Some(id) = self.ids.get(&key) {
             return Ok(*id);
         }
@@ -135,7 +140,12 @@ impl ScheduleKeyInterner {
             .ok_or_else(|| String::from("schedule key count overflow"))?;
         let id = u64::try_from(next).map_err(|_| String::from("schedule key ID exceeds u64"))?;
         self.ids.insert(key, id);
+        self.identities.insert(id, identity);
         Ok(id)
+    }
+
+    fn identity(&self, key: u64) -> Option<&[TransactionDatum]> {
+        self.identities.get(&key).map(Vec::as_slice)
     }
 }
 
@@ -545,6 +555,20 @@ impl TransactionReactionAdapter {
         self
     }
 
+    /// Recover the stable source identity associated with an interned keyed callback.
+    ///
+    /// # Errors
+    /// Returns an error for an unknown key or a poisoned key interner.
+    pub fn schedule_identity(&self, key: u64) -> Result<Vec<TransactionDatum>, EvalError> {
+        let keys = self
+            .schedule_keys
+            .lock()
+            .map_err(|_| EvalError::Message(String::from("schedule-key interner lock poisoned")))?;
+        keys.identity(key)
+            .map(<[TransactionDatum]>::to_vec)
+            .ok_or_else(|| EvalError::Message(format!("unknown schedule key {key}")))
+    }
+
     #[must_use]
     pub fn interner(&self) -> &Arc<Mutex<SnapshotInterner>> {
         &self.interner
@@ -738,12 +762,19 @@ fn lower_schedule_requests(
                 .as_nanos()
                 .checked_mul(request.delay_units)
                 .ok_or_else(|| EvalError::Message(String::from("schedule delay overflow")))?;
-            let canonical_key = request
+            let identity_parts = request
                 .key
                 .iter()
-                .map(|value| canonical_schedule_datum(adapter, state, value))
+                .map(|value| stable_schedule_datum(adapter, state, value))
                 .collect::<Result<Vec<_>, _>>()?;
-            let key = keys.intern(canonical_key).map_err(EvalError::Message)?;
+            let canonical_key = identity_parts
+                .iter()
+                .map(|(canonical, _)| canonical.clone())
+                .collect();
+            let identity = identity_parts.into_iter().map(|(_, value)| value).collect();
+            let key = keys
+                .intern(canonical_key, identity)
+                .map_err(EvalError::Message)?;
             Ok(TransactionScheduleRequest {
                 key,
                 after: SimDuration::from_nanos(nanos),
@@ -753,29 +784,32 @@ fn lower_schedule_requests(
         .collect()
 }
 
-fn canonical_schedule_datum(
+fn stable_schedule_datum(
     adapter: &TransactionReactionAdapter,
     state: &MemoryTransactionState,
     value: &TransactionDatum,
-) -> Result<CanonicalDatumKey, EvalError> {
-    if let TransactionDatum::Handle(handle) = value {
+) -> Result<(CanonicalDatumKey, TransactionDatum), EvalError> {
+    let stable = if let TransactionDatum::Handle(handle) = value {
         let component = adapter.schedule_identity_component.as_deref().ok_or_else(|| {
             EvalError::Message(format!(
                 "schedule key contains ephemeral handle {handle} without a stable identity component"
             ))
         })?;
-        let identity = state
+        state
             .objects
             .get(handle)
             .and_then(|object| object.components.get(component))
+            .cloned()
             .ok_or_else(|| {
                 EvalError::Message(format!(
                     "schedule key handle {handle} has no stable identity component {component:?}"
                 ))
-            })?;
-        return canonical_datum_key(identity).map_err(EvalError::Message);
-    }
-    canonical_datum_key(value).map_err(EvalError::Message)
+            })?
+    } else {
+        value.clone()
+    };
+    let canonical = canonical_datum_key(&stable).map_err(EvalError::Message)?;
+    Ok((canonical, stable))
 }
 
 fn lower_argument(
@@ -1493,6 +1527,7 @@ mod tests {
             "quantity",
         )
         .with_schedule_unit(SimDuration::from_millis(50));
+        let identity_adapter = adapter.clone();
         let observed = Arc::new(Mutex::new(Vec::new()));
         let captured = Arc::clone(&observed);
         let mut graph = Graph::new(RuntimeConfig::default());
@@ -1514,6 +1549,10 @@ mod tests {
         assert_eq!(observed[0].key, observed[1].key);
         assert_eq!(observed[0].after, SimDuration::from_millis(200));
         assert_eq!(observed[0].priority, -1);
+        assert_eq!(
+            identity_adapter.schedule_identity(observed[0].key)?,
+            vec![TransactionDatum::String(String::from("block:repeater"))]
+        );
         Ok(())
     }
 
@@ -1536,10 +1575,8 @@ mod tests {
         let callback_evaluations = Arc::new(AtomicUsize::new(0));
         let observed_callback = Arc::clone(&callback_evaluations);
         let mut graph = Graph::new(RuntimeConfig::default());
-        let callback = graph.add_reaction("transaction callback target", move |context| {
-            if context.now() != SimTime::ZERO {
-                observed_callback.fetch_add(1, Ordering::Relaxed);
-            }
+        let callback = graph.add_event_callback("transaction callback target", move |_| {
+            observed_callback.fetch_add(1, Ordering::Relaxed);
             Ok(ReactionOutput::idle())
         })?;
         let producer = graph.add_reaction("transaction schedule producer", move |context| {
@@ -1596,6 +1633,7 @@ mod tests {
                 ..ReactionHostPreparation::default()
             })
         });
+        let identity_adapter = adapter.clone();
         let observed = Arc::new(Mutex::new(None));
         let captured = Arc::clone(&observed);
         let mut graph = Graph::new(RuntimeConfig::default());
@@ -1614,6 +1652,12 @@ mod tests {
             .ok_or_else(|| String::from("schedule result missing"))?;
         assert_eq!(scheduled.after, SimDuration::from_millis(200));
         assert_eq!(scheduled.priority, -1);
+        assert_eq!(
+            identity_adapter.schedule_identity(scheduled.key)?,
+            vec![TransactionDatum::String(String::from(
+                "minecraft:unpowered_repeater"
+            ))]
+        );
         Ok(())
     }
 

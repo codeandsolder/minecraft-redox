@@ -147,10 +147,8 @@ fn run(program: TransactionProgram) -> Result<(), Box<dyn std::error::Error>> {
     let observed_requests = Arc::clone(&requests);
     let mut graph = Graph::new(RuntimeConfig::default());
     let callback =
-        graph.add_reaction("recovered repeater updateTick callback", move |context| {
-            if context.now() != SimTime::ZERO {
-                observed_callback.fetch_add(1, Ordering::Relaxed);
-            }
+        graph.add_event_callback("recovered repeater updateTick callback", move |_| {
+            observed_callback.fetch_add(1, Ordering::Relaxed);
             Ok(ReactionOutput::idle())
         })?;
     let producer = graph.add_reaction("recovered repeater neighbor handler", move |context| {
