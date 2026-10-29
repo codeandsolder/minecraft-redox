@@ -152,11 +152,15 @@ impl MemoryTransactionDraft<'_> {
         Ok((store, key))
     }
 
-    fn allocate_object(&mut self, object: MemoryTransactionObject) -> u64 {
+    fn allocate_object(&mut self, object: MemoryTransactionObject) -> Result<u64, String> {
         let handle = self.state.next_handle;
-        self.state.next_handle = self.state.next_handle.saturating_add(1);
+        self.state.next_handle = self
+            .state
+            .next_handle
+            .checked_add(1)
+            .ok_or_else(|| String::from("transaction object handle space exhausted"))?;
         self.state.objects.insert(handle, object);
-        handle
+        Ok(handle)
     }
 }
 
@@ -186,7 +190,7 @@ impl TransactionDraft for MemoryTransactionDraft<'_> {
             .get(handle)
             .cloned()
             .ok_or_else(|| format!("object handle {handle} is missing"))?;
-        Ok(TransactionDatum::Handle(self.allocate_object(object)))
+        Ok(TransactionDatum::Handle(self.allocate_object(object)?))
     }
 
     fn component(
@@ -366,7 +370,7 @@ impl TransactionDraft for MemoryTransactionDraft<'_> {
             TransactionDatum::Integer(amount),
         );
         let source_empty = quantity == amount;
-        let taken_handle = self.allocate_object(taken);
+        let taken_handle = self.allocate_object(taken)?;
         if source_empty {
             let store = self
                 .state
@@ -525,6 +529,34 @@ mod tests {
             result,
             consume,
         }
+    }
+
+    #[test]
+    fn object_handle_exhaustion_is_reported_without_overwriting() -> Result<(), String> {
+        let mut host = MemoryTransactionHost {
+            state: MemoryTransactionState {
+                objects: [(
+                    0,
+                    MemoryTransactionObject {
+                        components: BTreeMap::new(),
+                        semantic_tag: None,
+                    },
+                )]
+                .into_iter()
+                .collect(),
+                next_handle: u64::MAX,
+                ..MemoryTransactionState::default()
+            },
+            quantity_component: String::from("quantity"),
+            max_quantity_component: String::from("max_quantity"),
+        };
+        let mut draft = host.begin()?;
+        let error = draft
+            .clone_value(&TransactionDatum::Handle(0))
+            .expect_err("exhausted handle space must be rejected");
+        assert_eq!(error, "transaction object handle space exhausted");
+        assert_eq!(draft.state.objects.len(), 1);
+        Ok(())
     }
 
     #[test]
