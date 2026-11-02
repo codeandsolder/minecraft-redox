@@ -549,9 +549,8 @@ mod tests {
             max_quantity_component: String::from("max_quantity"),
         };
         let mut draft = host.begin()?;
-        let error = match draft.clone_value(&TransactionDatum::Handle(0)) {
-            Err(error) => error,
-            Ok(_) => return Err(String::from("exhausted handle space was accepted")),
+        let Err(error) = draft.clone_value(&TransactionDatum::Handle(0)) else {
+            return Err(String::from("exhausted handle space was accepted"));
         };
         assert_eq!(error, "transaction object handle space exhausted");
         assert_eq!(draft.state.objects.len(), 1);
