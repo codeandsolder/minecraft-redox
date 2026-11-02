@@ -40,7 +40,7 @@ fn pack_position([x, y, z]: [i32; 3]) -> Result<u64, io::Error> {
     Ok(x | (y << 4) | (z << 8))
 }
 
-fn unpack_position(token: u64) -> [u64; 3] {
+const fn unpack_position(token: u64) -> [u64; 3] {
     [token & 15, (token >> 4) & 15, (token >> 8) & 15]
 }
 

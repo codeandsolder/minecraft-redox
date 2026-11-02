@@ -118,12 +118,12 @@ impl SnapshotInterner {
     }
 
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.snapshots.len()
     }
 
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.snapshots.is_empty()
     }
 }
@@ -760,7 +760,7 @@ impl TransactionReactionAdapter {
     }
 
     #[must_use]
-    pub fn with_schedule_unit(mut self, unit: SimDuration) -> Self {
+    pub const fn with_schedule_unit(mut self, unit: SimDuration) -> Self {
         self.schedule_unit = Some(unit);
         self
     }
@@ -786,7 +786,7 @@ impl TransactionReactionAdapter {
     }
 
     #[must_use]
-    pub fn interner(&self) -> &Arc<Mutex<SnapshotInterner>> {
+    pub const fn interner(&self) -> &Arc<Mutex<SnapshotInterner>> {
         &self.interner
     }
 
@@ -990,18 +990,22 @@ fn execute_resolved_transaction(
     preparation: &ReactionHostPreparation,
     invocation: InvocationBindings<'_>,
 ) -> Result<DemandExecution, EvalError> {
-    let mut interner = adapter
-        .interner
-        .lock()
-        .map_err(|_| EvalError::Message(String::from("snapshot interner lock poisoned")))?;
-    let inner = build_host(
-        &interner,
-        stores,
-        snapshot_ids,
-        &adapter.quantity_component,
-        reserved_handle,
-    )
-    .map_err(EvalError::Message)?;
+    let inner = {
+        let interner = adapter
+            .interner
+            .lock()
+            .map_err(|_| EvalError::Message(String::from("snapshot interner lock poisoned")))?;
+        let inner = build_host(
+            &interner,
+            stores,
+            snapshot_ids,
+            &adapter.quantity_component,
+            reserved_handle,
+        )
+        .map_err(EvalError::Message)?;
+        drop(interner);
+        inner
+    };
     let resolved_handles: BTreeSet<_> = stores.iter().map(|binding| binding.local_handle).collect();
     let unresolved_stores = lazy_stores
         .keys()
@@ -1034,8 +1038,15 @@ fn execute_resolved_transaction(
         Ok(execution) => {
             let state_values = host.inner.state.state_values.clone();
             let performed_host_calls = host.inner.state.performed_host_calls.clone();
-            let mut writes = publish_stores(&mut interner, stores, snapshot_ids, &host.inner.state)
-                .map_err(EvalError::Message)?;
+            let mut writes = {
+                let mut interner = adapter.interner.lock().map_err(|_| {
+                    EvalError::Message(String::from("snapshot interner lock poisoned"))
+                })?;
+                let writes = publish_stores(&mut interner, stores, snapshot_ids, &host.inner.state)
+                    .map_err(EvalError::Message)?;
+                drop(interner);
+                writes
+            };
             writes.extend(publish_host_calls(adapter, &performed_host_calls)?);
             let schedule_requests = lower_schedule_requests(
                 adapter,
@@ -1424,12 +1435,10 @@ mod tests {
 
     fn stack(quantity: i64) -> CanonicalValueSnapshot {
         CanonicalValueSnapshot {
-            components: [(
+            components: BTreeMap::from([(
                 String::from("quantity"),
                 TransactionDatum::Integer(quantity),
-            )]
-            .into_iter()
-            .collect(),
+            )]),
             semantic_tag: Some(String::from("test_item")),
         }
     }
@@ -1791,18 +1800,21 @@ mod tests {
 
         let snapshot_id = graph.value_atom(source)?;
         assert_ne!(snapshot_id, initial);
-        let snapshots = interner
-            .lock()
-            .map_err(|_| String::from("snapshot interner lock poisoned"))?;
-        let snapshot = snapshots
-            .get(snapshot_id)
-            .ok_or_else(|| String::from("published snapshot missing"))?;
-        assert_eq!(
-            snapshot.slots[0]
-                .as_ref()
-                .and_then(|value| value.components.get("quantity")),
-            Some(&TransactionDatum::Integer(4))
-        );
+        {
+            let snapshots = interner
+                .lock()
+                .map_err(|_| String::from("snapshot interner lock poisoned"))?;
+            let snapshot = snapshots
+                .get(snapshot_id)
+                .ok_or_else(|| String::from("published snapshot missing"))?;
+            assert_eq!(
+                snapshot.slots[0]
+                    .as_ref()
+                    .and_then(|value| value.components.get("quantity")),
+                Some(&TransactionDatum::Integer(4))
+            );
+            drop(snapshots);
+        }
         Ok(())
     }
 
@@ -2139,20 +2151,16 @@ mod tests {
         .with_schedule_identity_component("semantic_id")
         .with_host_preparer(|_| {
             Ok(ReactionHostPreparation {
-                objects: [(
+                objects: BTreeMap::from([(
                     99,
                     MemoryTransactionObject {
-                        components: [(
+                        components: BTreeMap::from([(
                             String::from("semantic_id"),
                             TransactionDatum::String(String::from("minecraft:unpowered_repeater")),
-                        )]
-                        .into_iter()
-                        .collect(),
+                        )]),
                         semantic_tag: None,
                     },
-                )]
-                .into_iter()
-                .collect(),
+                )]),
                 ..ReactionHostPreparation::default()
             })
         });

@@ -220,11 +220,11 @@ enum StorageLocation {
     Local(String),
     StaticField(JimpleFieldSignature),
     InstanceField {
-        base: Box<StorageLocation>,
+        base: Box<Self>,
         field: JimpleFieldSignature,
     },
     ArrayElement {
-        base: Box<StorageLocation>,
+        base: Box<Self>,
         index: i64,
     },
 }
@@ -259,54 +259,54 @@ pub enum SymbolicValue {
         field: JimpleFieldSignature,
     },
     InstanceField {
-        base: Box<SymbolicValue>,
+        base: Box<Self>,
         field: JimpleFieldSignature,
     },
     ArrayElement {
-        base: Box<SymbolicValue>,
-        index: Box<SymbolicValue>,
+        base: Box<Self>,
+        index: Box<Self>,
     },
     Binary {
         operator: String,
-        left: Box<SymbolicValue>,
-        right: Box<SymbolicValue>,
+        left: Box<Self>,
+        right: Box<Self>,
     },
     Cast {
         type_name: String,
-        value: Box<SymbolicValue>,
+        value: Box<Self>,
     },
     InstanceOf {
-        value: Box<SymbolicValue>,
+        value: Box<Self>,
         check_type: String,
     },
     Unary {
         operator: String,
-        value: Box<SymbolicValue>,
+        value: Box<Self>,
     },
     ArrayLength {
-        value: Box<SymbolicValue>,
+        value: Box<Self>,
     },
     New {
         class_type: String,
     },
     NewArray {
         element_type: String,
-        size: Box<SymbolicValue>,
+        size: Box<Self>,
     },
     NewMultiArray {
         array_type: String,
-        sizes: Vec<SymbolicValue>,
+        sizes: Vec<Self>,
     },
     Phi {
-        values: Vec<SymbolicValue>,
+        values: Vec<Self>,
     },
     Piecewise {
         arms: Vec<SymbolicPiecewiseArm>,
     },
     Invoke {
         method: JimpleMethodSignature,
-        base: Option<Box<SymbolicValue>>,
-        arguments: Vec<SymbolicValue>,
+        base: Option<Box<Self>>,
+        arguments: Vec<Self>,
     },
     Unknown {
         type_name: String,
@@ -343,7 +343,7 @@ struct PiecewisePathState {
 }
 
 impl PiecewisePathState {
-    fn new(statement_id: usize) -> Self {
+    const fn new(statement_id: usize) -> Self {
         Self {
             statement_id,
             value: None,
@@ -735,15 +735,15 @@ impl JimpleMethod {
                 .iter()
                 .filter(|write| fixed_loop.statement_ids.contains(&write.statement_id))
             {
-                let target = match &write.receiver {
-                    Some(receiver) => SymbolicValue::InstanceField {
+                let target = write.receiver.as_ref().map_or_else(
+                    || SymbolicValue::StaticField {
+                        field: write.field.clone(),
+                    },
+                    |receiver| SymbolicValue::InstanceField {
                         base: Box::new(receiver.clone()),
                         field: write.field.clone(),
                     },
-                    None => SymbolicValue::StaticField {
-                        field: write.field.clone(),
-                    },
-                };
+                );
                 let Some((multiplier, addend)) =
                     affine_recurrence_for_target(&target, &write.value)
                 else {
@@ -2542,7 +2542,7 @@ pub(super) fn substitute_symbolic(
     }
 }
 
-fn operation_definition(operation: &JimpleOperation) -> Option<&JimpleValue> {
+const fn operation_definition(operation: &JimpleOperation) -> Option<&JimpleValue> {
     match operation {
         JimpleOperation::Assign { left, .. } | JimpleOperation::Identity { left, .. } => Some(left),
         _ => None,
@@ -2703,11 +2703,11 @@ pub enum AbstractValue {
     Lambda {
         handle_kind: String,
         target: JimpleMethodSignature,
-        captures: Vec<AbstractValue>,
+        captures: Vec<Self>,
     },
     Sequence {
         element_type: String,
-        values: Vec<AbstractValue>,
+        values: Vec<Self>,
     },
     Null,
     Parameter {
@@ -2721,28 +2721,28 @@ pub enum AbstractValue {
         field: JimpleFieldSignature,
     },
     InstanceField {
-        base: Box<AbstractValue>,
+        base: Box<Self>,
         field: JimpleFieldSignature,
     },
     ArrayElement {
-        base: Box<AbstractValue>,
-        index: Box<AbstractValue>,
+        base: Box<Self>,
+        index: Box<Self>,
     },
     Binary {
         operator: String,
-        left: Box<AbstractValue>,
-        right: Box<AbstractValue>,
+        left: Box<Self>,
+        right: Box<Self>,
     },
     Cast {
         type_name: String,
-        value: Box<AbstractValue>,
+        value: Box<Self>,
     },
     Unary {
         operator: String,
-        value: Box<AbstractValue>,
+        value: Box<Self>,
     },
     ArrayLength {
-        value: Box<AbstractValue>,
+        value: Box<Self>,
     },
     ObjectRef {
         id: u64,
@@ -2754,8 +2754,8 @@ pub enum AbstractValue {
     },
     Invoke {
         method: JimpleMethodSignature,
-        base: Option<Box<AbstractValue>>,
-        arguments: Vec<AbstractValue>,
+        base: Option<Box<Self>>,
+        arguments: Vec<Self>,
     },
     Unknown {
         type_name: String,
@@ -3299,7 +3299,7 @@ fn abstract_array_identity(value: &AbstractValue) -> Option<AbstractArrayIdentit
     }
 }
 
-fn abstract_truth(value: &AbstractValue) -> Option<bool> {
+const fn abstract_truth(value: &AbstractValue) -> Option<bool> {
     match value {
         AbstractValue::Integer { value } => Some(*value != 0),
         _ => None,
@@ -3333,21 +3333,21 @@ fn java_integer_cast(type_name: &str, value: i64) -> i64 {
     }
 }
 
-fn low_i8(value: i64) -> i8 {
+const fn low_i8(value: i64) -> i8 {
     i8::from_le_bytes([value.to_le_bytes()[0]])
 }
 
-fn low_i16(value: i64) -> i16 {
+const fn low_i16(value: i64) -> i16 {
     let bytes = value.to_le_bytes();
     i16::from_le_bytes([bytes[0], bytes[1]])
 }
 
-fn low_u16(value: i64) -> u16 {
+const fn low_u16(value: i64) -> u16 {
     let bytes = value.to_le_bytes();
     u16::from_le_bytes([bytes[0], bytes[1]])
 }
 
-fn low_i32(value: i64) -> i32 {
+const fn low_i32(value: i64) -> i32 {
     let bytes = value.to_le_bytes();
     i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
@@ -3418,7 +3418,7 @@ fn abstract_reference_equal(left: &AbstractValue, right: &AbstractValue) -> Opti
     }
 }
 
-fn abstract_definitely_non_null(value: &AbstractValue) -> bool {
+const fn abstract_definitely_non_null(value: &AbstractValue) -> bool {
     matches!(
         value,
         AbstractValue::ObjectRef { .. }

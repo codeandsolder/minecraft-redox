@@ -14,7 +14,7 @@ use quiescence_runtime::{EvalError, Graph, ReactionOutput, RuntimeConfig, StateW
 
 const TICK_MS: i64 = 50;
 
-fn datum_integer(value: i64) -> TransactionDatum {
+const fn datum_integer(value: i64) -> TransactionDatum {
     TransactionDatum::Integer(value)
 }
 
@@ -38,7 +38,7 @@ fn stack(item: &str, quantity: i64) -> CanonicalValueSnapshot {
 fn empty_destination() -> CanonicalStoreSnapshot {
     CanonicalStoreSnapshot {
         slots: vec![None; 5],
-        capabilities: [String::from("transfer_cooldown")].into_iter().collect(),
+        capabilities: BTreeSet::from([String::from("transfer_cooldown")]),
         allows_read: true,
         allows_write: true,
     }
@@ -170,27 +170,32 @@ fn run(program: TransactionProgram) -> Result<(), Box<dyn std::error::Error>> {
 
     let source_after = graph.value_atom(source_node)?;
     let destination_after = graph.value_atom(destination_node)?;
-    let interner = snapshots
-        .lock()
-        .map_err(|_| io::Error::other("snapshot interner lock poisoned"))?;
-    let source = interner
-        .get(source_after)
-        .ok_or_else(|| io::Error::other("source snapshot missing"))?;
-    let destination = interner
-        .get(destination_after)
-        .ok_or_else(|| io::Error::other("destination snapshot missing"))?;
+    let canonical_snapshots = {
+        let interner = snapshots
+            .lock()
+            .map_err(|_| io::Error::other("snapshot interner lock poisoned"))?;
+        let source = interner
+            .get(source_after)
+            .ok_or_else(|| io::Error::other("source snapshot missing"))?;
+        let destination = interner
+            .get(destination_after)
+            .ok_or_else(|| io::Error::other("destination snapshot missing"))?;
 
-    println!("source_snapshot={source_after}");
-    println!("destination_snapshot={destination_after}");
-    println!(
-        "source_quantity={}",
-        quantity(source, 0).unwrap_or_default()
-    );
-    println!(
-        "destination_quantity={}",
-        quantity(destination, 0).unwrap_or_default()
-    );
+        println!("source_snapshot={source_after}");
+        println!("destination_snapshot={destination_after}");
+        println!(
+            "source_quantity={}",
+            quantity(source, 0).unwrap_or_default()
+        );
+        println!(
+            "destination_quantity={}",
+            quantity(destination, 0).unwrap_or_default()
+        );
+        let canonical_snapshots = interner.len();
+        drop(interner);
+        canonical_snapshots
+    };
     println!("next_ready_ms={}", graph.value_atom(ready_at_ms)?);
-    println!("canonical_snapshots={}", interner.len());
+    println!("canonical_snapshots={canonical_snapshots}");
     Ok(())
 }

@@ -33,7 +33,7 @@ const STONE_STATE: u64 = 3;
 const CHUNK_UNAVAILABLE: u64 = 0;
 const CHUNK_AVAILABLE: u64 = 1;
 
-fn integer(value: i64) -> TransactionDatum {
+const fn integer(value: i64) -> TransactionDatum {
     TransactionDatum::Integer(value)
 }
 

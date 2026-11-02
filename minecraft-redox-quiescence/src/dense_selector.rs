@@ -147,7 +147,7 @@ impl AffineBitSelector {
     ///
     /// Rejects shifts outside the Java `int` width and negative masks.
     pub fn new(state: i32, spec: AffineBitSelectorSpec) -> Result<Self, AffineBitSelectorError> {
-        for shift in [spec.pre_shift].into_iter().chain(spec.component_shifts) {
+        for shift in std::iter::once(spec.pre_shift).chain(spec.component_shifts) {
             if shift >= i32::BITS {
                 return Err(AffineBitSelectorError::ShiftOutOfRange(shift));
             }
