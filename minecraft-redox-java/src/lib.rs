@@ -39,43 +39,43 @@ pub struct JavaInventory {
 pub enum JavaExpression {
     Reference(String),
     FieldAccess {
-        receiver: Box<JavaExpression>,
+        receiver: Box<Self>,
         field: String,
     },
     Array {
         element_type: Option<String>,
-        elements: Vec<JavaExpression>,
-        dimensions: Vec<JavaExpression>,
+        elements: Vec<Self>,
+        dimensions: Vec<Self>,
     },
     ArrayAccess {
-        array: Box<JavaExpression>,
-        index: Box<JavaExpression>,
+        array: Box<Self>,
+        index: Box<Self>,
     },
     Cast {
         type_name: String,
-        value: Box<JavaExpression>,
+        value: Box<Self>,
     },
     Literal(String),
     Call {
-        receiver: Option<Box<JavaExpression>>,
+        receiver: Option<Box<Self>>,
         method: String,
-        arguments: Vec<JavaExpression>,
+        arguments: Vec<Self>,
     },
     New {
         type_name: String,
-        arguments: Vec<JavaExpression>,
+        arguments: Vec<Self>,
     },
     Binary {
-        left: Box<JavaExpression>,
+        left: Box<Self>,
         operator: String,
-        right: Box<JavaExpression>,
+        right: Box<Self>,
     },
     Conditional {
-        condition: Box<JavaExpression>,
-        when_true: Box<JavaExpression>,
-        when_false: Box<JavaExpression>,
+        condition: Box<Self>,
+        when_true: Box<Self>,
+        when_false: Box<Self>,
     },
-    Parenthesized(Box<JavaExpression>),
+    Parenthesized(Box<Self>),
     Raw(String),
 }
 
@@ -311,7 +311,7 @@ impl JavaProjectIndex {
     }
 
     #[must_use]
-    pub fn method_count(&self) -> usize {
+    pub const fn method_count(&self) -> usize {
         self.methods.len()
     }
 
@@ -1127,7 +1127,7 @@ fn qualified_reference_name(expression: &JavaExpression) -> Option<String> {
     match expression {
         JavaExpression::Reference(reference) => Some(reference.clone()),
         JavaExpression::FieldAccess { receiver, field } => {
-            Some(format!("{}.{}", qualified_reference_name(receiver)?, field))
+            Some(format!("{}.{field}", qualified_reference_name(receiver)?))
         }
         JavaExpression::Parenthesized(inner) => qualified_reference_name(inner),
         _ => None,
@@ -1409,7 +1409,7 @@ fn enclosing_type_name(node: Node<'_>, source: &str, bindings: &JavaBindings) ->
         bindings
             .package
             .as_ref()
-            .map_or(owner.clone(), |package| format!("{package}.{owner}")),
+            .map_or_else(|| owner.clone(), |package| format!("{package}.{owner}")),
     )
 }
 

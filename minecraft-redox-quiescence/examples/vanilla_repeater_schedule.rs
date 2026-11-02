@@ -17,7 +17,7 @@ use minecraft_redox_quiescence::{
 use quiescence_core::{SimDuration, SimTime};
 use quiescence_runtime::{EvalError, Graph, ReactionOutput, RuntimeConfig, interaction_channel};
 
-fn integer(value: i64) -> TransactionDatum {
+const fn integer(value: i64) -> TransactionDatum {
     TransactionDatum::Integer(value)
 }
 
@@ -181,16 +181,19 @@ fn run(program: TransactionProgram) -> Result<(), Box<dyn std::error::Error>> {
     graph.advance_to(SimTime::from_millis(200))?;
     let callbacks_at_200 = callback_evaluations.load(Ordering::Relaxed);
 
-    let requests = requests
-        .lock()
-        .map_err(|_| io::Error::other("request capture lock poisoned"))?;
-    let [first, duplicate] = requests.as_slice() else {
-        return Err(io::Error::other("expected two source schedule requests").into());
-    };
-    println!("first_key={}", first.key);
-    println!("duplicate_key={}", duplicate.key);
-    println!("delay_ms={}", first.after.as_nanos() / 1_000_000);
-    println!("priority={}", first.priority);
+    {
+        let requests = requests
+            .lock()
+            .map_err(|_| io::Error::other("request capture lock poisoned"))?;
+        let [first, duplicate] = requests.as_slice() else {
+            return Err(io::Error::other("expected two source schedule requests").into());
+        };
+        println!("first_key={}", first.key);
+        println!("duplicate_key={}", duplicate.key);
+        println!("delay_ms={}", first.after.as_nanos() / 1_000_000);
+        println!("priority={}", first.priority);
+        drop(requests);
+    }
     println!("producer_evaluations_at_50ms={producers_at_50}");
     println!("callback_evaluations_at_50ms={callbacks_at_50}");
     println!("callback_evaluations_at_199ms={callbacks_at_199}");

@@ -22,7 +22,7 @@ pub enum TransactionDatum {
     Boolean(bool),
     String(String),
     Null,
-    Sequence(Vec<TransactionDatum>),
+    Sequence(Vec<Self>),
     Handle(u64),
 }
 
@@ -238,7 +238,7 @@ impl<E: fmt::Display> fmt::Display for TransactionExecutionError<E> {
 impl<E: Error + 'static> Error for TransactionExecutionError<E> {}
 
 impl<E> TransactionExecutionError<E> {
-    fn host(error: E) -> Self {
+    const fn host(error: E) -> Self {
         Self::Host(error)
     }
 }
@@ -344,8 +344,8 @@ impl<D: TransactionDraft> Executor<'_, D> {
                 .find(|statement| statement.id == pc)
                 .ok_or_else(|| {
                     TransactionExecutionError::InvalidProgram(format!(
-                        "statement {:?} missing from function {:?}",
-                        pc, function.id
+                        "statement {pc:?} missing from function {:?}",
+                        function.id
                     ))
                 })?;
             match &statement.operation {
@@ -769,7 +769,7 @@ impl<D: TransactionDraft> Executor<'_, D> {
         Ok(())
     }
 
-    fn bump_step(&mut self) -> Result<(), TransactionExecutionError<D::Error>> {
+    const fn bump_step(&mut self) -> Result<(), TransactionExecutionError<D::Error>> {
         if self.steps >= self.limits.max_steps {
             return Err(TransactionExecutionError::StepLimit {
                 limit: self.limits.max_steps,

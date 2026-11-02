@@ -22,7 +22,7 @@ pub struct JimpleProgram {
     methods: Vec<JimpleMethod>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct JimpleEffectCallFrame {
     pub caller: JimpleMethodSignature,
     pub statement_id: usize,
@@ -1165,7 +1165,7 @@ fn unique_pure_value_binding(
     Some(binding)
 }
 
-fn pure_value_shape_matches(
+const fn pure_value_shape_matches(
     operation: &JimplePureValueOperation,
     call: &JimpleProgramCall,
 ) -> bool {
@@ -1416,7 +1416,7 @@ pub struct ProgramExecution {
 
 impl JimpleProgram {
     #[must_use]
-    pub fn new(methods: Vec<JimpleMethod>) -> Self {
+    pub const fn new(methods: Vec<JimpleMethod>) -> Self {
         Self { methods }
     }
 
@@ -2521,9 +2521,9 @@ fn capture_path_outcome(result: Result<ExecutionHalt>) -> Result<PathOutcome> {
     match result {
         Ok(ExecutionHalt::Reached(frame)) => Ok(PathOutcome::Reached(frame)),
         Ok(ExecutionHalt::Returned(value)) => Ok(PathOutcome::Returned(value)),
-        Err(error) => match error.downcast_ref::<PathThrow>() {
-            Some(thrown) => Ok(PathOutcome::Thrown(thrown.0.clone())),
-            None => Err(error),
+        Err(error) => match error.downcast::<PathThrow>() {
+            Ok(thrown) => Ok(PathOutcome::Thrown(thrown.0)),
+            Err(error) => Err(error),
         },
     }
 }
@@ -2724,18 +2724,16 @@ impl<'a> ProgramVm<'a> {
         let statement_id = statement.id;
         if self.path_splits >= self.max_path_splits {
             bail!(
-                "interprocedural Jimple execution exceeded {} unknown branch splits at {} statement {}: {condition:?}",
+                "interprocedural Jimple execution exceeded {} unknown branch splits at {} statement {statement_id}: {condition:?}",
                 self.max_path_splits,
-                method.display_signature,
-                statement_id
+                method.display_signature
             );
         }
         if self.branch_depth >= self.max_branch_depth {
             bail!(
-                "interprocedural Jimple execution exceeded {} nested unknown branches at {} statement {}: {condition:?}",
+                "interprocedural Jimple execution exceeded {} nested unknown branches at {} statement {statement_id}: {condition:?}",
                 self.max_branch_depth,
-                method.display_signature,
-                statement_id
+                method.display_signature
             );
         }
 
@@ -2829,9 +2827,8 @@ impl<'a> ProgramVm<'a> {
                         &method.signature.return_type,
                     )))),
                     _ => bail!(
-                        "unknown branch at {} statement {} has incompatible normal return shapes",
-                        method.display_signature,
-                        statement_id
+                        "unknown branch at {} statement {statement_id} has incompatible normal return shapes",
+                        method.display_signature
                     ),
                 }
             }
@@ -2853,9 +2850,8 @@ impl<'a> ProgramVm<'a> {
             }
             (Some(_), PathOutcome::Reached(_), PathOutcome::Returned(_))
             | (Some(_), PathOutcome::Returned(_), PathOutcome::Reached(_)) => bail!(
-                "post-dominator analysis disagreed with return flow at {} statement {}",
-                method.display_signature,
-                statement_id
+                "post-dominator analysis disagreed with return flow at {} statement {statement_id}",
+                method.display_signature
             ),
             (None, PathOutcome::Reached(_), _) | (None, _, PathOutcome::Reached(_)) => {
                 bail!("branch execution reached a stop without a post-dominator")
@@ -2871,7 +2867,7 @@ impl<'a> ProgramVm<'a> {
         depth: usize,
         allocation_floor: u64,
         stop_before: Option<usize>,
-    ) -> Result<(ProgramVm<'a>, PathOutcome)> {
+    ) -> Result<(Self, PathOutcome)> {
         let mut branch = self.clone();
         branch.state.next_id = branch.state.next_id.max(allocation_floor);
         branch.path_splits = branch.path_splits.saturating_add(1);
@@ -2888,8 +2884,8 @@ impl<'a> ProgramVm<'a> {
 
     fn adopt_joined_branches(
         &mut self,
-        false_vm: &ProgramVm<'a>,
-        true_vm: &ProgramVm<'a>,
+        false_vm: &Self,
+        true_vm: &Self,
         original_unresolved: &[AbstractArrayWrite],
     ) {
         self.state = join_execution_states(&false_vm.state, &true_vm.state);
@@ -2934,8 +2930,8 @@ impl<'a> ProgramVm<'a> {
         &mut self,
         base_steps: usize,
         base_splits: usize,
-        false_vm: &ProgramVm<'a>,
-        true_vm: &ProgramVm<'a>,
+        false_vm: &Self,
+        true_vm: &Self,
         method: &JimpleMethod,
         statement_id: usize,
     ) -> Result<()> {
@@ -2944,10 +2940,9 @@ impl<'a> ProgramVm<'a> {
             .saturating_add(true_vm.steps.saturating_sub(base_steps));
         if joined_steps > self.max_steps {
             bail!(
-                "interprocedural Jimple execution exceeded {} steps while exploring unknown branch at {} statement {}",
+                "interprocedural Jimple execution exceeded {} steps while exploring unknown branch at {} statement {statement_id}",
                 self.max_steps,
-                method.display_signature,
-                statement_id
+                method.display_signature
             );
         }
         let nested_split_baseline = base_splits.saturating_add(1);
@@ -2956,10 +2951,9 @@ impl<'a> ProgramVm<'a> {
             .saturating_add(true_vm.path_splits.saturating_sub(nested_split_baseline));
         if joined_splits > self.max_path_splits {
             bail!(
-                "interprocedural Jimple execution exceeded {} unknown branch splits while exploring {} statement {}",
+                "interprocedural Jimple execution exceeded {} unknown branch splits while exploring {} statement {statement_id}",
                 self.max_path_splits,
-                method.display_signature,
-                statement_id
+                method.display_signature
             );
         }
         self.steps = joined_steps;
@@ -2967,11 +2961,7 @@ impl<'a> ProgramVm<'a> {
         Ok(())
     }
 
-    fn adopt_normal_branch(
-        &mut self,
-        branch: ProgramVm<'a>,
-        original_unresolved: Vec<AbstractArrayWrite>,
-    ) {
+    fn adopt_normal_branch(&mut self, branch: Self, original_unresolved: Vec<AbstractArrayWrite>) {
         self.state = branch.state;
         self.maps = branch.maps;
         self.lists = branch.lists;
@@ -4278,7 +4268,7 @@ fn simplify_boolean_connective(
     }
 }
 
-fn symbolic_boolean_constant(value: &SymbolicValue) -> Option<bool> {
+const fn symbolic_boolean_constant(value: &SymbolicValue) -> Option<bool> {
     let SymbolicValue::Integer { value, .. } = value else {
         return None;
     };
@@ -4520,7 +4510,7 @@ fn join_frames(left: &Frame, right: &Frame) -> Frame {
                 right.locals.get(&name),
                 &format!("local {name}"),
             )
-            .unwrap_or(AbstractValue::Unknown {
+            .unwrap_or_else(|| AbstractValue::Unknown {
                 type_name: String::from("java.lang.Object"),
                 text: format!("branch-dependent local {name}"),
             });
@@ -4536,7 +4526,7 @@ fn join_frames(left: &Frame, right: &Frame) -> Frame {
                 right.arguments.get(index),
                 &format!("argument {index}"),
             )
-            .unwrap_or(AbstractValue::Unknown {
+            .unwrap_or_else(|| AbstractValue::Unknown {
                 type_name: String::from("java.lang.Object"),
                 text: format!("branch-dependent argument {index}"),
             })
@@ -5063,11 +5053,11 @@ fn object_binary(
     abstract_binary(operator, left, right, type_name)
 }
 
-fn reference_comparable(left: &AbstractValue, right: &AbstractValue) -> bool {
+const fn reference_comparable(left: &AbstractValue, right: &AbstractValue) -> bool {
     concrete_reference(left) && concrete_reference(right)
 }
 
-fn concrete_reference(value: &AbstractValue) -> bool {
+const fn concrete_reference(value: &AbstractValue) -> bool {
     matches!(
         value,
         AbstractValue::ObjectRef { .. } | AbstractValue::ArrayRef { .. } | AbstractValue::Null

@@ -22,7 +22,7 @@ use quiescence_runtime::{
 const TICK_MS: u64 = 50;
 const COORDINATES: [i64; 3] = [10, 21, 30];
 
-fn datum_integer(value: i64) -> TransactionDatum {
+const fn datum_integer(value: i64) -> TransactionDatum {
     TransactionDatum::Integer(value)
 }
 
@@ -112,20 +112,25 @@ fn snapshot_quantity(
     snapshots: &Arc<Mutex<SnapshotInterner>>,
     id: u64,
 ) -> Result<i64, Box<dyn std::error::Error>> {
-    let snapshots = snapshots
-        .lock()
-        .map_err(|_| io::Error::other("snapshot interner lock poisoned"))?;
-    let snapshot = snapshots
-        .get(id)
-        .ok_or_else(|| io::Error::other("snapshot missing"))?;
-    let value = snapshot.slots[0]
-        .as_ref()
-        .and_then(|item| item.components.get("quantity"))
-        .ok_or_else(|| io::Error::other("quantity missing"))?;
-    let TransactionDatum::Integer(value) = value else {
-        return Err(io::Error::other("quantity is not integer").into());
+    let value = {
+        let snapshots = snapshots
+            .lock()
+            .map_err(|_| io::Error::other("snapshot interner lock poisoned"))?;
+        let snapshot = snapshots
+            .get(id)
+            .ok_or_else(|| io::Error::other("snapshot missing"))?;
+        let value = snapshot.slots[0]
+            .as_ref()
+            .and_then(|item| item.components.get("quantity"))
+            .ok_or_else(|| io::Error::other("quantity missing"))?;
+        let TransactionDatum::Integer(value) = value else {
+            return Err(io::Error::other("quantity is not integer").into());
+        };
+        let value = *value;
+        drop(snapshots);
+        value
     };
-    Ok(*value)
+    Ok(value)
 }
 
 fn run(program: TransactionProgram) -> Result<(), Box<dyn std::error::Error>> {

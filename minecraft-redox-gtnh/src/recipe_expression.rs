@@ -17,7 +17,7 @@ pub enum ItemSemantic {
     },
     OreDictUnify {
         item: JavaExpression,
-        inner: Option<Box<ItemSemantic>>,
+        inner: Option<Box<Self>>,
     },
     OreDictHelper {
         method: String,
@@ -41,7 +41,7 @@ pub enum ItemSemantic {
         amount: JavaExpression,
         meta: Option<JavaExpression>,
         item: JavaExpression,
-        inner: Option<Box<ItemSemantic>>,
+        inner: Option<Box<Self>>,
         unsafe_copy: bool,
     },
     ItemStack {
@@ -61,8 +61,8 @@ pub enum ItemSemantic {
     },
     ModuleConditionalItem {
         module: String,
-        when_present: Option<Box<ItemSemantic>>,
-        when_absent: Option<Box<ItemSemantic>>,
+        when_present: Option<Box<Self>>,
+        when_absent: Option<Box<Self>>,
     },
     LinkedMethod {
         method_id: String,
@@ -82,11 +82,11 @@ pub enum ItemSemantic {
     },
     InlinedMethod {
         method_id: String,
-        result: Box<ItemSemantic>,
+        result: Box<Self>,
     },
     InlinedValue {
         value_id: String,
-        result: Box<ItemSemantic>,
+        result: Box<Self>,
     },
 }
 
@@ -118,7 +118,7 @@ pub enum FluidSemantic {
     },
     InlinedValue {
         value_id: String,
-        result: Box<FluidSemantic>,
+        result: Box<Self>,
     },
 }
 
@@ -306,10 +306,7 @@ fn recipe_input_semantic(
     }
 }
 
-pub(crate) fn item_semantic(
-    expression: &JavaExpression,
-    bindings: &JavaBindings,
-) -> Option<ItemSemantic> {
+pub fn item_semantic(expression: &JavaExpression, bindings: &JavaBindings) -> Option<ItemSemantic> {
     match expression {
         JavaExpression::Call {
             receiver: Some(receiver),
@@ -994,7 +991,7 @@ fn classify_new_item(
     None
 }
 
-pub(crate) fn fluid_semantic(
+pub fn fluid_semantic(
     expression: &JavaExpression,
     bindings: &JavaBindings,
 ) -> Option<FluidSemantic> {
@@ -1007,7 +1004,7 @@ pub(crate) fn fluid_semantic(
             && arguments.len() >= 2
             && reference_name(receiver, bindings)?.ends_with("FluidRegistry") =>
         {
-            let provider = format!("{}.{}", reference_name(receiver, bindings)?, method);
+            let provider = format!("{}.{method}", reference_name(receiver, bindings)?);
             Some(FluidSemantic::RegistryFluid {
                 provider,
                 arguments: arguments.clone(),
@@ -1074,7 +1071,7 @@ fn reference_name(expression: &JavaExpression, bindings: &JavaBindings) -> Optio
     match expression {
         JavaExpression::Reference(reference) => Some(bindings.resolve_reference(reference)),
         JavaExpression::FieldAccess { receiver, field } => {
-            Some(format!("{}.{}", reference_name(receiver, bindings)?, field))
+            Some(format!("{}.{field}", reference_name(receiver, bindings)?))
         }
         JavaExpression::Parenthesized(inner) => reference_name(inner, bindings),
         _ => None,
@@ -1132,7 +1129,7 @@ fn is_fluid_accessor(method: &str) -> bool {
     )
 }
 
-pub(crate) fn literal_i64(expression: &JavaExpression) -> Option<i64> {
+pub fn literal_i64(expression: &JavaExpression) -> Option<i64> {
     match expression {
         JavaExpression::Literal(value) => parse_integer_literal(value),
         JavaExpression::Binary {
@@ -1156,7 +1153,7 @@ pub(crate) fn literal_i64(expression: &JavaExpression) -> Option<i64> {
     }
 }
 
-pub(crate) fn resolved_reference_name(
+pub fn resolved_reference_name(
     expression: &JavaExpression,
     bindings: &JavaBindings,
 ) -> Option<String> {

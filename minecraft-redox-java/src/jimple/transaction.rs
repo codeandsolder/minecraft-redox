@@ -144,9 +144,8 @@ fn discover_transaction_methods(
             if let Some(existing) = discovered.iter().find(|item| item.signature == target) {
                 if existing.runtime_this != target_runtime_this {
                     bail!(
-                        "transaction helper {target:?} requires conflicting runtime-this specializations {:?} and {:?}",
-                        existing.runtime_this,
-                        target_runtime_this
+                        "transaction helper {target:?} requires conflicting runtime-this specializations {:?} and {target_runtime_this:?}",
+                        existing.runtime_this
                     );
                 }
             } else {
@@ -543,26 +542,28 @@ fn collect_semantic_local_uses(
             bootstrap_arguments,
             ..
         } => {
-            let query_matches: Vec<_> = bindings
+            let mut semantic_matches = bindings
                 .host_queries
                 .iter()
                 .filter(|binding| binding.callee == *method)
                 .map(|binding| (binding.receiver.as_ref(), binding.arguments.as_slice()))
-                .collect();
-            let call_matches: Vec<_> = bindings
-                .host_calls
-                .iter()
-                .filter(|binding| binding.callee == *method)
-                .map(|binding| (binding.receiver.as_ref(), binding.arguments.as_slice()))
-                .collect();
-            let semantic_matches: Vec<_> = query_matches.into_iter().chain(call_matches).collect();
-            if let [(receiver_selector, argument_selectors)] = semantic_matches.as_slice() {
+                .chain(
+                    bindings
+                        .host_calls
+                        .iter()
+                        .filter(|binding| binding.callee == *method)
+                        .map(|binding| (binding.receiver.as_ref(), binding.arguments.as_slice())),
+                );
+            let semantic_match = semantic_matches.next();
+            if semantic_matches.next().is_none()
+                && let Some((receiver_selector, argument_selectors)) = semantic_match
+            {
                 if let Some(selector) = receiver_selector
                     && let Some(selected) = select_raw_operand(base.as_deref(), arguments, selector)
                 {
                     collect_semantic_local_uses(selected, bindings, uses);
                 }
-                for selector in *argument_selectors {
+                for selector in argument_selectors {
                     if let Some(selected) = select_raw_operand(base.as_deref(), arguments, selector)
                     {
                         collect_semantic_local_uses(selected, bindings, uses);
