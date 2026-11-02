@@ -2724,18 +2724,16 @@ impl<'a> ProgramVm<'a> {
         let statement_id = statement.id;
         if self.path_splits >= self.max_path_splits {
             bail!(
-                "interprocedural Jimple execution exceeded {} unknown branch splits at {} statement {}: {condition:?}",
+                "interprocedural Jimple execution exceeded {} unknown branch splits at {} statement {statement_id}: {condition:?}",
                 self.max_path_splits,
-                method.display_signature,
-                statement_id
+                method.display_signature
             );
         }
         if self.branch_depth >= self.max_branch_depth {
             bail!(
-                "interprocedural Jimple execution exceeded {} nested unknown branches at {} statement {}: {condition:?}",
+                "interprocedural Jimple execution exceeded {} nested unknown branches at {} statement {statement_id}: {condition:?}",
                 self.max_branch_depth,
-                method.display_signature,
-                statement_id
+                method.display_signature
             );
         }
 
@@ -2829,9 +2827,8 @@ impl<'a> ProgramVm<'a> {
                         &method.signature.return_type,
                     )))),
                     _ => bail!(
-                        "unknown branch at {} statement {} has incompatible normal return shapes",
-                        method.display_signature,
-                        statement_id
+                        "unknown branch at {} statement {statement_id} has incompatible normal return shapes",
+                        method.display_signature
                     ),
                 }
             }
@@ -2853,9 +2850,8 @@ impl<'a> ProgramVm<'a> {
             }
             (Some(_), PathOutcome::Reached(_), PathOutcome::Returned(_))
             | (Some(_), PathOutcome::Returned(_), PathOutcome::Reached(_)) => bail!(
-                "post-dominator analysis disagreed with return flow at {} statement {}",
-                method.display_signature,
-                statement_id
+                "post-dominator analysis disagreed with return flow at {} statement {statement_id}",
+                method.display_signature
             ),
             (None, PathOutcome::Reached(_), _) | (None, _, PathOutcome::Reached(_)) => {
                 bail!("branch execution reached a stop without a post-dominator")
@@ -2944,10 +2940,9 @@ impl<'a> ProgramVm<'a> {
             .saturating_add(true_vm.steps.saturating_sub(base_steps));
         if joined_steps > self.max_steps {
             bail!(
-                "interprocedural Jimple execution exceeded {} steps while exploring unknown branch at {} statement {}",
+                "interprocedural Jimple execution exceeded {} steps while exploring unknown branch at {} statement {statement_id}",
                 self.max_steps,
-                method.display_signature,
-                statement_id
+                method.display_signature
             );
         }
         let nested_split_baseline = base_splits.saturating_add(1);
@@ -2956,10 +2951,9 @@ impl<'a> ProgramVm<'a> {
             .saturating_add(true_vm.path_splits.saturating_sub(nested_split_baseline));
         if joined_splits > self.max_path_splits {
             bail!(
-                "interprocedural Jimple execution exceeded {} unknown branch splits while exploring {} statement {}",
+                "interprocedural Jimple execution exceeded {} unknown branch splits while exploring {} statement {statement_id}",
                 self.max_path_splits,
-                method.display_signature,
-                statement_id
+                method.display_signature
             );
         }
         self.steps = joined_steps;

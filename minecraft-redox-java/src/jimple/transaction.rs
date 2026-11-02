@@ -144,9 +144,8 @@ fn discover_transaction_methods(
             if let Some(existing) = discovered.iter().find(|item| item.signature == target) {
                 if existing.runtime_this != target_runtime_this {
                     bail!(
-                        "transaction helper {target:?} requires conflicting runtime-this specializations {:?} and {:?}",
-                        existing.runtime_this,
-                        target_runtime_this
+                        "transaction helper {target:?} requires conflicting runtime-this specializations {:?} and {target_runtime_this:?}",
+                        existing.runtime_this
                     );
                 }
             } else {

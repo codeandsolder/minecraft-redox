@@ -1127,7 +1127,7 @@ fn qualified_reference_name(expression: &JavaExpression) -> Option<String> {
     match expression {
         JavaExpression::Reference(reference) => Some(reference.clone()),
         JavaExpression::FieldAccess { receiver, field } => {
-            Some(format!("{}.{}", qualified_reference_name(receiver)?, field))
+            Some(format!("{}.{field}", qualified_reference_name(receiver)?))
         }
         JavaExpression::Parenthesized(inner) => qualified_reference_name(inner),
         _ => None,
