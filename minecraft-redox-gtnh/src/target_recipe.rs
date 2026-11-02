@@ -1834,7 +1834,9 @@ fn java_positive_floating_literal(literal: &str) -> Option<f64> {
 }
 
 fn java_gtpp_round_to_closest_int(value: f64) -> Option<u64> {
-    let rounded_half_steps = (value * 2.0 + 0.5).floor();
+    // Match Java's separate binary64 multiply and add; do not fuse these operations.
+    let doubled = value * 2.0;
+    let rounded_half_steps = (doubled + 0.5).floor();
     let truncated = (rounded_half_steps / 2.0).trunc();
     if !(1.0..=f64::from(i32::MAX)).contains(&truncated) {
         return None;
@@ -1949,7 +1951,7 @@ fn lower_fuel_energy(
     energy
 }
 
-fn has_valid_universal_fuel_shape(recipe: &RecipeDefinition) -> bool {
+const fn has_valid_universal_fuel_shape(recipe: &RecipeDefinition) -> bool {
     recipe.item_input_semantics.len() == 1
         && recipe.fluid_input_semantics.is_empty()
         && recipe.item_output_semantics.len() <= 1

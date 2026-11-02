@@ -6,7 +6,7 @@ use crate::recipe_expression::{literal_i64, resolved_reference_name};
 
 const MAX_DEPTH: usize = 32;
 
-pub(crate) fn scalar_i64(
+pub fn scalar_i64(
     expression: &JavaExpression,
     bindings: &JavaBindings,
     project: &JavaProjectIndex,
@@ -15,7 +15,7 @@ pub(crate) fn scalar_i64(
     eval_i64(expression, bindings, project, None, 0, &mut seen)
 }
 
-pub(crate) fn scalar_i64_at(
+pub fn scalar_i64_at(
     expression: &JavaExpression,
     bindings: &JavaBindings,
     project: &JavaProjectIndex,
