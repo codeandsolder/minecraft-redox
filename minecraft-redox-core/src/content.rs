@@ -60,7 +60,7 @@ pub enum FluidSelector {
     /// This is an ordered identity fallback, not a recipe-input alternative: once the
     /// preferred identity exists, later choices are not accepted as substitutes.
     FirstAvailable {
-        choices: Vec<FluidSelector>,
+        choices: Vec<Self>,
     },
     /// Select a fluid identity from content-module presence.
     ///
@@ -68,8 +68,8 @@ pub enum FluidSelector {
     /// module availability even if the preferred registry identity is absent.
     ContentModuleConditional {
         module: ContentId,
-        when_present: Box<FluidSelector>,
-        when_absent: Box<FluidSelector>,
+        when_present: Box<Self>,
+        when_absent: Box<Self>,
     },
 }
 
@@ -110,7 +110,7 @@ impl Probability {
     }
 }
 
-fn greatest_common_divisor(mut left: u64, mut right: u64) -> u64 {
+const fn greatest_common_divisor(mut left: u64, mut right: u64) -> u64 {
     while right != 0 {
         let remainder = left % right;
         left = right;

@@ -18,7 +18,7 @@ pub struct MemoryTransactionObject {
     pub semantic_tag: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MemoryTransactionStore {
     pub slots: Vec<Option<u64>>,
     #[serde(default = "default_true")]
@@ -535,15 +535,13 @@ mod tests {
     fn object_handle_exhaustion_is_reported_without_overwriting() -> Result<(), String> {
         let mut host = MemoryTransactionHost {
             state: MemoryTransactionState {
-                objects: [(
+                objects: BTreeMap::from([(
                     0,
                     MemoryTransactionObject {
                         components: BTreeMap::new(),
                         semantic_tag: None,
                     },
-                )]
-                .into_iter()
-                .collect(),
+                )]),
                 next_handle: u64::MAX,
                 ..MemoryTransactionState::default()
             },
@@ -551,9 +549,10 @@ mod tests {
             max_quantity_component: String::from("max_quantity"),
         };
         let mut draft = host.begin()?;
-        let error = draft
-            .clone_value(&TransactionDatum::Handle(0))
-            .expect_err("exhausted handle space must be rejected");
+        let error = match draft.clone_value(&TransactionDatum::Handle(0)) {
+            Err(error) => error,
+            Ok(_) => return Err(String::from("exhausted handle space was accepted")),
+        };
         assert_eq!(error, "transaction object handle space exhausted");
         assert_eq!(draft.state.objects.len(), 1);
         Ok(())
@@ -563,7 +562,7 @@ mod tests {
     fn store_empty_and_full_queries_follow_draft_state() -> Result<(), String> {
         let mut host = MemoryTransactionHost {
             state: MemoryTransactionState {
-                objects: [(
+                objects: BTreeMap::from([(
                     7,
                     MemoryTransactionObject {
                         components: [
@@ -574,19 +573,15 @@ mod tests {
                         .collect(),
                         semantic_tag: Some(String::from("item")),
                     },
-                )]
-                .into_iter()
-                .collect(),
-                stores: [(
+                )]),
+                stores: BTreeMap::from([(
                     1,
                     MemoryTransactionStore {
                         slots: vec![None],
                         allows_read: true,
                         allows_write: true,
                     },
-                )]
-                .into_iter()
-                .collect(),
+                )]),
                 next_handle: 8,
                 ..MemoryTransactionState::default()
             },
