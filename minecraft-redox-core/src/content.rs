@@ -95,7 +95,7 @@ impl Probability {
     };
 
     #[must_use]
-    pub fn new(numerator: u64, denominator: u64) -> Option<Self> {
+    pub const fn new(numerator: u64, denominator: u64) -> Option<Self> {
         if denominator == 0 || numerator > denominator {
             return None;
         }
