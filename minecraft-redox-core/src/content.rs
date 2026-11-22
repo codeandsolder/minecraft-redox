@@ -484,6 +484,10 @@ pub struct ContentMaterial {
     pub dye_color: Option<ContentId>,
     pub argb: u32,
     pub melting_point: Option<i64>,
+    /// Explicit gas temperature stored on the material.
+    pub gas_temperature: Option<i64>,
+    /// Explicit post-construction processing energy tier, in EU/t.
+    pub processing_tier_eut: Option<i64>,
     pub blast_furnace_temp: Option<i64>,
     pub form_groups: Vec<MaterialFormGroup>,
     pub added_forms: Vec<ContentId>,

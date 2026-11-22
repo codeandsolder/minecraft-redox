@@ -104,6 +104,7 @@ pub struct MaterialDefinition {
     pub blast_furnace_temp: Option<String>,
     pub properties: Vec<BuilderCall>,
     pub definition_calls: Vec<BuilderCall>,
+    pub post_construct_calls: Vec<BuilderCall>,
     pub unhandled_calls: Vec<BuilderCall>,
 }
 
@@ -697,11 +698,13 @@ fn scalar_i64_at_call(
 }
 
 fn recognize_material(chain: &JavaCallChain) -> Option<MaterialDefinition> {
-    if !chain.root.starts_with("new MaterialBuilder")
-        || chain.calls.last()?.name != "constructMaterial"
-    {
+    if !chain.root.starts_with("new MaterialBuilder") {
         return None;
     }
+    let construction = chain
+        .calls
+        .iter()
+        .position(|call| call.name == "constructMaterial")?;
     let mut material = MaterialDefinition {
         origin: chain.origin.clone(),
         name: None,
@@ -712,10 +715,11 @@ fn recognize_material(chain: &JavaCallChain) -> Option<MaterialDefinition> {
         blast_furnace_temp: None,
         properties: Vec::new(),
         definition_calls: Vec::new(),
+        post_construct_calls: Vec::new(),
         unhandled_calls: Vec::new(),
     };
 
-    for call in &chain.calls {
+    for call in &chain.calls[..=construction] {
         match call.name.as_str() {
             "setName" => {
                 material.name = one_argument(call);
@@ -745,6 +749,16 @@ fn recognize_material(chain: &JavaCallChain) -> Option<MaterialDefinition> {
             "constructMaterial" if call.arguments.is_empty() => {}
             name if is_known_material_property(name) => material.properties.push(call.into()),
             _ => material.unhandled_calls.push(call.into()),
+        }
+    }
+    for call in &chain.calls[construction + 1..] {
+        if matches!(
+            call.name.as_str(),
+            "setLiquidTemperature" | "setGasTemperature" | "setProcessingMaterialTierEU"
+        ) {
+            material.post_construct_calls.push(call.into());
+        } else {
+            material.unhandled_calls.push(call.into());
         }
     }
     Some(material)

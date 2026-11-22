@@ -103,6 +103,8 @@ struct MaterialBaseFields {
     icon_set: Option<MaterialIconSetSpec>,
     dye_color: Option<ContentId>,
     melting_point: Option<i64>,
+    gas_temperature: Option<i64>,
+    processing_tier_eut: Option<i64>,
     blast_furnace_temp: Option<i64>,
 }
 
@@ -159,6 +161,7 @@ fn lower_material_internal(
             .definition_calls
             .iter_mut()
             .chain(&mut material.properties)
+            .chain(&mut material.post_construct_calls)
         {
             for expression in &mut call.argument_expressions {
                 *expression = minecraft_redox_java::rewrite_references(expression, &|reference| {
@@ -179,10 +182,13 @@ fn lower_material_internal(
             record_property_result(call, None, &mut blockers);
         }
     }
-    let base = lower_base_fields(&material, bindings, project, &mut blockers);
+    let mut base = lower_base_fields(&material, bindings, project, &mut blockers);
     let mut accumulated = MaterialAccumulator::default();
     for call in &material.properties {
         lower_property(call, bindings, project, &mut accumulated, &mut blockers);
+    }
+    for call in &material.post_construct_calls {
+        lower_post_construct(call, bindings, project, &mut base, &mut blockers);
     }
     if blockers.is_empty() {
         return finalize_material(&material, base, accumulated).ok_or_else(|| {
@@ -262,6 +268,8 @@ fn lower_base_fields(
     blockers: &mut Vec<MaterialLoweringBlocker>,
 ) -> MaterialBaseFields {
     MaterialBaseFields {
+        gas_temperature: None,
+        processing_tier_eut: None,
         name: required_string(
             material.name.as_deref(),
             MaterialLoweringBlockerKind::Name,
@@ -326,6 +334,8 @@ fn finalize_material(
         dye_color: base.dye_color,
         argb,
         melting_point: base.melting_point,
+        gas_temperature: base.gas_temperature,
+        processing_tier_eut: base.processing_tier_eut,
         blast_furnace_temp: base.blast_furnace_temp,
         form_groups: accumulated.form_groups,
         added_forms: accumulated.added_forms,
@@ -365,6 +375,42 @@ enum PropertyLoweringResult {
     Unsupported,
     Valid,
     Invalid,
+}
+
+fn lower_post_construct(
+    call: &BuilderCall,
+    bindings: &JavaBindings,
+    project: Option<&JavaProjectIndex>,
+    base: &mut MaterialBaseFields,
+    blockers: &mut Vec<MaterialLoweringBlocker>,
+) {
+    let value = one_scalar(call, bindings, project);
+    let result = match call.name.as_str() {
+        "setLiquidTemperature" => value
+            .and_then(|value| i32::try_from(value).ok())
+            .map(|value| {
+                base.melting_point = Some(i64::from(value));
+            }),
+        "setGasTemperature" => value
+            .and_then(|value| i32::try_from(value).ok())
+            .map(|value| {
+                base.gas_temperature = Some(i64::from(value));
+            }),
+        "setProcessingMaterialTierEU" => value.map(|value| {
+            // Materials stores the low 32 bits of the supplied Java long.
+            let [a, b, c, d, ..] = value.to_le_bytes();
+            base.processing_tier_eut = Some(i64::from(i32::from_le_bytes([a, b, c, d])));
+        }),
+        _ => {
+            push_blocker(
+                blockers,
+                MaterialLoweringBlockerKind::UnsupportedProperty,
+                call.name.clone(),
+            );
+            return;
+        }
+    };
+    record_property_result(call, result, blockers);
 }
 
 fn lower_property(
@@ -1101,6 +1147,54 @@ mod tests {
             [MaterialFormulaPart::Text { value }, MaterialFormulaPart::Glyph { name }]
                 if value == "Fe" && name == "SUBSCRIPT_2"
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn applies_post_construction_mutations_in_order() -> anyhow::Result<()> {
+        let source = r#"
+            class TierEU { static final long RECIPE_UV = 491520L; }
+            class MaterialsInit {
+                void run() {
+                    Materials foo = new MaterialBuilder()
+                        .setName("Foo")
+                        .setDefaultLocalName("Foo")
+                        .setMeltingPoint(1200)
+                        .constructMaterial()
+                        .setLiquidTemperature(303)
+                        .setProcessingMaterialTierEU(TierEU.RECIPE_UV)
+                        .setGasTemperature(420)
+                        .setGasTemperature(600);
+                }
+            }
+        "#;
+        let lowered = lower_fixture(source)?
+            .map_err(|failure| anyhow::anyhow!("material lowering failed: {failure:?}"))?;
+        assert_eq!(lowered.melting_point, Some(303));
+        assert_eq!(lowered.gas_temperature, Some(600));
+        assert_eq!(lowered.processing_tier_eut, Some(491_520));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_unknown_post_construction_effects() -> anyhow::Result<()> {
+        let source = r#"
+            class MaterialsInit {
+                void run() {
+                    Materials foo = new MaterialBuilder()
+                        .setName("Foo")
+                        .setDefaultLocalName("Foo")
+                        .constructMaterial()
+                        .addDustItems();
+                }
+            }
+        "#;
+        let failure = lower_fixture(source)?
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("unsupported post-construction call was accepted"))?;
+        assert!(failure.blockers.iter().any(|blocker| blocker.kind
+            == MaterialLoweringBlockerKind::UnsupportedProperty
+            && blocker.detail == "addDustItems"));
         Ok(())
     }
 
