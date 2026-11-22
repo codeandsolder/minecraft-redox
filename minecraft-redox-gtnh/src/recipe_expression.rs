@@ -1,5 +1,5 @@
 use minecraft_redox_java::{
-    JavaBindings, JavaExpression, JavaProjectIndex, JavaValueKind, substitute_references,
+    JavaBindings, JavaExpression, JavaProjectIndex, JavaValueKind, rewrite_references,
 };
 use serde::Serialize;
 
@@ -360,7 +360,9 @@ fn project_input_item_semantic(
             && resolved.returns.len() == 1
             && let Some(replacements) = resolved.argument_bindings(arguments)
         {
-            let substituted = substitute_references(&resolved.returns[0].expression, &replacements);
+            let substituted = rewrite_references(&resolved.returns[0].expression, &|name| {
+                replacements.get(name).cloned()
+            });
             if let Some(result) = recipe_input_semantic(&substituted, bindings, true)
                 .or_else(|| item_semantic(&substituted, bindings))
             {
@@ -757,7 +759,9 @@ fn linked_method_semantic(
         && resolved.returns.len() == 1
         && let Some(replacements) = resolved.argument_bindings(arguments)
     {
-        let substituted = substitute_references(&resolved.returns[0].expression, &replacements);
+        let substituted = rewrite_references(&resolved.returns[0].expression, &|name| {
+            replacements.get(name).cloned()
+        });
         if let Some(result) = item_semantic(&substituted, bindings) {
             return Some(ItemSemantic::InlinedMethod {
                 method_id,

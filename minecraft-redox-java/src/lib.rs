@@ -286,7 +286,7 @@ enum MethodFilter {
 }
 
 impl MethodFilter {
-    fn matches(self, method: &JavaMethod) -> bool {
+    const fn matches(self, method: &JavaMethod) -> bool {
         match self {
             Self::Any => true,
             Self::Static => method.is_static,
@@ -1311,44 +1311,19 @@ impl JavaProjectIndex {
         type_name: &str,
         bindings: &JavaBindings,
     ) -> String {
-        let mut base = type_name.trim();
-        let mut dimensions = 0usize;
-        while let Some(stripped) = base.strip_suffix("[]") {
-            dimensions += 1;
-            base = stripped.trim_end();
-        }
-        let (raw_type, generic_suffix) = base
-            .find('<')
-            .map_or((base, ""), |index| (&base[..index], &base[index..]));
-        let resolved_reference = bindings.resolve_reference(raw_type.trim());
-        let mut normalized = self
-            .class_owner_for_reference_at(path, byte_position, bindings, &resolved_reference)
-            .unwrap_or_else(|| {
-                self.normalize_owner_name(&resolved_reference, bindings.package.as_deref())
-            });
-        normalized.push_str(generic_suffix);
-        for _ in 0..dimensions {
-            normalized.push_str("[]");
-        }
-        normalized
+        map_type_owner(type_name, |raw_type| {
+            let resolved_reference = bindings.resolve_reference(raw_type);
+            self.class_owner_for_reference_at(path, byte_position, bindings, &resolved_reference)
+                .unwrap_or_else(|| {
+                    self.normalize_owner_name(&resolved_reference, bindings.package.as_deref())
+                })
+        })
     }
 
     fn normalize_type_name(&self, type_name: &str, package: Option<&str>) -> String {
-        let mut base = type_name.trim();
-        let mut dimensions = 0usize;
-        while let Some(stripped) = base.strip_suffix("[]") {
-            dimensions += 1;
-            base = stripped.trim_end();
-        }
-        let (raw_type, generic_suffix) = base
-            .find('<')
-            .map_or((base, ""), |index| (&base[..index], &base[index..]));
-        let mut normalized = self.normalize_owner_name(raw_type.trim(), package);
-        normalized.push_str(generic_suffix);
-        for _ in 0..dimensions {
-            normalized.push_str("[]");
-        }
-        normalized
+        map_type_owner(type_name, |raw_type| {
+            self.normalize_owner_name(raw_type, package)
+        })
     }
 
     fn normalize_owner_name(&self, type_name: &str, package: Option<&str>) -> String {
@@ -1617,6 +1592,15 @@ impl JavaProjectIndex {
     }
 }
 
+fn map_type_owner(type_name: &str, map: impl FnOnce(&str) -> String) -> String {
+    let base = type_name.trim();
+    let split = base.find(['<', '[']).unwrap_or(base.len());
+    let (owner, suffix) = base.split_at(split);
+    let mut normalized = map(owner.trim());
+    normalized.push_str(suffix);
+    normalized
+}
+
 fn resolve_type_reference(bindings: &JavaBindings, type_name: &str) -> String {
     let mut base = type_name.trim();
     let mut dimensions = 0usize;
@@ -1625,16 +1609,17 @@ fn resolve_type_reference(bindings: &JavaBindings, type_name: &str) -> String {
         base = stripped.trim_end();
     }
 
-    let mut resolved = if let Some(generic_start) = base.find('<') {
-        let generic_end = base.rfind('>').unwrap_or(base.len());
-        let raw_type = base.get(..generic_start).unwrap_or(base).trim();
-        let arguments = base
-            .get(generic_start + 1..generic_end)
-            .map_or_default(|text| resolve_generic_arguments(bindings, text));
-        format!("{}<{arguments}>", bindings.resolve_reference(raw_type))
-    } else {
-        bindings.resolve_reference(base)
-    };
+    let mut resolved = base.find('<').map_or_else(
+        || bindings.resolve_reference(base),
+        |generic_start| {
+            let generic_end = base.rfind('>').unwrap_or(base.len());
+            let raw_type = base.get(..generic_start).unwrap_or(base).trim();
+            let arguments = base
+                .get(generic_start + 1..generic_end)
+                .map_or_default(|text| resolve_generic_arguments(bindings, text));
+            format!("{}<{arguments}>", bindings.resolve_reference(raw_type))
+        },
+    );
 
     for _ in 0..dimensions {
         resolved.push_str("[]");
@@ -2756,22 +2741,20 @@ fn collect_returns(
     }
 }
 
-/// Replace syntactic reference expressions that match supplied bindings.
-///
-/// This is deliberately not name resolution. It is used after a call target has
-/// already been linked to substitute formal parameters with actual arguments.
+/// Rewrite syntactic references using the supplied callback, retaining all other structure.
+/// A replacement is not recursively rewritten. Lambda bodies are opaque because
+/// their parameter bindings are not yet represented.
 #[must_use]
-pub fn substitute_references(
+pub fn rewrite_references(
     expression: &JavaExpression,
-    replacements: &BTreeMap<String, JavaExpression>,
+    rewrite: &impl Fn(&str) -> Option<JavaExpression>,
 ) -> JavaExpression {
     match expression {
-        JavaExpression::Reference(reference) => replacements
-            .get(reference)
-            .cloned()
-            .unwrap_or_else(|| expression.clone()),
+        JavaExpression::Reference(reference) => {
+            rewrite(reference).unwrap_or_else(|| expression.clone())
+        }
         JavaExpression::FieldAccess { receiver, field } => JavaExpression::FieldAccess {
-            receiver: Box::new(substitute_references(receiver, replacements)),
+            receiver: Box::new(rewrite_references(receiver, rewrite)),
             field: field.clone(),
         },
         JavaExpression::Array {
@@ -2782,20 +2765,20 @@ pub fn substitute_references(
             element_type: element_type.clone(),
             elements: elements
                 .iter()
-                .map(|value| substitute_references(value, replacements))
+                .map(|value| rewrite_references(value, rewrite))
                 .collect(),
             dimensions: dimensions
                 .iter()
-                .map(|value| substitute_references(value, replacements))
+                .map(|value| rewrite_references(value, rewrite))
                 .collect(),
         },
         JavaExpression::ArrayAccess { array, index } => JavaExpression::ArrayAccess {
-            array: Box::new(substitute_references(array, replacements)),
-            index: Box::new(substitute_references(index, replacements)),
+            array: Box::new(rewrite_references(array, rewrite)),
+            index: Box::new(rewrite_references(index, rewrite)),
         },
         JavaExpression::Cast { type_name, value } => JavaExpression::Cast {
             type_name: type_name.clone(),
-            value: Box::new(substitute_references(value, replacements)),
+            value: Box::new(rewrite_references(value, rewrite)),
         },
         JavaExpression::Call {
             receiver,
@@ -2804,11 +2787,11 @@ pub fn substitute_references(
         } => JavaExpression::Call {
             receiver: receiver
                 .as_ref()
-                .map(|value| Box::new(substitute_references(value, replacements))),
+                .map(|value| Box::new(rewrite_references(value, rewrite))),
             method: method.clone(),
             arguments: arguments
                 .iter()
-                .map(|value| substitute_references(value, replacements))
+                .map(|value| rewrite_references(value, rewrite))
                 .collect(),
         },
         JavaExpression::New {
@@ -2818,7 +2801,7 @@ pub fn substitute_references(
             type_name: type_name.clone(),
             arguments: arguments
                 .iter()
-                .map(|value| substitute_references(value, replacements))
+                .map(|value| rewrite_references(value, rewrite))
                 .collect(),
         },
         JavaExpression::Binary {
@@ -2826,28 +2809,26 @@ pub fn substitute_references(
             operator,
             right,
         } => JavaExpression::Binary {
-            left: Box::new(substitute_references(left, replacements)),
+            left: Box::new(rewrite_references(left, rewrite)),
             operator: operator.clone(),
-            right: Box::new(substitute_references(right, replacements)),
+            right: Box::new(rewrite_references(right, rewrite)),
         },
         JavaExpression::Unary { operator, operand } => JavaExpression::Unary {
             operator: operator.clone(),
-            operand: Box::new(substitute_references(operand, replacements)),
+            operand: Box::new(rewrite_references(operand, rewrite)),
         },
         JavaExpression::Conditional {
             condition,
             when_true,
             when_false,
         } => JavaExpression::Conditional {
-            condition: Box::new(substitute_references(condition, replacements)),
-            when_true: Box::new(substitute_references(when_true, replacements)),
-            when_false: Box::new(substitute_references(when_false, replacements)),
+            condition: Box::new(rewrite_references(condition, rewrite)),
+            when_true: Box::new(rewrite_references(when_true, rewrite)),
+            when_false: Box::new(rewrite_references(when_false, rewrite)),
         },
-        JavaExpression::Lambda { body } => JavaExpression::Lambda {
-            body: Box::new(substitute_references(body, replacements)),
-        },
+        JavaExpression::Lambda { .. } => expression.clone(),
         JavaExpression::Parenthesized(inner) => {
-            JavaExpression::Parenthesized(Box::new(substitute_references(inner, replacements)))
+            JavaExpression::Parenthesized(Box::new(rewrite_references(inner, rewrite)))
         }
         JavaExpression::Literal(_) | JavaExpression::Raw(_) => expression.clone(),
     }
@@ -3217,7 +3198,60 @@ fn symbol_kind(kind: &str) -> Option<JavaSymbolKind> {
 
 #[cfg(test)]
 mod tests {
-    use super::{JavaSymbolKind, analyze_source, inventory_source};
+    use super::{
+        JavaAnalysis, JavaCall, JavaExpression, JavaProjectIndex, JavaSymbolKind, analyze_source,
+        inventory_source,
+    };
+
+    fn indexed_fixture(
+        path: &str,
+        artifact: &str,
+        source: &str,
+    ) -> anyhow::Result<(JavaAnalysis, JavaProjectIndex)> {
+        let analysis = analyze_source(path, artifact, None, source)?;
+        let mut index = JavaProjectIndex::default();
+        index.add_analysis(&analysis);
+        Ok((analysis, index))
+    }
+
+    fn sink_calls(analysis: &JavaAnalysis) -> impl Iterator<Item = &JavaCall> {
+        analysis
+            .call_chains
+            .iter()
+            .flat_map(|chain| &chain.calls)
+            .filter(|call| call.name == "sink")
+    }
+
+    fn sink_argument(call: &JavaCall) -> anyhow::Result<&JavaExpression> {
+        call.argument_expressions
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("sink argument missing"))
+    }
+
+    fn first_sink_argument(
+        analysis: &JavaAnalysis,
+    ) -> anyhow::Result<(&JavaCall, &JavaExpression)> {
+        let call = sink_calls(analysis)
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("sink call missing"))?;
+        Ok((call, sink_argument(call)?))
+    }
+
+    fn inferred_sink_types(
+        analysis: &JavaAnalysis,
+        index: &JavaProjectIndex,
+    ) -> anyhow::Result<Vec<Option<String>>> {
+        sink_calls(analysis)
+            .map(|call| {
+                Ok(index.expression_type_at(
+                    &analysis.inventory.path,
+                    call.byte_start,
+                    sink_argument(call)?,
+                    &analysis.bindings,
+                ))
+            })
+            .collect()
+    }
 
     #[test]
     fn inventories_class_constructor_and_method() -> anyhow::Result<()> {
@@ -3399,12 +3433,7 @@ mod tests {
             }
         "#;
         let analysis = analyze_source("Recipe.java", "demo", None, source)?;
-        let sink_calls: Vec<_> = analysis
-            .call_chains
-            .iter()
-            .flat_map(|chain| &chain.calls)
-            .filter(|call| call.name == "sink")
-            .collect();
+        let sink_calls: Vec<_> = sink_calls(&analysis).collect();
         assert_eq!(sink_calls.len(), 2);
         assert_eq!(sink_calls[0].arguments.len(), 1);
         let Some(super::JavaExpression::Array {
@@ -3471,27 +3500,10 @@ mod tests {
                 });
             }
         ";
-        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
-        let mut index = super::JavaProjectIndex::default();
-        index.add_analysis(&analysis);
-        let sink = analysis
-            .call_chains
-            .iter()
-            .flat_map(|chain| &chain.calls)
-            .find(|call| call.name == "sink")
-            .ok_or_else(|| anyhow::anyhow!("sink call missing"))?;
-        let expression = sink
-            .argument_expressions
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("sink argument missing"))?;
+        let (analysis, index) = indexed_fixture("Recipe.java", "demo", source)?;
         assert_eq!(
-            index.expression_type_at(
-                "Recipe.java",
-                sink.byte_start,
-                expression,
-                &analysis.bindings
-            ),
-            Some(String::from("ItemStack[]"))
+            inferred_sink_types(&analysis, &index)?,
+            vec![Some(String::from("ItemStack[]"))]
         );
         Ok(())
     }
@@ -3506,27 +3518,10 @@ mod tests {
                 void run(List<ItemStack> items) { sink(items.get(0)); }
             }
         ";
-        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
-        let mut index = super::JavaProjectIndex::default();
-        index.add_analysis(&analysis);
-        let sink = analysis
-            .call_chains
-            .iter()
-            .flat_map(|chain| &chain.calls)
-            .find(|call| call.name == "sink")
-            .ok_or_else(|| anyhow::anyhow!("sink call missing"))?;
-        let expression = sink
-            .argument_expressions
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("sink argument missing"))?;
+        let (analysis, index) = indexed_fixture("Recipe.java", "demo", source)?;
         assert_eq!(
-            index.expression_type_at(
-                "Recipe.java",
-                sink.byte_start,
-                expression,
-                &analysis.bindings
-            ),
-            Some(String::from("net.minecraft.item.ItemStack"))
+            inferred_sink_types(&analysis, &index)?,
+            vec![Some(String::from("net.minecraft.item.ItemStack"))]
         );
         Ok(())
     }
@@ -3551,15 +3546,8 @@ mod tests {
                 }
             }
         "#;
-        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
-        let mut index = super::JavaProjectIndex::default();
-        index.add_analysis(&analysis);
-        let calls: Vec<_> = analysis
-            .call_chains
-            .iter()
-            .flat_map(|chain| &chain.calls)
-            .filter(|call| call.name == "sink")
-            .collect();
+        let (analysis, index) = indexed_fixture("Recipe.java", "demo", source)?;
+        let calls: Vec<_> = sink_calls(&analysis).collect();
         assert_eq!(calls.len(), 5);
         for call in calls {
             let expression = call
@@ -3589,27 +3577,10 @@ mod tests {
                 void run(ItemStack item) { sink(Objects.requireNonNull(item)); }
             }
         ";
-        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
-        let mut index = super::JavaProjectIndex::default();
-        index.add_analysis(&analysis);
-        let sink = analysis
-            .call_chains
-            .iter()
-            .flat_map(|chain| &chain.calls)
-            .find(|call| call.name == "sink")
-            .ok_or_else(|| anyhow::anyhow!("sink call missing"))?;
-        let expression = sink
-            .argument_expressions
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("sink argument missing"))?;
+        let (analysis, index) = indexed_fixture("Recipe.java", "demo", source)?;
         assert_eq!(
-            index.expression_type_at(
-                "Recipe.java",
-                sink.byte_start,
-                expression,
-                &analysis.bindings
-            ),
-            Some(String::from("demo.ItemStack"))
+            inferred_sink_types(&analysis, &index)?,
+            vec![Some(String::from("demo.ItemStack"))]
         );
         Ok(())
     }
@@ -3624,27 +3595,10 @@ mod tests {
                 void run(Pair<ItemStack, Integer> pair) { sink(pair.getLeft()); }
             }
         ";
-        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
-        let mut index = super::JavaProjectIndex::default();
-        index.add_analysis(&analysis);
-        let sink = analysis
-            .call_chains
-            .iter()
-            .flat_map(|chain| &chain.calls)
-            .find(|call| call.name == "sink")
-            .ok_or_else(|| anyhow::anyhow!("sink call missing"))?;
-        let expression = sink
-            .argument_expressions
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("sink argument missing"))?;
+        let (analysis, index) = indexed_fixture("Recipe.java", "demo", source)?;
         assert_eq!(
-            index.expression_type_at(
-                "Recipe.java",
-                sink.byte_start,
-                expression,
-                &analysis.bindings,
-            ),
-            Some(String::from("net.minecraft.item.ItemStack"))
+            inferred_sink_types(&analysis, &index)?,
+            vec![Some(String::from("net.minecraft.item.ItemStack"))]
         );
         Ok(())
     }
@@ -3659,27 +3613,10 @@ mod tests {
                 void run(Supplier<ItemStack> item) { sink(item.get()); }
             }
         ";
-        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
-        let mut index = super::JavaProjectIndex::default();
-        index.add_analysis(&analysis);
-        let sink = analysis
-            .call_chains
-            .iter()
-            .flat_map(|chain| &chain.calls)
-            .find(|call| call.name == "sink")
-            .ok_or_else(|| anyhow::anyhow!("sink call missing"))?;
-        let expression = sink
-            .argument_expressions
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("sink argument missing"))?;
+        let (analysis, index) = indexed_fixture("Recipe.java", "demo", source)?;
         assert_eq!(
-            index.expression_type_at(
-                "Recipe.java",
-                sink.byte_start,
-                expression,
-                &analysis.bindings,
-            ),
-            Some(String::from("net.minecraft.item.ItemStack"))
+            inferred_sink_types(&analysis, &index)?,
+            vec![Some(String::from("net.minecraft.item.ItemStack"))]
         );
         Ok(())
     }
@@ -3698,15 +3635,8 @@ mod tests {
                 }
             }
         "#;
-        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
-        let mut index = super::JavaProjectIndex::default();
-        index.add_analysis(&analysis);
-        let sink_calls: Vec<_> = analysis
-            .call_chains
-            .iter()
-            .flat_map(|chain| &chain.calls)
-            .filter(|call| call.name == "sink")
-            .collect();
+        let (analysis, index) = indexed_fixture("Recipe.java", "demo", source)?;
+        let sink_calls: Vec<_> = sink_calls(&analysis).collect();
         assert_eq!(sink_calls.len(), 2);
         for sink in sink_calls {
             let expression = sink
@@ -3738,27 +3668,10 @@ mod tests {
                 }
             }
         ";
-        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
-        let mut index = super::JavaProjectIndex::default();
-        index.add_analysis(&analysis);
-        let sink = analysis
-            .call_chains
-            .iter()
-            .flat_map(|chain| &chain.calls)
-            .find(|call| call.name == "sink")
-            .ok_or_else(|| anyhow::anyhow!("sink call missing"))?;
-        let expression = sink
-            .argument_expressions
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("sink argument missing"))?;
+        let (analysis, index) = indexed_fixture("Recipe.java", "demo", source)?;
         assert_eq!(
-            index.expression_type_at(
-                "Recipe.java",
-                sink.byte_start,
-                expression,
-                &analysis.bindings
-            ),
-            Some(String::from("net.minecraft.item.ItemStack[]"))
+            inferred_sink_types(&analysis, &index)?,
+            vec![Some(String::from("net.minecraft.item.ItemStack[]"))]
         );
         Ok(())
     }
@@ -3781,15 +3694,8 @@ mod tests {
                 }
             }
         ";
-        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
-        let mut index = super::JavaProjectIndex::default();
-        index.add_analysis(&analysis);
-        let sink_calls: Vec<_> = analysis
-            .call_chains
-            .iter()
-            .flat_map(|chain| &chain.calls)
-            .filter(|call| call.name == "sink")
-            .collect();
+        let (analysis, index) = indexed_fixture("Recipe.java", "demo", source)?;
+        let sink_calls: Vec<_> = sink_calls(&analysis).collect();
         let expected = [
             super::JavaValueKind::Parameter,
             super::JavaValueKind::Local,
@@ -3832,15 +3738,8 @@ mod tests {
                 }
             }
         "#;
-        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
-        let mut index = super::JavaProjectIndex::default();
-        index.add_analysis(&analysis);
-        let calls: Vec<_> = analysis
-            .call_chains
-            .iter()
-            .flat_map(|chain| &chain.calls)
-            .filter(|call| call.name == "sink")
-            .collect();
+        let (analysis, index) = indexed_fixture("Recipe.java", "demo", source)?;
+        let calls: Vec<_> = sink_calls(&analysis).collect();
         assert_eq!(calls.len(), 2);
         for call in calls {
             let expression = call
@@ -3871,19 +3770,8 @@ mod tests {
             }
             class Recipe { void run() { sink(Component.MOTOR.get(4)); } }
         ";
-        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
-        let mut index = super::JavaProjectIndex::default();
-        index.add_analysis(&analysis);
-        let sink = analysis
-            .call_chains
-            .iter()
-            .flat_map(|chain| &chain.calls)
-            .find(|call| call.name == "sink")
-            .ok_or_else(|| anyhow::anyhow!("sink call missing"))?;
-        let expression = sink
-            .argument_expressions
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("sink argument missing"))?;
+        let (analysis, index) = indexed_fixture("Recipe.java", "demo", source)?;
+        let (sink, expression) = first_sink_argument(&analysis)?;
         let (resolved, receiver_type) = index
             .resolve_call_at(
                 "Recipe.java",
@@ -3907,27 +3795,10 @@ mod tests {
                 void run() { sink(this.output.copy()); }
             }
         ";
-        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
-        let mut index = super::JavaProjectIndex::default();
-        index.add_analysis(&analysis);
-        let sink = analysis
-            .call_chains
-            .iter()
-            .flat_map(|chain| &chain.calls)
-            .find(|call| call.name == "sink")
-            .ok_or_else(|| anyhow::anyhow!("sink call missing"))?;
-        let expression = sink
-            .argument_expressions
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("sink argument missing"))?;
+        let (analysis, index) = indexed_fixture("Recipe.java", "demo", source)?;
         assert_eq!(
-            index.expression_type_at(
-                "Recipe.java",
-                sink.byte_start,
-                expression,
-                &analysis.bindings,
-            ),
-            Some(String::from("demo.ItemStack"))
+            inferred_sink_types(&analysis, &index)?,
+            vec![Some(String::from("demo.ItemStack"))]
         );
         Ok(())
     }
@@ -3944,15 +3815,8 @@ mod tests {
                 void localUse(Material Lubricant) { sink(Lubricant); }
             }
         ";
-        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
-        let mut index = super::JavaProjectIndex::default();
-        index.add_analysis(&analysis);
-        let calls: Vec<_> = analysis
-            .call_chains
-            .iter()
-            .flat_map(|chain| &chain.calls)
-            .filter(|call| call.name == "sink")
-            .collect();
+        let (analysis, index) = indexed_fixture("Recipe.java", "demo", source)?;
+        let calls: Vec<_> = sink_calls(&analysis).collect();
         assert_eq!(calls.len(), 2);
         assert_eq!(
             index
@@ -3994,15 +3858,8 @@ mod tests {
                 }
             }
         ";
-        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
-        let mut index = super::JavaProjectIndex::default();
-        index.add_analysis(&analysis);
-        let calls: Vec<_> = analysis
-            .call_chains
-            .iter()
-            .flat_map(|chain| &chain.calls)
-            .filter(|call| call.name == "sink")
-            .collect();
+        let (analysis, index) = indexed_fixture("Recipe.java", "demo", source)?;
+        let calls: Vec<_> = sink_calls(&analysis).collect();
         assert_eq!(calls.len(), 2);
         for call in calls {
             let expression = call
@@ -4051,15 +3908,8 @@ mod tests {
                 }
             }
         ";
-        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
-        let mut index = super::JavaProjectIndex::default();
-        index.add_analysis(&analysis);
-        let calls: Vec<_> = analysis
-            .call_chains
-            .iter()
-            .flat_map(|chain| &chain.calls)
-            .filter(|call| call.name == "sink")
-            .collect();
+        let (analysis, index) = indexed_fixture("Recipe.java", "demo", source)?;
+        let calls: Vec<_> = sink_calls(&analysis).collect();
         assert_eq!(calls.len(), 4);
         assert!(matches!(
             index.stable_local_initializer_at("Recipe.java", calls[0].byte_start, "stable"),
@@ -4096,15 +3946,8 @@ mod tests {
                 }
             }
         ";
-        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
-        let mut index = super::JavaProjectIndex::default();
-        index.add_analysis(&analysis);
-        let calls: Vec<_> = analysis
-            .call_chains
-            .iter()
-            .flat_map(|chain| &chain.calls)
-            .filter(|call| call.name == "sink")
-            .collect();
+        let (analysis, index) = indexed_fixture("Recipe.java", "demo", source)?;
+        let calls: Vec<_> = sink_calls(&analysis).collect();
         assert_eq!(calls.len(), 2);
         let values = index
             .stable_enhanced_for_elements_at("Recipe.java", calls[0].byte_start, "item")
@@ -4130,9 +3973,7 @@ mod tests {
                 }
             }
         ";
-        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
-        let mut index = super::JavaProjectIndex::default();
-        index.add_analysis(&analysis);
+        let (analysis, index) = indexed_fixture("Recipe.java", "demo", source)?;
         let sink = analysis
             .call_chains
             .iter()
@@ -4159,15 +4000,8 @@ mod tests {
                 }
             }
         ";
-        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
-        let mut index = super::JavaProjectIndex::default();
-        index.add_analysis(&analysis);
-        let calls: Vec<_> = analysis
-            .call_chains
-            .iter()
-            .flat_map(|chain| &chain.calls)
-            .filter(|call| call.name == "sink")
-            .collect();
+        let (analysis, index) = indexed_fixture("Recipe.java", "demo", source)?;
+        let calls: Vec<_> = sink_calls(&analysis).collect();
         assert_eq!(calls.len(), 2);
         for (call, expected) in calls.iter().zip(["parameter", "local"]) {
             let value = index
@@ -4190,9 +4024,7 @@ mod tests {
                 }
             }
         ";
-        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
-        let mut index = super::JavaProjectIndex::default();
-        index.add_analysis(&analysis);
+        let (analysis, index) = indexed_fixture("Recipe.java", "demo", source)?;
         let sink = analysis
             .call_chains
             .iter()
@@ -4220,19 +4052,8 @@ mod tests {
                 void run(int tier) { sink(ComponentType.MOTOR.getComponent(tier).get(4)); }
             }
         ";
-        let analysis = analyze_source("Outer.java", "demo", None, source)?;
-        let mut index = super::JavaProjectIndex::default();
-        index.add_analysis(&analysis);
-        let sink = analysis
-            .call_chains
-            .iter()
-            .flat_map(|chain| &chain.calls)
-            .find(|call| call.name == "sink")
-            .ok_or_else(|| anyhow::anyhow!("sink call missing"))?;
-        let expression = sink
-            .argument_expressions
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("sink argument missing"))?;
+        let (analysis, index) = indexed_fixture("Outer.java", "demo", source)?;
+        let (sink, expression) = first_sink_argument(&analysis)?;
         let (resolved, receiver_type) = index
             .resolve_call_at(
                 "Outer.java",
@@ -4257,19 +4078,8 @@ mod tests {
             }
             class Recipe { void run() { sink(Outer.Inner.VALUE.get(4)); } }
         ";
-        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
-        let mut index = super::JavaProjectIndex::default();
-        index.add_analysis(&analysis);
-        let sink = analysis
-            .call_chains
-            .iter()
-            .flat_map(|chain| &chain.calls)
-            .find(|call| call.name == "sink")
-            .ok_or_else(|| anyhow::anyhow!("sink call missing"))?;
-        let expression = sink
-            .argument_expressions
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("sink argument missing"))?;
+        let (analysis, index) = indexed_fixture("Recipe.java", "demo", source)?;
+        let (sink, expression) = first_sink_argument(&analysis)?;
         let nested_field = index
             .resolve_field("demo.Outer.Inner", "VALUE", Some(true))
             .ok_or_else(|| anyhow::anyhow!("nested VALUE field was not indexed"))?;
@@ -4321,19 +4131,8 @@ mod tests {
                 }
             }
         ";
-        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
-        let mut index = super::JavaProjectIndex::default();
-        index.add_analysis(&analysis);
-        let sink = analysis
-            .call_chains
-            .iter()
-            .flat_map(|chain| &chain.calls)
-            .find(|call| call.name == "sink")
-            .ok_or_else(|| anyhow::anyhow!("sink call missing"))?;
-        let expression = sink
-            .argument_expressions
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("sink argument missing"))?;
+        let (analysis, index) = indexed_fixture("Recipe.java", "demo", source)?;
+        let (sink, expression) = first_sink_argument(&analysis)?;
         let (resolved, receiver_type) = index
             .resolve_call_at(
                 "Recipe.java",
@@ -4359,19 +4158,8 @@ mod tests {
                 void run() { sink(make(4)); }
             }
         ";
-        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
-        let mut index = super::JavaProjectIndex::default();
-        index.add_analysis(&analysis);
-        let sink = analysis
-            .call_chains
-            .iter()
-            .flat_map(|chain| &chain.calls)
-            .find(|call| call.name == "sink")
-            .ok_or_else(|| anyhow::anyhow!("sink call missing"))?;
-        let expression = sink
-            .argument_expressions
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("sink argument missing"))?;
+        let (analysis, index) = indexed_fixture("Recipe.java", "demo", source)?;
+        let (sink, expression) = first_sink_argument(&analysis)?;
         let (resolved, receiver_type) = index
             .resolve_call_at(
                 "Recipe.java",
@@ -4393,9 +4181,7 @@ mod tests {
             class RecipeMetadataKey<T> {}
             class ResearchKey extends RecipeMetadataKey<ItemStack> {}
         ";
-        let analysis = analyze_source("ResearchKey.java", "demo", None, source)?;
-        let mut index = super::JavaProjectIndex::default();
-        index.add_analysis(&analysis);
+        let (_, index) = indexed_fixture("ResearchKey.java", "demo", source)?;
         assert_eq!(
             index.generic_supertype_argument("demo.ResearchKey", "RecipeMetadataKey", 0),
             Some(String::from("net.minecraft.item.ItemStack"))
@@ -4411,9 +4197,7 @@ mod tests {
             enum Upgrade { NONE, BIO }
             class UpgradeKey extends RecipeMetadataKey<Upgrade> {}
         ";
-        let analysis = analyze_source("UpgradeKey.java", "demo", None, source)?;
-        let mut index = super::JavaProjectIndex::default();
-        index.add_analysis(&analysis);
+        let (_, index) = indexed_fixture("UpgradeKey.java", "demo", source)?;
         assert_eq!(
             index.generic_supertype_argument("demo.UpgradeKey", "RecipeMetadataKey", 0),
             Some(String::from("demo.Upgrade"))
@@ -4427,9 +4211,7 @@ mod tests {
             package demo;
             enum FuelType { DIESEL, GAS, HOT, SEMI_FLUID, PLASMA, MAGIC; }
         ";
-        let analysis = analyze_source("FuelType.java", "demo", None, source)?;
-        let mut index = super::JavaProjectIndex::default();
-        index.add_analysis(&analysis);
+        let (_, index) = indexed_fixture("FuelType.java", "demo", source)?;
         assert_eq!(
             index.enum_constant_ordinal("demo.FuelType", "DIESEL"),
             Some(0)
@@ -4454,19 +4236,8 @@ mod tests {
             class Tool extends BaseTool {}
             class Recipe { void run(Tool tool) { sink(tool.build(4)); } }
         ";
-        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
-        let mut index = super::JavaProjectIndex::default();
-        index.add_analysis(&analysis);
-        let sink = analysis
-            .call_chains
-            .iter()
-            .flat_map(|chain| &chain.calls)
-            .find(|call| call.name == "sink")
-            .ok_or_else(|| anyhow::anyhow!("sink call missing"))?;
-        let expression = sink
-            .argument_expressions
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("sink argument missing"))?;
+        let (analysis, index) = indexed_fixture("Recipe.java", "demo", source)?;
+        let (sink, expression) = first_sink_argument(&analysis)?;
         let (resolved, receiver_type) = index
             .resolve_call_at(
                 "Recipe.java",
@@ -4496,19 +4267,8 @@ mod tests {
                 }
             }
         ";
-        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
-        let mut index = super::JavaProjectIndex::default();
-        index.add_analysis(&analysis);
-        let sink = analysis
-            .call_chains
-            .iter()
-            .flat_map(|chain| &chain.calls)
-            .find(|call| call.name == "sink")
-            .ok_or_else(|| anyhow::anyhow!("sink call missing"))?;
-        let expression = sink
-            .argument_expressions
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("sink argument missing"))?;
+        let (analysis, index) = indexed_fixture("Recipe.java", "demo", source)?;
+        let (sink, expression) = first_sink_argument(&analysis)?;
         let (resolved, _) = index
             .resolve_call_at(
                 "Recipe.java",
@@ -4534,19 +4294,8 @@ mod tests {
             }
             class Recipe { void run() { sink(Helper.get(Short.MAX_VALUE)); } }
         ";
-        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
-        let mut index = super::JavaProjectIndex::default();
-        index.add_analysis(&analysis);
-        let sink = analysis
-            .call_chains
-            .iter()
-            .flat_map(|chain| &chain.calls)
-            .find(|call| call.name == "sink")
-            .ok_or_else(|| anyhow::anyhow!("sink call missing"))?;
-        let expression = sink
-            .argument_expressions
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("sink argument missing"))?;
+        let (analysis, index) = indexed_fixture("Recipe.java", "demo", source)?;
+        let (sink, expression) = first_sink_argument(&analysis)?;
         let (resolved, _) = index
             .resolve_call_at(
                 "Recipe.java",
@@ -4570,19 +4319,8 @@ mod tests {
             }
             class Recipe { void run(Holder holder) { sink(holder.get(4)); } }
         ";
-        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
-        let mut index = super::JavaProjectIndex::default();
-        index.add_analysis(&analysis);
-        let sink = analysis
-            .call_chains
-            .iter()
-            .flat_map(|chain| &chain.calls)
-            .find(|call| call.name == "sink")
-            .ok_or_else(|| anyhow::anyhow!("sink call missing"))?;
-        let expression = sink
-            .argument_expressions
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("sink argument missing"))?;
+        let (analysis, index) = indexed_fixture("Recipe.java", "demo", source)?;
+        let (sink, expression) = first_sink_argument(&analysis)?;
         let (resolved, _) = index
             .resolve_call_at(
                 "Recipe.java",
@@ -4604,16 +4342,7 @@ mod tests {
             }
         ";
         let analysis = analyze_source("Recipe.java", "demo", None, source)?;
-        let sink = analysis
-            .call_chains
-            .iter()
-            .flat_map(|chain| &chain.calls)
-            .find(|call| call.name == "sink")
-            .ok_or_else(|| anyhow::anyhow!("sink call missing"))?;
-        let expression = sink
-            .argument_expressions
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("sink argument missing"))?;
+        let (_, expression) = first_sink_argument(&analysis)?;
         assert!(matches!(
             expression,
             super::JavaExpression::Lambda { body }
@@ -4632,19 +4361,8 @@ mod tests {
                 }
             }
         ";
-        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
-        let mut index = super::JavaProjectIndex::default();
-        index.add_analysis(&analysis);
-        let sink = analysis
-            .call_chains
-            .iter()
-            .flat_map(|chain| &chain.calls)
-            .find(|call| call.name == "sink")
-            .ok_or_else(|| anyhow::anyhow!("sink call missing"))?;
-        let expression = sink
-            .argument_expressions
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("sink argument missing"))?;
+        let (analysis, index) = indexed_fixture("Recipe.java", "demo", source)?;
+        let (sink, expression) = first_sink_argument(&analysis)?;
         assert!(matches!(
             expression,
             super::JavaExpression::Cast { value, .. }
@@ -4673,19 +4391,8 @@ mod tests {
                 }
             }
         ";
-        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
-        let mut index = super::JavaProjectIndex::default();
-        index.add_analysis(&analysis);
-        let sink = analysis
-            .call_chains
-            .iter()
-            .flat_map(|chain| &chain.calls)
-            .find(|call| call.name == "sink")
-            .ok_or_else(|| anyhow::anyhow!("sink call missing"))?;
-        let expression = sink
-            .argument_expressions
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("sink argument missing"))?;
+        let (analysis, index) = indexed_fixture("Recipe.java", "demo", source)?;
+        let (sink, expression) = first_sink_argument(&analysis)?;
         assert!(matches!(
             expression,
             super::JavaExpression::Conditional { .. }
@@ -4716,19 +4423,8 @@ mod tests {
                 void run() { sink(Materials.getInstance().IRON.getDust(4)); }
             }
         ";
-        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
-        let mut index = super::JavaProjectIndex::default();
-        index.add_analysis(&analysis);
-        let sink = analysis
-            .call_chains
-            .iter()
-            .flat_map(|chain| &chain.calls)
-            .find(|call| call.name == "sink")
-            .ok_or_else(|| anyhow::anyhow!("sink call missing"))?;
-        let expression = sink
-            .argument_expressions
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("sink argument missing"))?;
+        let (analysis, index) = indexed_fixture("Recipe.java", "demo", source)?;
+        let (sink, expression) = first_sink_argument(&analysis)?;
         let (resolved, receiver_type) = index
             .resolve_call_at(
                 "Recipe.java",
@@ -4760,7 +4456,9 @@ mod tests {
         let bindings = method
             .argument_bindings(&arguments)
             .ok_or_else(|| anyhow::anyhow!("argument binding failed"))?;
-        let substituted = super::substitute_references(&method.returns[0].expression, &bindings);
+        let substituted = super::rewrite_references(&method.returns[0].expression, &|name| {
+            bindings.get(name).cloned()
+        });
         assert!(matches!(substituted, super::JavaExpression::Binary { .. }));
         Ok(())
     }
@@ -4774,9 +4472,7 @@ mod tests {
                 static final int HALF = (int) BASE / 2;
             }
         ";
-        let analysis = analyze_source("Constants.java", "demo", None, source)?;
-        let mut index = super::JavaProjectIndex::default();
-        index.add_analysis(&analysis);
+        let (_, index) = indexed_fixture("Constants.java", "demo", source)?;
         let base = index
             .resolve_field("demo.Constants", "BASE", Some(true))
             .ok_or_else(|| anyhow::anyhow!("BASE field missing"))?;

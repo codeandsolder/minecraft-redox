@@ -1,6 +1,8 @@
 use std::collections::BTreeSet;
 
-use minecraft_redox_java::{JavaBindings, JavaExpression, JavaField, JavaProjectIndex};
+use minecraft_redox_java::{
+    JavaBindings, JavaExpression, JavaField, JavaProjectIndex, rewrite_references,
+};
 
 use crate::recipe_expression::{literal_i64, resolved_reference_name};
 
@@ -22,150 +24,13 @@ pub fn scalar_i64_at(
     source_path: &str,
     byte_position: usize,
 ) -> Option<i64> {
-    let expression =
-        qualify_use_site_static_fields(expression, bindings, project, source_path, byte_position);
+    let expression = rewrite_references(expression, &|reference| {
+        project
+            .qualified_field_reference_at(source_path, byte_position, reference, bindings)
+            .map(JavaExpression::Reference)
+    });
     let mut seen = BTreeSet::new();
     eval_i64(&expression, bindings, project, None, 0, &mut seen)
-}
-
-fn qualify_use_site_static_fields(
-    expression: &JavaExpression,
-    bindings: &JavaBindings,
-    project: &JavaProjectIndex,
-    source_path: &str,
-    byte_position: usize,
-) -> JavaExpression {
-    match expression {
-        JavaExpression::Reference(reference) => project
-            .qualified_field_reference_at(source_path, byte_position, reference, bindings)
-            .map_or_else(|| expression.clone(), JavaExpression::Reference),
-        JavaExpression::FieldAccess { receiver, field } => JavaExpression::FieldAccess {
-            receiver: Box::new(qualify_use_site_static_fields(
-                receiver,
-                bindings,
-                project,
-                source_path,
-                byte_position,
-            )),
-            field: field.clone(),
-        },
-        JavaExpression::ArrayAccess { array, index } => JavaExpression::ArrayAccess {
-            array: Box::new(qualify_use_site_static_fields(
-                array,
-                bindings,
-                project,
-                source_path,
-                byte_position,
-            )),
-            index: Box::new(qualify_use_site_static_fields(
-                index,
-                bindings,
-                project,
-                source_path,
-                byte_position,
-            )),
-        },
-        JavaExpression::Cast { type_name, value } => JavaExpression::Cast {
-            type_name: type_name.clone(),
-            value: Box::new(qualify_use_site_static_fields(
-                value,
-                bindings,
-                project,
-                source_path,
-                byte_position,
-            )),
-        },
-        JavaExpression::Binary {
-            left,
-            operator,
-            right,
-        } => JavaExpression::Binary {
-            left: Box::new(qualify_use_site_static_fields(
-                left,
-                bindings,
-                project,
-                source_path,
-                byte_position,
-            )),
-            operator: operator.clone(),
-            right: Box::new(qualify_use_site_static_fields(
-                right,
-                bindings,
-                project,
-                source_path,
-                byte_position,
-            )),
-        },
-        JavaExpression::Unary { operator, operand } => JavaExpression::Unary {
-            operator: operator.clone(),
-            operand: Box::new(qualify_use_site_static_fields(
-                operand,
-                bindings,
-                project,
-                source_path,
-                byte_position,
-            )),
-        },
-        JavaExpression::Conditional {
-            condition,
-            when_true,
-            when_false,
-        } => JavaExpression::Conditional {
-            condition: Box::new(qualify_use_site_static_fields(
-                condition,
-                bindings,
-                project,
-                source_path,
-                byte_position,
-            )),
-            when_true: Box::new(qualify_use_site_static_fields(
-                when_true,
-                bindings,
-                project,
-                source_path,
-                byte_position,
-            )),
-            when_false: Box::new(qualify_use_site_static_fields(
-                when_false,
-                bindings,
-                project,
-                source_path,
-                byte_position,
-            )),
-        },
-        JavaExpression::Call {
-            receiver,
-            method,
-            arguments,
-        } => JavaExpression::Call {
-            receiver: receiver.as_ref().map(|receiver| {
-                Box::new(qualify_use_site_static_fields(
-                    receiver,
-                    bindings,
-                    project,
-                    source_path,
-                    byte_position,
-                ))
-            }),
-            method: method.clone(),
-            arguments: arguments
-                .iter()
-                .map(|argument| {
-                    qualify_use_site_static_fields(
-                        argument,
-                        bindings,
-                        project,
-                        source_path,
-                        byte_position,
-                    )
-                })
-                .collect(),
-        },
-        JavaExpression::Parenthesized(inner) => JavaExpression::Parenthesized(Box::new(
-            qualify_use_site_static_fields(inner, bindings, project, source_path, byte_position),
-        )),
-        _ => expression.clone(),
-    }
 }
 
 #[derive(Clone, Copy)]
