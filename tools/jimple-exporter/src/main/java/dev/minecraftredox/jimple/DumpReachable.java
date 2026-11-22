@@ -51,13 +51,15 @@ public final class DumpReachable {
     private final View view;
     private final int maxMethods;
     private final int maxDepth;
+    private final ClassType rootRuntimeType;
     private final ArrayDeque<Pending> pending = new ArrayDeque<>();
     private final Map<String, SootMethod> methods = new LinkedHashMap<>();
     private final Set<String> queued = new HashSet<>();
     private final Set<String> initializerOwners = new HashSet<>();
 
-    private DumpReachable(View view, int maxMethods, int maxDepth) {
+    private DumpReachable(View view, ClassType rootRuntimeType, int maxMethods, int maxDepth) {
         this.view = view;
+        this.rootRuntimeType = rootRuntimeType;
         this.maxMethods = maxMethods;
         this.maxDepth = maxDepth;
     }
@@ -88,7 +90,7 @@ public final class DumpReachable {
                     "no concrete root methods matched " + args[1] + "::" + args[2]);
         }
 
-        DumpReachable exporter = new DumpReachable(view, maxMethods, maxDepth);
+        DumpReachable exporter = new DumpReachable(view, rootType, maxMethods, maxDepth);
         roots.forEach(method -> exporter.enqueue(method.getSignature(), 0));
         exporter.enqueueClassInitializer(rootType, 0);
         exporter.run();
@@ -198,7 +200,9 @@ public final class DumpReachable {
             MethodSignature target = invoke.getMethodSignature();
             if (!(invoke instanceof JDynamicInvokeExpr)) {
                 enqueue(target, childDepth);
-                if (!(invoke instanceof AbstractInstanceInvokeExpr)) {
+                if (invoke instanceof AbstractInstanceInvokeExpr) {
+                    enqueueRootRuntimeDispatchCandidate(target, childDepth);
+                } else {
                     enqueueClassInitializer(target.getDeclClassType(), childDepth);
                 }
             }
