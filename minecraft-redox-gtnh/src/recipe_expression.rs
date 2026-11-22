@@ -129,7 +129,7 @@ pub struct RecoveredExpression<T> {
     pub semantic: Option<T>,
 }
 
-#[must_use]
+#[must_use = "the returned items contain the recovered recipe values"]
 pub fn recover_items(
     sources: &[String],
     expressions: &[JavaExpression],
@@ -140,7 +140,7 @@ pub fn recover_items(
     })
 }
 
-#[must_use]
+#[must_use = "the returned items describe the recovered recipe inputs"]
 pub fn recover_item_inputs(
     sources: &[String],
     expressions: &[JavaExpression],
@@ -153,7 +153,7 @@ pub fn recover_item_inputs(
     })
 }
 
-#[must_use]
+#[must_use = "the returned inputs incorporate project-wide expression resolution"]
 pub fn recover_item_inputs_with_project(
     sources: &[String],
     expressions: &[JavaExpression],
@@ -188,7 +188,7 @@ pub fn recover_item_inputs_with_project(
     })
 }
 
-#[must_use]
+#[must_use = "the returned items incorporate project-wide expression resolution"]
 pub fn recover_items_with_project(
     sources: &[String],
     expressions: &[JavaExpression],
@@ -214,7 +214,7 @@ pub fn recover_items_with_project(
     })
 }
 
-#[must_use]
+#[must_use = "the returned fluids describe recovered recipe values"]
 pub fn recover_fluids(
     sources: &[String],
     expressions: &[JavaExpression],
@@ -225,7 +225,7 @@ pub fn recover_fluids(
     })
 }
 
-#[must_use]
+#[must_use = "the returned fluids incorporate project-wide expression resolution"]
 pub fn recover_fluids_with_project(
     sources: &[String],
     expressions: &[JavaExpression],
@@ -252,7 +252,7 @@ pub fn recover_fluids_with_project(
     })
 }
 
-#[must_use]
+#[must_use = "the returned duration indicates whether the expression resolves to ticks"]
 pub fn duration_ticks(expression: &JavaExpression, bindings: &JavaBindings) -> Option<i64> {
     eval_i64(expression, bindings)
 }

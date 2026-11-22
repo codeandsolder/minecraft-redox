@@ -12,12 +12,12 @@ use crate::SourceOrigin;
 pub struct ContentId(pub String);
 
 impl ContentId {
-    #[must_use]
+    #[must_use = "the returned identifier owns the supplied resource name"]
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
     }
 
-    #[must_use]
+    #[must_use = "the returned reference identifies the underlying resource name"]
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -94,7 +94,7 @@ impl Probability {
         denominator: 1,
     };
 
-    #[must_use]
+    #[must_use = "the returned fraction indicates whether the ratio is valid"]
     pub const fn new(numerator: u64, denominator: u64) -> Option<Self> {
         if denominator == 0 || numerator > denominator {
             return None;
@@ -359,7 +359,7 @@ pub struct FixedDecimal {
 }
 
 impl FixedDecimal {
-    #[must_use]
+    #[must_use = "the returned decimal represents the exact integer"]
     pub const fn integer(value: i64) -> Self {
         Self {
             coefficient: value,

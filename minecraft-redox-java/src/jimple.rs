@@ -509,14 +509,14 @@ pub fn parse_methods(json: &str) -> Result<Vec<JimpleMethod>> {
 }
 
 impl JimpleMethod {
-    #[must_use]
+    #[must_use = "the returned statement matches the requested text when present"]
     pub fn statement_containing(&self, text: &str) -> Option<&JimpleStatement> {
         self.statements
             .iter()
             .find(|statement| statement.text.contains(text))
     }
 
-    #[must_use]
+    #[must_use = "the returned statement IDs form the dependency slice"]
     pub fn backward_slice(&self, sink_id: usize) -> Vec<usize> {
         let Some(sink) = self
             .statements
@@ -540,7 +540,7 @@ impl JimpleMethod {
     /// This intentionally reports compiler locals rather than assigning domain meaning. Loop
     /// induction variables and semantic counters can share this shape; update guards and use-site
     /// context let later lowering distinguish them.
-    #[must_use]
+    #[must_use = "the returned candidates describe possible local counters"]
     pub fn local_counter_candidates(&self) -> Vec<JimpleLocalCounterCandidate> {
         let mut initial_values: BTreeMap<String, Vec<i64>> = BTreeMap::new();
         let mut updates: BTreeMap<String, Vec<JimpleLocalCounterUpdate>> = BTreeMap::new();
@@ -601,7 +601,7 @@ impl JimpleMethod {
     /// The loop bound is resolved through CFG reaching definitions without requiring it to be a
     /// literal. A constant bound additionally yields an exact trip count; dynamic bounds remain
     /// explicit for later transaction/resource lowering.
-    #[must_use]
+    #[must_use = "the returned loops describe inferred induction variables"]
     pub fn induction_loops(&self) -> Vec<JimpleInductionLoop> {
         let predecessors = self.predecessors();
         let dominators = self.dominators(&predecessors);
@@ -690,7 +690,7 @@ impl JimpleMethod {
     }
 
     /// Recover the subset of induction loops with a provable constant trip count.
-    #[must_use]
+    #[must_use = "the returned loops describe proven fixed trip counts"]
     pub fn fixed_trip_loops(&self) -> Vec<JimpleFixedTripLoop> {
         self.induction_loops()
             .into_iter()
@@ -717,7 +717,7 @@ impl JimpleMethod {
     /// This deliberately recognizes only the exact source-neutral shape `field = field * m + a`
     /// (with commuted multiplication/addition operands allowed). More complex recurrences remain
     /// explicit rather than being guessed.
-    #[must_use]
+    #[must_use = "the returned recurrences describe affine field updates in fixed loops"]
     pub fn fixed_loop_affine_field_recurrences(&self) -> Vec<JimpleAffineFieldRecurrence> {
         let loops = self.fixed_trip_loops();
         let writes: Vec<_> = self
@@ -768,7 +768,7 @@ impl JimpleMethod {
     ///
     /// This is source-neutral: it does not identify a particular RNG or callback API. A caller can
     /// bind the recovered selector method separately and retain argument order as component order.
-    #[must_use]
+    #[must_use = "the returned selectors describe affine bit selection in fixed loops"]
     pub fn fixed_loop_affine_bit_selectors(&self) -> Vec<JimpleAffineBitSelectorCandidate> {
         let loops = self.fixed_trip_loops();
         let recurrences = self.fixed_loop_affine_field_recurrences();
@@ -926,7 +926,7 @@ impl JimpleMethod {
     /// Local temporaries are resolved at each program point, while heap fields remain state facts.
     /// Calls are reported separately so a program-level analysis can compose exact callees without
     /// pretending ambiguous dynamic dispatch is known.
-    #[must_use]
+    #[must_use = "the returned summary describes the method's effects"]
     pub fn effect_summary(&self) -> JimpleEffectSummary {
         let mut effects = Vec::new();
 
@@ -978,7 +978,7 @@ impl JimpleMethod {
     /// The detector follows local definitions before matching, so it recognizes JVM/Jimple
     /// shapes such as `tmp = this.counter; tmp2 = tmp - 1; this.counter = tmp2` without
     /// knowing the source field or class name.
-    #[must_use]
+    #[must_use = "the returned summary describes the method's temporal behavior"]
     pub fn temporal_summary(&self) -> JimpleTemporalSummary {
         let effects = self.effect_summary();
         let mut counter_updates = Vec::new();
@@ -2812,7 +2812,7 @@ pub struct FiniteExecution {
 }
 
 impl FiniteExecution {
-    #[must_use]
+    #[must_use = "the returned snapshot describes the requested static array when present"]
     pub fn static_array(&self, owner: &str, name: &str) -> Option<&AbstractArraySnapshot> {
         self.arrays.iter().find(|array| {
             matches!(
@@ -2823,7 +2823,7 @@ impl FiniteExecution {
         })
     }
 
-    #[must_use]
+    #[must_use = "the returned snapshot describes the requested abstract object when present"]
     pub fn object(&self, id: u64) -> Option<&AbstractObjectSnapshot> {
         self.objects.iter().find(|object| object.id == id)
     }
