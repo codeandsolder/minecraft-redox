@@ -9,7 +9,9 @@ use minecraft_redox_core::transaction::{
     MemoryTransactionHost, TransactionDatum, TransactionExecution, TransactionExecutionLimits,
     TransactionProgram, execute_transaction,
 };
-use minecraft_redox_gtnh::{GtnhSummary, lower_recipe_with_project, recover_with_project};
+use minecraft_redox_gtnh::{
+    GtnhSummary, MaterialRecovery, lower_materials, lower_recipe_with_project, recover_with_project,
+};
 use minecraft_redox_java::{
     JavaProjectIndex, analyze_source, inventory_source,
     jimple::{
@@ -78,6 +80,9 @@ fn main() -> Result<()> {
         [_, command, path] if command == "gtnh" => print_gtnh(path, false),
         [_, command, flag, path] if command == "gtnh" && flag == "--summary" => {
             print_gtnh(path, true)
+        }
+        [_, command, flag, path] if command == "gtnh" && flag == "--materials" => {
+            print_gtnh_materials(path)
         }
         [_, command, flag, path] if command == "gtnh" && flag == "--blockers" => {
             print_gtnh_blockers(path)
@@ -163,7 +168,7 @@ fn main() -> Result<()> {
         }
         [_, command, path, request] if command == "jimple-call" => print_jimple_call(path, request),
         _ => bail!(
-            "usage: minecraft-redox [inventory|chains] <java-file> | gtnh [--summary|--blockers] <file-or-dir> | jimple-slice <json> <method-substring> <sink-substring> | jimple-execute-array <json> <method-substring> <field-owner> <field-name> | jimple-program <json> <owner::method,...> | jimple-program-call <json> <owner::method,...> <request-json> | jimple-call <json> <request-json> | jimple-temporal <json> | jimple-loops <json> <method-substring> | jimple-local-counters <json> <method-substring> | jimple-effects <json> <method-substring> | jimple-clocked <json> <method-substring> | jimple-calls <json> <method-substring> <callee-substring> | jimple-calls-runtime <json> <method-substring> <callee-substring> <runtime-type> | jimple-bind-schedule <json> <method-substring> <runtime-type-or--> <binding-json> | jimple-bind-uniform-int <json> <method-substring> <runtime-type-or--> <binding-json> | jimple-bind-indexed-store <json> <method-substring> <runtime-type-or--> <bindings-json> | jimple-bind-rollbacks <json> <method-substring> <runtime-type-or--> <store-bindings-json> <clone-bindings-json> | jimple-transaction-coverage <json> <method-substring> <runtime-type-or--> <bindings-json> | jimple-lower-transaction <json> <method-substring> <bindings-json> | jimple-lower-transaction-runtime <json> <method-substring> <runtime-type> <bindings-json> | transaction-run-memory <program-json> <host-json> <request-json>"
+            "usage: minecraft-redox [inventory|chains] <java-file> | gtnh [--summary|--blockers|--materials] <file-or-dir> | jimple-slice <json> <method-substring> <sink-substring> | jimple-execute-array <json> <method-substring> <field-owner> <field-name> | jimple-program <json> <owner::method,...> | jimple-program-call <json> <owner::method,...> <request-json> | jimple-call <json> <request-json> | jimple-temporal <json> | jimple-loops <json> <method-substring> | jimple-local-counters <json> <method-substring> | jimple-effects <json> <method-substring> | jimple-clocked <json> <method-substring> | jimple-calls <json> <method-substring> <callee-substring> | jimple-calls-runtime <json> <method-substring> <callee-substring> <runtime-type> | jimple-bind-schedule <json> <method-substring> <runtime-type-or--> <binding-json> | jimple-bind-uniform-int <json> <method-substring> <runtime-type-or--> <binding-json> | jimple-bind-indexed-store <json> <method-substring> <runtime-type-or--> <bindings-json> | jimple-bind-rollbacks <json> <method-substring> <runtime-type-or--> <store-bindings-json> <clone-bindings-json> | jimple-transaction-coverage <json> <method-substring> <runtime-type-or--> <bindings-json> | jimple-lower-transaction <json> <method-substring> <bindings-json> | jimple-lower-transaction-runtime <json> <method-substring> <runtime-type> <bindings-json> | transaction-run-memory <program-json> <host-json> <request-json>"
         ),
     }
 }
@@ -817,6 +822,24 @@ fn print_gtnh(path: &str, summary_only: bool) -> Result<()> {
         }
     }
     println!("{}", serde_json::to_string_pretty(&files)?);
+    Ok(())
+}
+
+fn print_gtnh_materials(path: &str) -> Result<()> {
+    let paths = java_paths(Path::new(path))?;
+    let project = build_project_index(&paths)?;
+    let mut materials = MaterialRecovery::default();
+    for source_path in paths {
+        let display = source_path.to_string_lossy();
+        let source = read_source(&source_path)?;
+        let analysis = analyze_source(&display, "GTNH", None, &source)?;
+        let recovery = recover_with_project(&analysis, &project);
+        let result = lower_materials(&analysis, &recovery, &project);
+        materials.materials.extend(result.materials);
+        materials.failures.extend(result.failures);
+        materials.oracles.extend(result.oracles);
+    }
+    println!("{}", serde_json::to_string_pretty(&materials)?);
     Ok(())
 }
 
