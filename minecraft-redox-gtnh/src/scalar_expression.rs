@@ -96,11 +96,83 @@ fn qualify_use_site_static_fields(
                 byte_position,
             )),
         },
+        JavaExpression::Unary { operator, operand } => JavaExpression::Unary {
+            operator: operator.clone(),
+            operand: Box::new(qualify_use_site_static_fields(
+                operand,
+                bindings,
+                project,
+                source_path,
+                byte_position,
+            )),
+        },
+        JavaExpression::Conditional {
+            condition,
+            when_true,
+            when_false,
+        } => JavaExpression::Conditional {
+            condition: Box::new(qualify_use_site_static_fields(
+                condition,
+                bindings,
+                project,
+                source_path,
+                byte_position,
+            )),
+            when_true: Box::new(qualify_use_site_static_fields(
+                when_true,
+                bindings,
+                project,
+                source_path,
+                byte_position,
+            )),
+            when_false: Box::new(qualify_use_site_static_fields(
+                when_false,
+                bindings,
+                project,
+                source_path,
+                byte_position,
+            )),
+        },
+        JavaExpression::Call {
+            receiver,
+            method,
+            arguments,
+        } => JavaExpression::Call {
+            receiver: receiver.as_ref().map(|receiver| {
+                Box::new(qualify_use_site_static_fields(
+                    receiver,
+                    bindings,
+                    project,
+                    source_path,
+                    byte_position,
+                ))
+            }),
+            method: method.clone(),
+            arguments: arguments
+                .iter()
+                .map(|argument| {
+                    qualify_use_site_static_fields(
+                        argument,
+                        bindings,
+                        project,
+                        source_path,
+                        byte_position,
+                    )
+                })
+                .collect(),
+        },
         JavaExpression::Parenthesized(inner) => JavaExpression::Parenthesized(Box::new(
             qualify_use_site_static_fields(inner, bindings, project, source_path, byte_position),
         )),
         _ => expression.clone(),
     }
+}
+
+#[derive(Clone, Copy)]
+struct ScalarEvalSite<'a> {
+    bindings: &'a JavaBindings,
+    project: &'a JavaProjectIndex,
+    current_owner: Option<&'a str>,
 }
 
 fn eval_i64(
@@ -137,6 +209,31 @@ fn eval_i64(
             let value = eval_i64(value, bindings, project, current_owner, depth + 1, seen)?;
             numeric_cast(type_name, value)
         }
+        JavaExpression::Unary { operator, operand } => {
+            let value = eval_i64(operand, bindings, project, current_owner, depth + 1, seen)?;
+            match operator.as_str() {
+                "+" => Some(value),
+                "-" => value.checked_neg(),
+                "~" => Some(!value),
+                _ => None,
+            }
+        }
+        JavaExpression::Conditional {
+            when_true,
+            when_false,
+            ..
+        } => {
+            let when_true = eval_i64(when_true, bindings, project, current_owner, depth + 1, seen)?;
+            let when_false = eval_i64(
+                when_false,
+                bindings,
+                project,
+                current_owner,
+                depth + 1,
+                seen,
+            )?;
+            (when_true == when_false).then_some(when_true)
+        }
         JavaExpression::Binary {
             left,
             operator,
@@ -149,12 +246,90 @@ fn eval_i64(
         JavaExpression::Parenthesized(inner) => {
             eval_i64(inner, bindings, project, current_owner, depth + 1, seen)
         }
+        JavaExpression::Call {
+            receiver: Some(receiver),
+            method,
+            arguments,
+        } if matches!(method.as_str(), "min" | "max") && arguments.len() == 2 => eval_math_i64(
+            receiver,
+            method,
+            arguments,
+            ScalarEvalSite {
+                bindings,
+                project,
+                current_owner,
+            },
+            depth,
+            seen,
+        ),
+        JavaExpression::Call {
+            receiver: Some(receiver),
+            method,
+            arguments,
+        } if method == "ordinal" && arguments.is_empty() => {
+            eval_enum_ordinal(receiver, bindings, project, current_owner)
+        }
         JavaExpression::Call { .. }
         | JavaExpression::New { .. }
         | JavaExpression::Array { .. }
-        | JavaExpression::Conditional { .. }
         | JavaExpression::Literal(_)
+        | JavaExpression::Lambda { .. }
         | JavaExpression::Raw(_) => None,
+    }
+}
+
+fn eval_enum_ordinal(
+    receiver: &JavaExpression,
+    bindings: &JavaBindings,
+    project: &JavaProjectIndex,
+    current_owner: Option<&str>,
+) -> Option<i64> {
+    let reference = resolved_reference_name(receiver, bindings)?;
+    let (owner, name) = reference.rsplit_once('.')?;
+    let ordinal = project.enum_constant_ordinal(owner, name).or_else(|| {
+        let package = current_owner
+            .and_then(|owner| owner.rsplit_once('.').map(|(package, _)| package))
+            .or(bindings.package.as_deref())?;
+        project.enum_constant_ordinal(&format!("{package}.{owner}"), name)
+    })?;
+    i64::try_from(ordinal).ok()
+}
+
+fn eval_math_i64(
+    receiver: &JavaExpression,
+    method: &str,
+    arguments: &[JavaExpression],
+    site: ScalarEvalSite<'_>,
+    depth: usize,
+    seen: &mut BTreeSet<String>,
+) -> Option<i64> {
+    let receiver = resolved_reference_name(receiver, site.bindings)?;
+    if !matches!(receiver.as_str(), "Math" | "java.lang.Math") {
+        return None;
+    }
+    let [left, right] = arguments else {
+        return None;
+    };
+    let left = eval_i64(
+        left,
+        site.bindings,
+        site.project,
+        site.current_owner,
+        depth + 1,
+        seen,
+    )?;
+    let right = eval_i64(
+        right,
+        site.bindings,
+        site.project,
+        site.current_owner,
+        depth + 1,
+        seen,
+    )?;
+    match method {
+        "min" => Some(left.min(right)),
+        "max" => Some(left.max(right)),
+        _ => None,
     }
 }
 
@@ -296,6 +471,43 @@ mod tests {
     use minecraft_redox_java::{JavaProjectIndex, analyze_source};
 
     use super::scalar_i64;
+
+    #[test]
+    fn evaluates_recovered_scalar_operations_at_use_site() -> anyhow::Result<()> {
+        let source = r"
+            package demo;
+            enum FuelType { DIESEL, GAS, HOT, SEMI_FLUID, PLASMA, MAGIC; }
+            class Recipe {
+                static final int VALUE = 4;
+                void run(boolean enabled) {
+                    sink(Math.max(VALUE, Math.min(1000, 200 * 8 / 320)));
+                    sink(FuelType.PLASMA.ordinal());
+                    sink(-VALUE);
+                    sink(enabled ? VALUE : 4);
+                }
+            }
+        ";
+        let analysis = analyze_source("Recipe.java", "demo", None, source)?;
+        let mut project = JavaProjectIndex::default();
+        project.add_analysis(&analysis);
+        let values: Vec<_> = analysis
+            .call_chains
+            .iter()
+            .flat_map(|chain| &chain.calls)
+            .filter(|call| call.name == "sink")
+            .map(|call| {
+                super::scalar_i64_at(
+                    &call.argument_expressions[0],
+                    &analysis.bindings,
+                    &project,
+                    "Recipe.java",
+                    call.byte_start,
+                )
+            })
+            .collect();
+        assert_eq!(values, vec![Some(5), Some(4), Some(-4), Some(4)]);
+        Ok(())
+    }
 
     #[test]
     fn evaluates_gt_recipe_tier_from_source_definitions() -> anyhow::Result<()> {
