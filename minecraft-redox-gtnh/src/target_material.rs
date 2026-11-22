@@ -1177,28 +1177,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_post_construction_effects() -> anyhow::Result<()> {
-        let source = r#"
-            class MaterialsInit {
-                void run() {
-                    Materials foo = new MaterialBuilder()
-                        .setName("Foo")
-                        .setDefaultLocalName("Foo")
-                        .constructMaterial()
-                        .addDustItems();
-                }
-            }
-        "#;
-        let failure = lower_fixture(source)?
-            .err()
-            .ok_or_else(|| anyhow::anyhow!("unsupported post-construction call was accepted"))?;
-        assert!(failure.blockers.iter().any(|blocker| blocker.kind
-            == MaterialLoweringBlockerKind::UnsupportedProperty
-            && blocker.detail == "addDustItems"));
-        Ok(())
-    }
-
-    #[test]
     fn lowers_custom_texture_set_shape() -> anyhow::Result<()> {
         let source = r#"
             import gregtech.api.enums.*;
@@ -1285,21 +1263,30 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn unsupported_builder_call_is_not_silently_discarded() -> anyhow::Result<()> {
-        let source = r#"
-            class MaterialsInit {
-                void run() {
-                    new MaterialBuilder().setName("Foo").setDefaultLocalName("Foo")
-                        .unknownRuntimeProperty().constructMaterial();
-                }
-            }
-        "#;
-        let failure = lower_fixture(source)?
-            .err()
-            .ok_or_else(|| anyhow::anyhow!("unknown property was accepted"))?;
-        assert!(failure.blockers.iter().any(|blocker| blocker.kind
-            == MaterialLoweringBlockerKind::UnsupportedProperty
-            && blocker.detail == "unknownRuntimeProperty"));
+    fn unsupported_builder_and_post_construction_calls_are_not_discarded() -> anyhow::Result<()> {
+        for (suffix, expected) in [
+            (
+                ".unknownRuntimeProperty().constructMaterial()",
+                "unknownRuntimeProperty",
+            ),
+            (".constructMaterial().addDustItems()", "addDustItems"),
+        ] {
+            let source = format!(
+                r#"
+                class MaterialsInit {{
+                    void run() {{
+                        new MaterialBuilder().setName("Foo").setDefaultLocalName("Foo"){suffix};
+                    }}
+                }}
+            "#
+            );
+            let failure = lower_fixture(&source)?
+                .err()
+                .ok_or_else(|| anyhow::anyhow!("unsupported call {expected} was accepted"))?;
+            assert!(failure.blockers.iter().any(|blocker| blocker.kind
+                == MaterialLoweringBlockerKind::UnsupportedProperty
+                && blocker.detail == expected));
+        }
         Ok(())
     }
 
