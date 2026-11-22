@@ -411,12 +411,12 @@ fn lower_property(
             material.components.push(MaterialComponentSpec {
                 material: id,
                 amount,
-            })
+            });
         }),
         "addAspect" => lower_counted_content(call, bindings, project).map(|(id, amount)| {
             material
                 .aspects
-                .push(MaterialAspectSpec { aspect: id, amount })
+                .push(MaterialAspectSpec { aspect: id, amount });
         }),
         "addOreByproduct" => call
             .argument_expressions
