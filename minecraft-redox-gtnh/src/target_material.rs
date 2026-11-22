@@ -33,7 +33,7 @@ pub enum MaterialLoweringBlockerKind {
 }
 
 impl MaterialLoweringBlockerKind {
-    #[must_use]
+    #[must_use = "the returned text identifies the material field in the target schema"]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Name => "name",
