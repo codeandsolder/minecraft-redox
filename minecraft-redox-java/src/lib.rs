@@ -3767,8 +3767,12 @@ mod tests {
     }
 
     #[test]
-    fn resolves_enum_constant_receiver_type() -> anyhow::Result<()> {
-        let source = r"
+    fn resolves_receiver_and_declaring_type_across_scopes() -> anyhow::Result<()> {
+        for (case, path, source, owner, receiver) in [
+            (
+                "resolves_enum_constant_receiver_type",
+                "Recipe.java",
+                r"
             package demo;
             import net.minecraft.item.ItemStack;
             enum Component {
@@ -3776,11 +3780,70 @@ mod tests {
                 ItemStack get(int amount) { return null; }
             }
             class Recipe { void run() { sink(Component.MOTOR.get(4)); } }
-        ";
-        let (analysis, index) = indexed_fixture("Recipe.java", "demo", source)?;
-        let (resolved, receiver_type) = resolved_sink(&analysis, &index)?;
-        assert_eq!(resolved.owner, "demo.Component");
-        assert_eq!(receiver_type.as_deref(), Some("demo.Component"));
+        ",
+                "demo.Component",
+                "demo.Component",
+            ),
+            (
+                "resolves_lexically_visible_nested_type",
+                "Outer.java",
+                r"
+            package demo;
+            import net.minecraft.item.ItemStack;
+            class ItemList { ItemStack get(long amount) { return null; } }
+            class Outer {
+                enum ComponentType {
+                    MOTOR;
+                    ItemList getComponent(int tier) { return null; }
+                }
+                void run(int tier) { sink(ComponentType.MOTOR.getComponent(tier).get(4)); }
+            }
+        ",
+                "demo.ItemList",
+                "demo.ItemList",
+            ),
+            (
+                "resolves_member_type_inside_anonymous_subclass",
+                "Recipe.java",
+                r"
+            package demo;
+            class ItemStack {}
+            abstract class Base {
+                protected static class Iter { ItemStack nextItem() { return null; } }
+                protected abstract void apply(Iter iterator);
+            }
+            class Recipe {
+                void run() {
+                    new Base() {
+                        @Override protected void apply(Iter iterator) {
+                            sink(iterator.nextItem());
+                        }
+                    };
+                }
+            }
+        ",
+                "demo.Base.Iter",
+                "demo.Base.Iter",
+            ),
+            (
+                "resolves_inherited_instance_method",
+                "Recipe.java",
+                r"
+            package demo;
+            class ItemStack {}
+            class BaseTool { ItemStack build(int amount) { return null; } }
+            class Tool extends BaseTool {}
+            class Recipe { void run(Tool tool) { sink(tool.build(4)); } }
+        ",
+                "demo.BaseTool",
+                "demo.Tool",
+            ),
+        ] {
+            let (analysis, index) = indexed_fixture(path, "demo", source)?;
+            let (resolved, receiver_type) = resolved_sink(&analysis, &index)?;
+            assert_eq!(resolved.owner, owner, "{case}");
+            assert_eq!(receiver_type.as_deref(), Some(receiver), "{case}");
+        }
         Ok(())
     }
 
@@ -4022,27 +4085,6 @@ mod tests {
     }
 
     #[test]
-    fn resolves_lexically_visible_nested_type() -> anyhow::Result<()> {
-        let source = r"
-            package demo;
-            import net.minecraft.item.ItemStack;
-            class ItemList { ItemStack get(long amount) { return null; } }
-            class Outer {
-                enum ComponentType {
-                    MOTOR;
-                    ItemList getComponent(int tier) { return null; }
-                }
-                void run(int tier) { sink(ComponentType.MOTOR.getComponent(tier).get(4)); }
-            }
-        ";
-        let (analysis, index) = indexed_fixture("Outer.java", "demo", source)?;
-        let (resolved, receiver_type) = resolved_sink(&analysis, &index)?;
-        assert_eq!(resolved.owner, "demo.ItemList");
-        assert_eq!(receiver_type.as_deref(), Some("demo.ItemList"));
-        Ok(())
-    }
-
-    #[test]
     fn resolves_nested_type_field_chain() -> anyhow::Result<()> {
         let source = r"
             package demo;
@@ -4084,32 +4126,6 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("nested field chain was not resolved"))?;
         assert_eq!(resolved.owner, "demo.Holder");
         assert_eq!(receiver_type.as_deref(), Some("demo.Holder"));
-        Ok(())
-    }
-
-    #[test]
-    fn resolves_member_type_inside_anonymous_subclass() -> anyhow::Result<()> {
-        let source = r"
-            package demo;
-            class ItemStack {}
-            abstract class Base {
-                protected static class Iter { ItemStack nextItem() { return null; } }
-                protected abstract void apply(Iter iterator);
-            }
-            class Recipe {
-                void run() {
-                    new Base() {
-                        @Override protected void apply(Iter iterator) {
-                            sink(iterator.nextItem());
-                        }
-                    };
-                }
-            }
-        ";
-        let (analysis, index) = indexed_fixture("Recipe.java", "demo", source)?;
-        let (resolved, receiver_type) = resolved_sink(&analysis, &index)?;
-        assert_eq!(resolved.owner, "demo.Base.Iter");
-        assert_eq!(receiver_type.as_deref(), Some("demo.Base.Iter"));
         Ok(())
     }
 
@@ -4183,22 +4199,6 @@ mod tests {
             index.enum_constant_ordinal("demo.FuelType", "MAGIC"),
             Some(5)
         );
-        Ok(())
-    }
-
-    #[test]
-    fn resolves_inherited_instance_method() -> anyhow::Result<()> {
-        let source = r"
-            package demo;
-            class ItemStack {}
-            class BaseTool { ItemStack build(int amount) { return null; } }
-            class Tool extends BaseTool {}
-            class Recipe { void run(Tool tool) { sink(tool.build(4)); } }
-        ";
-        let (analysis, index) = indexed_fixture("Recipe.java", "demo", source)?;
-        let (resolved, receiver_type) = resolved_sink(&analysis, &index)?;
-        assert_eq!(resolved.owner, "demo.BaseTool");
-        assert_eq!(receiver_type.as_deref(), Some("demo.Tool"));
         Ok(())
     }
 
