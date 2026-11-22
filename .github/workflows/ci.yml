@@ -24,3 +24,13 @@ jobs:
         cargo +1.99.1 fmt --all -- --check &&
         CARGO_BUILD_WARNINGS=deny cargo +1.99.1 clippy --workspace --all-targets --all-features -- -D warnings -A unfulfilled-lint-expectations &&
         cargo +1.99.1 test --workspace --all-features
+
+  jimple-exporter:
+    name: Jimple exporter
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Test bytecode exporter
+        working-directory: tools/jimple-exporter
+        run: mvn --batch-mode --no-transfer-progress test

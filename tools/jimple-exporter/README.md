@@ -9,7 +9,7 @@ This lets the Rust side reason about finite Java execution rather than recognizi
 ## Build
 
 ```sh
-mvn -q -DskipTests compile
+mvn -q test
 ```
 
 ## Structured export
@@ -28,7 +28,7 @@ mvn -q exec:java \
   -Dexec.args="/path/to/classes fully.qualified.RootClass methodNameSubstring 2000"
 ```
 
-The final argument is a hard method-count guard. This is intentionally a bounded analysis export, not an invitation to serialize the entire JVM.
+The optional fourth argument is a hard method-count guard; a fifth argument sets maximum call depth (default 8). This is intentionally a bounded analysis export, not an invitation to serialize the entire JVM.
 
 Each concrete method is emitted as JSON with its signature and statements. Every statement currently includes:
 
@@ -43,6 +43,8 @@ Each concrete method is emitted as JSON with its signature and statements. Every
 - declaring-class superclass/interface metadata so downstream analysis can prove exact runtime dispatch when a concrete receiver type is known.
 
 `DumpJimple` is retained as a human-readable debugging companion.
+
+For virtual/interface invocation edges whose declared owner lies in the root class's known ancestry, the exporter additionally includes the applicable concrete root-class override candidate. It does not infer that every such receiver is the root object, and never applies this expansion to explicit special invokes or unrelated receivers. All candidates count against the existing depth and method guards.
 
 The Rust structural-effect path can optionally bind an exact runtime type for the entry receiver. It then performs JVM-style virtual/interface lookup through the exported hierarchy while preserving the concrete receiver through inherited methods. Bounded side-effect-free single-return helpers can be substituted symbolically, so polymorphic wrappers remain abstract until a runtime class is known and then specialize mechanically.
 

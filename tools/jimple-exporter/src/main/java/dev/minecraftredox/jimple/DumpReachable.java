@@ -15,6 +15,8 @@ import sootup.core.jimple.common.Value;
 import sootup.core.jimple.common.expr.AbstractInstanceInvokeExpr;
 import sootup.core.jimple.common.expr.AbstractInvokeExpr;
 import sootup.core.jimple.common.expr.JDynamicInvokeExpr;
+import sootup.core.jimple.common.expr.JInterfaceInvokeExpr;
+import sootup.core.jimple.common.expr.JVirtualInvokeExpr;
 import sootup.core.jimple.common.expr.JNewExpr;
 import sootup.core.jimple.common.ref.JStaticFieldRef;
 import sootup.core.jimple.common.stmt.JAssignStmt;
@@ -51,13 +53,17 @@ public final class DumpReachable {
     private final View view;
     private final int maxMethods;
     private final int maxDepth;
+    private final ClassType rootRuntimeType;
+    private final Set<ClassType> rootAncestors;
     private final ArrayDeque<Pending> pending = new ArrayDeque<>();
     private final Map<String, SootMethod> methods = new LinkedHashMap<>();
     private final Set<String> queued = new HashSet<>();
     private final Set<String> initializerOwners = new HashSet<>();
 
-    private DumpReachable(View view, int maxMethods, int maxDepth) {
+    private DumpReachable(View view, ClassType rootRuntimeType, int maxMethods, int maxDepth) {
         this.view = view;
+        this.rootRuntimeType = rootRuntimeType;
+        this.rootAncestors = ancestorsOf(rootRuntimeType);
         this.maxMethods = maxMethods;
         this.maxDepth = maxDepth;
     }
@@ -69,26 +75,39 @@ public final class DumpReachable {
         }
         int maxMethods = args.length >= 4 ? Integer.parseInt(args[3]) : DEFAULT_MAX_METHODS;
         int maxDepth = args.length == 5 ? Integer.parseInt(args[4]) : DEFAULT_MAX_DEPTH;
+        Export export = export(args[0], args[1], args[2], maxMethods, maxDepth);
+        System.err.printf(
+                "reachable Jimple: %d methods across %d classes (max depth %d)%n",
+                export.methods().size(),
+                export.classes(),
+                maxDepth);
+        System.out.println(GSON.toJson(export.methods()));
+    }
+
+    record Export(List<Object> methods, long classes) {}
+
+    static Export export(String classPath, String rootClassName, String methodSubstring,
+                         int maxMethods, int maxDepth) {
         if (maxMethods <= 0 || maxDepth < 0) {
             throw new IllegalArgumentException("max-methods must be positive and max-depth non-negative");
         }
 
-        AnalysisInputLocation input = new JavaClassPathAnalysisInputLocation(args[0]);
+        AnalysisInputLocation input = new JavaClassPathAnalysisInputLocation(classPath);
         View view = new JavaView(input);
-        ClassType rootType = view.getIdentifierFactory().getClassType(args[1]);
+        ClassType rootType = view.getIdentifierFactory().getClassType(rootClassName);
         SootClass rootClass = view.getClass(rootType)
-                .orElseThrow(() -> new IllegalArgumentException("class not found: " + args[1]));
+                .orElseThrow(() -> new IllegalArgumentException("class not found: " + rootClassName));
         List<? extends SootMethod> roots = rootClass.getMethods().stream()
                 .filter(SootMethod::isConcrete)
-                .filter(method -> method.getName().contains(args[2]))
+                .filter(method -> method.getName().contains(methodSubstring))
                 .sorted(Comparator.comparing(method -> method.getSignature().toString()))
                 .toList();
         if (roots.isEmpty()) {
             throw new IllegalArgumentException(
-                    "no concrete root methods matched " + args[1] + "::" + args[2]);
+                    "no concrete root methods matched " + rootClassName + "::" + methodSubstring);
         }
 
-        DumpReachable exporter = new DumpReachable(view, maxMethods, maxDepth);
+        DumpReachable exporter = new DumpReachable(view, rootType, maxMethods, maxDepth);
         roots.forEach(method -> exporter.enqueue(method.getSignature(), 0));
         exporter.enqueueClassInitializer(rootType, 0);
         exporter.run();
@@ -97,15 +116,11 @@ public final class DumpReachable {
                 .sorted(Comparator.comparing(method -> method.getSignature().toString()))
                 .map(method -> DumpJson.method(method, view))
                 .toList();
-        System.err.printf(
-                "reachable Jimple: %d methods across %d classes (max depth %d)%n",
-                encoded.size(),
-                exporter.methods.values().stream()
-                        .map(method -> method.getSignature().getDeclClassType().toString())
-                        .distinct()
-                        .count(),
-                maxDepth);
-        System.out.println(GSON.toJson(encoded));
+        long classes = exporter.methods.values().stream()
+                .map(method -> method.getSignature().getDeclClassType())
+                .distinct()
+                .count();
+        return new Export(encoded, classes);
     }
 
     private void run() {
@@ -198,13 +213,72 @@ public final class DumpReachable {
             MethodSignature target = invoke.getMethodSignature();
             if (!(invoke instanceof JDynamicInvokeExpr)) {
                 enqueue(target, childDepth);
-                if (!(invoke instanceof AbstractInstanceInvokeExpr)) {
+                if (invoke instanceof JVirtualInvokeExpr || invoke instanceof JInterfaceInvokeExpr) {
+                    enqueueRootRuntimeDispatchCandidate(target, childDepth);
+                } else if (!(invoke instanceof AbstractInstanceInvokeExpr)) {
                     enqueueClassInitializer(target.getDeclClassType(), childDepth);
                 }
             }
         }
         for (Value nested : value.getUses()) {
             scanValue(nested, depth, seen);
+        }
+    }
+
+    /**
+     * Walk only the root's known ancestors, not the entire input classpath. A missing
+     * class stops that branch of the walk rather than inventing a subtype relation.
+     */
+    private Set<ClassType> ancestorsOf(ClassType type) {
+        Set<ClassType> ancestors = new HashSet<>();
+        ArrayDeque<ClassType> remaining = new ArrayDeque<>();
+        remaining.add(type);
+        while (!remaining.isEmpty()) {
+            ClassType current = remaining.removeFirst();
+            if (!ancestors.add(current)) {
+                continue;
+            }
+            view.getClass(current).ifPresent(klass -> {
+                klass.getSuperclass().ifPresent(remaining::addLast);
+                remaining.addAll(klass.getInterfaces());
+            });
+        }
+        return ancestors;
+    }
+
+    /**
+     * Include a possible override for a virtual/interface call on the exact root
+     * receiver. This is an export candidate, not proof that the actual call receiver
+     * is the root object. The consumer must still resolve receiver provenance.
+     */
+    private void enqueueRootRuntimeDispatchCandidate(MethodSignature declared, int depth) {
+        if (!rootAncestors.contains(declared.getDeclClassType())
+                || !shouldAnalyzeOwner(declared.getDeclClassType().toString())) {
+            return;
+        }
+        ClassType owner = rootRuntimeType;
+        Set<ClassType> visited = new HashSet<>();
+        while (visited.add(owner)) {
+            Optional<? extends SootClass> klass = view.getClass(owner);
+            if (klass.isEmpty()) {
+                return;
+            }
+            Optional<? extends SootMethod> candidate = klass.get().getMethod(declared.getSubSignature());
+            if (candidate.isPresent()) {
+                SootMethod method = candidate.get();
+                if (!method.isPrivate() && !method.isStatic()) {
+                    if (method.isConcrete()) {
+                        enqueue(method.getSignature(), depth);
+                    }
+                    // An abstract override must not fall through to a base implementation.
+                    return;
+                }
+            }
+            Optional<? extends ClassType> parent = klass.get().getSuperclass();
+            if (parent.isEmpty()) {
+                return;
+            }
+            owner = parent.get();
         }
     }
 
