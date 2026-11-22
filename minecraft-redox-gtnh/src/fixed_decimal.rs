@@ -1,7 +1,7 @@
 use minecraft_redox_core::content::FixedDecimal;
 use minecraft_redox_java::JavaExpression;
 
-pub(crate) fn fixed_decimal_value(expression: &JavaExpression) -> Option<FixedDecimal> {
+pub fn fixed_decimal_value(expression: &JavaExpression) -> Option<FixedDecimal> {
     match expression {
         JavaExpression::Literal(value) => parse_fixed_decimal_literal(value),
         JavaExpression::Parenthesized(inner) => fixed_decimal_value(inner),
@@ -22,7 +22,7 @@ pub(crate) fn fixed_decimal_value(expression: &JavaExpression) -> Option<FixedDe
     }
 }
 
-pub(crate) fn parse_fixed_decimal_literal(source: &str) -> Option<FixedDecimal> {
+fn parse_fixed_decimal_literal(source: &str) -> Option<FixedDecimal> {
     let mut text = source.trim().replace('_', "");
     if text.ends_with(['f', 'F', 'd', 'D']) {
         text.pop();

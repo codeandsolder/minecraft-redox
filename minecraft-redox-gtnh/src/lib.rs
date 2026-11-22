@@ -294,11 +294,12 @@ impl GtnhSummary {
             match lowered {
                 Ok(_) => self.materials_lowered += 1,
                 Err(failure) => {
+                    let mut seen = BTreeSet::new();
                     for kind in failure
                         .blockers
                         .iter()
                         .map(|blocker| blocker.kind)
-                        .collect::<BTreeSet<_>>()
+                        .filter(|kind| seen.insert(*kind))
                     {
                         *self
                             .material_lowering_blockers

@@ -314,7 +314,7 @@ fn finalize_material(
         multiplier: 1,
         divider: 1,
     });
-    let fuel = accumulated.fuel.unwrap_or(MaterialFuelSpec {
+    let fuel = accumulated.fuel.unwrap_or_else(|| MaterialFuelSpec {
         fuel_type: ContentId::new("gregtech.api.enums.MaterialBuilder.FuelType.Diesel"),
         power: 0,
     });
@@ -586,7 +586,7 @@ fn lower_redirect_property(
     }
 }
 
-fn auto_recipe_policy(enabled: bool) -> MaterialAutoRecipePolicy {
+const fn auto_recipe_policy(enabled: bool) -> MaterialAutoRecipePolicy {
     if enabled {
         MaterialAutoRecipePolicy::Enabled
     } else {
