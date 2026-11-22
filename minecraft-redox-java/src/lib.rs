@@ -2742,6 +2742,7 @@ fn collect_returns(
 }
 
 /// Rewrite syntactic references using the supplied callback, retaining all other structure.
+///
 /// A replacement is not recursively rewritten. Lambda bodies are opaque because
 /// their parameter bindings are not yet represented.
 #[must_use]
@@ -2826,11 +2827,12 @@ pub fn rewrite_references(
             when_true: Box::new(rewrite_references(when_true, rewrite)),
             when_false: Box::new(rewrite_references(when_false, rewrite)),
         },
-        JavaExpression::Lambda { .. } => expression.clone(),
         JavaExpression::Parenthesized(inner) => {
             JavaExpression::Parenthesized(Box::new(rewrite_references(inner, rewrite)))
         }
-        JavaExpression::Literal(_) | JavaExpression::Raw(_) => expression.clone(),
+        JavaExpression::Literal(_) | JavaExpression::Raw(_) | JavaExpression::Lambda { .. } => {
+            expression.clone()
+        }
     }
 }
 
@@ -3237,6 +3239,37 @@ mod tests {
         Ok((call, sink_argument(call)?))
     }
 
+    fn resolved_sink<'a>(
+        analysis: &JavaAnalysis,
+        index: &'a JavaProjectIndex,
+    ) -> anyhow::Result<(&'a super::JavaMethod, Option<String>)> {
+        let (sink, expression) = first_sink_argument(analysis)?;
+        index
+            .resolve_call_at(
+                &analysis.inventory.path,
+                sink.byte_start,
+                expression,
+                &analysis.bindings,
+            )
+            .ok_or_else(|| anyhow::anyhow!("sink call target not resolved"))
+    }
+
+    fn resolved_sink_value(
+        analysis: &JavaAnalysis,
+        index: &JavaProjectIndex,
+        name: &str,
+    ) -> anyhow::Result<super::JavaValueResolution> {
+        let (sink, _) = first_sink_argument(analysis)?;
+        index
+            .resolve_value_at(
+                &analysis.inventory.path,
+                sink.byte_start,
+                name,
+                &analysis.bindings,
+            )
+            .ok_or_else(|| anyhow::anyhow!("sink value {name} not resolved"))
+    }
+
     fn inferred_sink_types(
         analysis: &JavaAnalysis,
         index: &JavaProjectIndex,
@@ -3547,23 +3580,10 @@ mod tests {
             }
         "#;
         let (analysis, index) = indexed_fixture("Recipe.java", "demo", source)?;
-        let calls: Vec<_> = sink_calls(&analysis).collect();
-        assert_eq!(calls.len(), 5);
-        for call in calls {
-            let expression = call
-                .argument_expressions
-                .first()
-                .ok_or_else(|| anyhow::anyhow!("sink argument missing"))?;
-            assert_eq!(
-                index.expression_type_at(
-                    "Recipe.java",
-                    call.byte_start,
-                    expression,
-                    &analysis.bindings,
-                ),
-                Some(String::from("net.minecraft.item.ItemStack"))
-            );
-        }
+        assert_eq!(
+            inferred_sink_types(&analysis, &index)?,
+            vec![Some(String::from("net.minecraft.item.ItemStack")); 5]
+        );
         Ok(())
     }
 
@@ -3739,23 +3759,10 @@ mod tests {
             }
         "#;
         let (analysis, index) = indexed_fixture("Recipe.java", "demo", source)?;
-        let calls: Vec<_> = sink_calls(&analysis).collect();
-        assert_eq!(calls.len(), 2);
-        for call in calls {
-            let expression = call
-                .argument_expressions
-                .first()
-                .ok_or_else(|| anyhow::anyhow!("sink argument missing"))?;
-            assert_eq!(
-                index.expression_type_at(
-                    "Recipe.java",
-                    call.byte_start,
-                    expression,
-                    &analysis.bindings,
-                ),
-                Some(String::from("net.minecraft.item.ItemStack"))
-            );
-        }
+        assert_eq!(
+            inferred_sink_types(&analysis, &index)?,
+            vec![Some(String::from("net.minecraft.item.ItemStack")); 2]
+        );
         Ok(())
     }
 
@@ -3771,15 +3778,7 @@ mod tests {
             class Recipe { void run() { sink(Component.MOTOR.get(4)); } }
         ";
         let (analysis, index) = indexed_fixture("Recipe.java", "demo", source)?;
-        let (sink, expression) = first_sink_argument(&analysis)?;
-        let (resolved, receiver_type) = index
-            .resolve_call_at(
-                "Recipe.java",
-                sink.byte_start,
-                expression,
-                &analysis.bindings,
-            )
-            .ok_or_else(|| anyhow::anyhow!("enum receiver was not resolved"))?;
+        let (resolved, receiver_type) = resolved_sink(&analysis, &index)?;
         assert_eq!(resolved.owner, "demo.Component");
         assert_eq!(receiver_type.as_deref(), Some("demo.Component"));
         Ok(())
@@ -3974,15 +3973,7 @@ mod tests {
             }
         ";
         let (analysis, index) = indexed_fixture("Recipe.java", "demo", source)?;
-        let sink = analysis
-            .call_chains
-            .iter()
-            .flat_map(|chain| &chain.calls)
-            .find(|call| call.name == "sink")
-            .ok_or_else(|| anyhow::anyhow!("sink call missing"))?;
-        let value = index
-            .resolve_value_at("Recipe.java", sink.byte_start, "input", &analysis.bindings)
-            .ok_or_else(|| anyhow::anyhow!("inferred var missing"))?;
+        let value = resolved_sink_value(&analysis, &index, "input")?;
         assert_eq!(value.type_name, "demo.OreDictItemStack");
         Ok(())
     }
@@ -4025,15 +4016,7 @@ mod tests {
             }
         ";
         let (analysis, index) = indexed_fixture("Recipe.java", "demo", source)?;
-        let sink = analysis
-            .call_chains
-            .iter()
-            .flat_map(|chain| &chain.calls)
-            .find(|call| call.name == "sink")
-            .ok_or_else(|| anyhow::anyhow!("sink call missing"))?;
-        let value = index
-            .resolve_value_at("Recipe.java", sink.byte_start, "item", &analysis.bindings)
-            .ok_or_else(|| anyhow::anyhow!("enhanced-for value missing"))?;
+        let value = resolved_sink_value(&analysis, &index, "item")?;
         assert_eq!(value.type_name, "net.minecraft.item.ItemStack");
         Ok(())
     }
@@ -4053,15 +4036,7 @@ mod tests {
             }
         ";
         let (analysis, index) = indexed_fixture("Outer.java", "demo", source)?;
-        let (sink, expression) = first_sink_argument(&analysis)?;
-        let (resolved, receiver_type) = index
-            .resolve_call_at(
-                "Outer.java",
-                sink.byte_start,
-                expression,
-                &analysis.bindings,
-            )
-            .ok_or_else(|| anyhow::anyhow!("nested lexical type was not resolved"))?;
+        let (resolved, receiver_type) = resolved_sink(&analysis, &index)?;
         assert_eq!(resolved.owner, "demo.ItemList");
         assert_eq!(receiver_type.as_deref(), Some("demo.ItemList"));
         Ok(())
@@ -4132,15 +4107,7 @@ mod tests {
             }
         ";
         let (analysis, index) = indexed_fixture("Recipe.java", "demo", source)?;
-        let (sink, expression) = first_sink_argument(&analysis)?;
-        let (resolved, receiver_type) = index
-            .resolve_call_at(
-                "Recipe.java",
-                sink.byte_start,
-                expression,
-                &analysis.bindings,
-            )
-            .ok_or_else(|| anyhow::anyhow!("anonymous inherited member type was not resolved"))?;
+        let (resolved, receiver_type) = resolved_sink(&analysis, &index)?;
         assert_eq!(resolved.owner, "demo.Base.Iter");
         assert_eq!(receiver_type.as_deref(), Some("demo.Base.Iter"));
         Ok(())
@@ -4159,15 +4126,7 @@ mod tests {
             }
         ";
         let (analysis, index) = indexed_fixture("Recipe.java", "demo", source)?;
-        let (sink, expression) = first_sink_argument(&analysis)?;
-        let (resolved, receiver_type) = index
-            .resolve_call_at(
-                "Recipe.java",
-                sink.byte_start,
-                expression,
-                &analysis.bindings,
-            )
-            .ok_or_else(|| anyhow::anyhow!("default interface method was not resolved"))?;
+        let (resolved, receiver_type) = resolved_sink(&analysis, &index)?;
         assert_eq!(resolved.owner, "demo.Helper");
         assert_eq!(receiver_type, None);
         Ok(())
@@ -4237,15 +4196,7 @@ mod tests {
             class Recipe { void run(Tool tool) { sink(tool.build(4)); } }
         ";
         let (analysis, index) = indexed_fixture("Recipe.java", "demo", source)?;
-        let (sink, expression) = first_sink_argument(&analysis)?;
-        let (resolved, receiver_type) = index
-            .resolve_call_at(
-                "Recipe.java",
-                sink.byte_start,
-                expression,
-                &analysis.bindings,
-            )
-            .ok_or_else(|| anyhow::anyhow!("inherited method was not resolved"))?;
+        let (resolved, receiver_type) = resolved_sink(&analysis, &index)?;
         assert_eq!(resolved.owner, "demo.BaseTool");
         assert_eq!(receiver_type.as_deref(), Some("demo.Tool"));
         Ok(())
@@ -4268,15 +4219,7 @@ mod tests {
             }
         ";
         let (analysis, index) = indexed_fixture("Recipe.java", "demo", source)?;
-        let (sink, expression) = first_sink_argument(&analysis)?;
-        let (resolved, _) = index
-            .resolve_call_at(
-                "Recipe.java",
-                sink.byte_start,
-                expression,
-                &analysis.bindings,
-            )
-            .ok_or_else(|| anyhow::anyhow!("overloaded static call was not resolved"))?;
+        let (resolved, _) = resolved_sink(&analysis, &index)?;
         assert_eq!(resolved.owner, "demo.Helper");
         assert_eq!(resolved.parameters.len(), 2);
         assert_eq!(resolved.parameters[0].type_name, "Materials");
@@ -4295,15 +4238,7 @@ mod tests {
             class Recipe { void run() { sink(Helper.get(Short.MAX_VALUE)); } }
         ";
         let (analysis, index) = indexed_fixture("Recipe.java", "demo", source)?;
-        let (sink, expression) = first_sink_argument(&analysis)?;
-        let (resolved, _) = index
-            .resolve_call_at(
-                "Recipe.java",
-                sink.byte_start,
-                expression,
-                &analysis.bindings,
-            )
-            .ok_or_else(|| anyhow::anyhow!("overload was not resolved"))?;
+        let (resolved, _) = resolved_sink(&analysis, &index)?;
         assert_eq!(resolved.stable_id(), "demo.Helper#get(int)");
         Ok(())
     }
@@ -4320,15 +4255,7 @@ mod tests {
             class Recipe { void run(Holder holder) { sink(holder.get(4)); } }
         ";
         let (analysis, index) = indexed_fixture("Recipe.java", "demo", source)?;
-        let (sink, expression) = first_sink_argument(&analysis)?;
-        let (resolved, _) = index
-            .resolve_call_at(
-                "Recipe.java",
-                sink.byte_start,
-                expression,
-                &analysis.bindings,
-            )
-            .ok_or_else(|| anyhow::anyhow!("primitive overload was not resolved"))?;
+        let (resolved, _) = resolved_sink(&analysis, &index)?;
         assert_eq!(resolved.parameters[0].type_name, "long");
         Ok(())
     }
@@ -4424,15 +4351,7 @@ mod tests {
             }
         ";
         let (analysis, index) = indexed_fixture("Recipe.java", "demo", source)?;
-        let (sink, expression) = first_sink_argument(&analysis)?;
-        let (resolved, receiver_type) = index
-            .resolve_call_at(
-                "Recipe.java",
-                sink.byte_start,
-                expression,
-                &analysis.bindings,
-            )
-            .ok_or_else(|| anyhow::anyhow!("field chain was not resolved"))?;
+        let (resolved, receiver_type) = resolved_sink(&analysis, &index)?;
         assert_eq!(resolved.owner, "demo.Material");
         assert_eq!(resolved.name, "getDust");
         assert_eq!(resolved.return_type, "net.minecraft.item.ItemStack");
