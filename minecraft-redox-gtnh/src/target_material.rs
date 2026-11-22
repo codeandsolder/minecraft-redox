@@ -395,19 +395,7 @@ fn lower_property(
         return;
     }
 
-    let expected_arity = match call.name.as_str() {
-        "addMaterial"
-        | "addAspect"
-        | "setDensity"
-        | "setFuel"
-        | "setToolEnchantment"
-        | "setArmorEnchantment" => Some(2),
-        "setTool" | "setTurbine" => Some(3),
-        "setChemicalFormula" => None,
-        "hasGlowingOre" => Some(0),
-        _ => Some(1),
-    };
-    if expected_arity.is_some_and(|arity| call.argument_expressions.len() != arity) {
+    if property_arity(&call.name).is_some_and(|arity| call.argument_expressions.len() != arity) {
         record_property_result(call, None, blockers);
         return;
     }
@@ -419,12 +407,17 @@ fn lower_property(
             one_content_id(call, bindings).map(|value| material.removed_forms.push(value))
         }
         "addSubTag" => one_content_id(call, bindings).map(|value| material.tags.push(value)),
-        "addMaterial" => {
-            lower_component(call, bindings, project).map(|value| material.components.push(value))
-        }
-        "addAspect" => {
-            lower_aspect(call, bindings, project).map(|value| material.aspects.push(value))
-        }
+        "addMaterial" => lower_counted_content(call, bindings, project).map(|(id, amount)| {
+            material.components.push(MaterialComponentSpec {
+                material: id,
+                amount,
+            })
+        }),
+        "addAspect" => lower_counted_content(call, bindings, project).map(|(id, amount)| {
+            material
+                .aspects
+                .push(MaterialAspectSpec { aspect: id, amount })
+        }),
         "addOreByproduct" => call
             .argument_expressions
             .first()
@@ -478,6 +471,21 @@ fn lower_property(
     };
 
     record_property_result(call, result, blockers);
+}
+
+fn property_arity(name: &str) -> Option<usize> {
+    match name {
+        "addMaterial"
+        | "addAspect"
+        | "setDensity"
+        | "setFuel"
+        | "setToolEnchantment"
+        | "setArmorEnchantment" => Some(2),
+        "setTool" | "setTurbine" => Some(3),
+        "setChemicalFormula" => None,
+        "hasGlowingOre" => Some(0),
+        _ => Some(1),
+    }
 }
 
 fn record_specialized_property_result(
@@ -746,9 +754,9 @@ fn lower_tool(
 
 fn lower_turbine(call: &BuilderCall) -> Option<MaterialTurbineSpec> {
     Some(MaterialTurbineSpec {
-        steam_multiplier: fixed_decimal_value(call.argument_expressions.first()?)?,
-        gas_multiplier: fixed_decimal_value(call.argument_expressions.get(1)?)?,
-        plasma_multiplier: fixed_decimal_value(call.argument_expressions.get(2)?)?,
+        steam: fixed_decimal_value(call.argument_expressions.first()?)?,
+        gas: fixed_decimal_value(call.argument_expressions.get(1)?)?,
+        plasma: fixed_decimal_value(call.argument_expressions.get(2)?)?,
     })
 }
 
@@ -814,36 +822,18 @@ fn material_form_group(name: &str) -> Option<MaterialFormGroup> {
     }
 }
 
-fn lower_component(
+fn lower_counted_content(
     call: &BuilderCall,
     bindings: &JavaBindings,
     project: Option<&JavaProjectIndex>,
-) -> Option<MaterialComponentSpec> {
-    Some(MaterialComponentSpec {
-        material: content_id(call.argument_expressions.first()?, bindings)?,
-        amount: u64::try_from(scalar_value(
-            call.argument_expressions.get(1)?,
-            bindings,
-            project,
-        )?)
-        .ok()?,
-    })
-}
-
-fn lower_aspect(
-    call: &BuilderCall,
-    bindings: &JavaBindings,
-    project: Option<&JavaProjectIndex>,
-) -> Option<MaterialAspectSpec> {
-    Some(MaterialAspectSpec {
-        aspect: content_id(call.argument_expressions.first()?, bindings)?,
-        amount: u64::try_from(scalar_value(
-            call.argument_expressions.get(1)?,
-            bindings,
-            project,
-        )?)
-        .ok()?,
-    })
+) -> Option<(ContentId, u64)> {
+    let [id, amount] = call.argument_expressions.as_slice() else {
+        return None;
+    };
+    Some((
+        content_id(id, bindings)?,
+        u64::try_from(scalar_value(amount, bindings, project)?).ok()?,
+    ))
 }
 
 fn one_content_id(call: &BuilderCall, bindings: &JavaBindings) -> Option<ContentId> {

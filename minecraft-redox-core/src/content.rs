@@ -387,17 +387,17 @@ impl Default for MaterialToolSpec {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MaterialTurbineSpec {
-    pub steam_multiplier: FixedDecimal,
-    pub gas_multiplier: FixedDecimal,
-    pub plasma_multiplier: FixedDecimal,
+    pub steam: FixedDecimal,
+    pub gas: FixedDecimal,
+    pub plasma: FixedDecimal,
 }
 
 impl Default for MaterialTurbineSpec {
     fn default() -> Self {
         Self {
-            steam_multiplier: FixedDecimal::integer(1),
-            gas_multiplier: FixedDecimal::integer(1),
-            plasma_multiplier: FixedDecimal::integer(1),
+            steam: FixedDecimal::integer(1),
+            gas: FixedDecimal::integer(1),
+            plasma: FixedDecimal::integer(1),
         }
     }
 }
