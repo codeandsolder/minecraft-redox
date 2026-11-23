@@ -208,7 +208,7 @@ fn associated_block(current: &str, expected: &str) -> bool {
 
 fn callback_matches_schedule(
     adapter: &TransactionReactionAdapter,
-    context: &quiescence_runtime::EvalContext<'_>,
+    context: &mut quiescence_runtime::EvalContext<'_>,
     block_state: quiescence_core::NodeId,
 ) -> Result<bool, EvalError> {
     let key = context
