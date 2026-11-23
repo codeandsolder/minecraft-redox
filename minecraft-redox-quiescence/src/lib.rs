@@ -587,7 +587,9 @@ impl TransactionInteractionSender {
         Ok(token)
     }
 
-    /// Re-enqueue a retained failed invocation at the next quiescent boundary.
+    /// Re-enqueue a retained invocation after its earlier ingress was rejected or discarded.
+    /// Evaluation failures retain their callback in Quiescence and retry on the next quiescence;
+    /// do not submit a duplicate callback for those failures.
     ///
     /// # Errors
     /// Returns an error for an unknown token, unavailable payload storage, or ingress failure.
@@ -605,7 +607,8 @@ impl TransactionInteractionSender {
             .map_err(Into::into)
     }
 
-    /// Re-enqueue a retained failed invocation at an explicit simulation timestamp.
+    /// Re-enqueue a retained invocation at a timestamp after rejected ingress.
+    /// Evaluation failures already retain their callback in Quiescence and must not be duplicated.
     ///
     /// # Errors
     /// Returns an error for an unknown token, unavailable payload storage, or ingress failure.
@@ -1869,7 +1872,9 @@ mod tests {
 
         let first = port.submit_now(0, invocation(7))?;
         assert_eq!(port.pending_payload_count()?, 1);
-        assert_eq!(graph.process_interactions(&inbox)?, 1);
+        let imported = graph.process_interactions(&inbox)?;
+        assert_eq!(imported.accepted, 1);
+        assert!(imported.rejected.is_empty());
         assert_eq!(graph.value_atom(world_state)?, 7);
         assert_eq!(port.pending_payload_count()?, 0);
         assert!(matches!(
@@ -1878,7 +1883,9 @@ mod tests {
         ));
 
         let future = port.submit_at(SimTime::from_millis(20), 0, invocation(9))?;
-        assert_eq!(graph.process_interactions(&inbox)?, 1);
+        let imported = graph.process_interactions(&inbox)?;
+        assert_eq!(imported.accepted, 1);
+        assert!(imported.rejected.is_empty());
         assert_eq!(graph.value_atom(world_state)?, 7);
         assert_eq!(port.pending_payload_count()?, 1);
         graph.advance_to(SimTime::from_millis(20))?;
@@ -1892,7 +1899,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_transaction_interaction_payload_can_retry_same_token()
+    fn failed_transaction_interaction_payload_retries_on_quiesce()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut graph = Graph::new(RuntimeConfig::default());
         let world_state = graph.add_atom_input("world state", 0)?;
@@ -1943,15 +1950,17 @@ mod tests {
             }],
             ..ReactionHostPreparation::default()
         });
-        let token = port.submit_now(0, invocation)?;
+        port.submit_now(0, invocation)?;
         assert!(matches!(
             graph.process_interactions(&inbox),
-            Err(RuntimeError::ReactionEvaluation { .. })
+            Err(RuntimeError::InteractionProcessing { import, source })
+                if import.accepted == 1
+                    && import.rejected.is_empty()
+                    && matches!(*source, RuntimeError::ReactionEvaluation { .. })
         ));
         assert_eq!(port.pending_payload_count()?, 1);
         assert_eq!(graph.value_atom(world_state)?, 0);
-        port.retry_now(token, 0)?;
-        assert_eq!(graph.process_interactions(&inbox)?, 1);
+        graph.quiesce()?;
         assert_eq!(graph.value_atom(world_state)?, 11);
         assert_eq!(port.pending_payload_count()?, 0);
         assert_eq!(attempts.load(Ordering::Relaxed), 2);

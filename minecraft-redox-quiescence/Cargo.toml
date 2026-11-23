@@ -8,7 +8,7 @@ repository.workspace = true
 
 [dependencies]
 minecraft-redox-core = { path = "../minecraft-redox-core" }
-quiescence-core = { git = "https://github.com/codeandsolder/quiescence.git", rev = "56125d1" }
+quiescence-core = { git = "https://github.com/codeandsolder/quiescence.git", rev = "c428dc358910ee7a624642690bd38cb4ac02ca06" }
 quiescence-runtime = { git = "https://github.com/codeandsolder/quiescence.git", rev = "c428dc358910ee7a624642690bd38cb4ac02ca06" }
 serde.workspace = true
 

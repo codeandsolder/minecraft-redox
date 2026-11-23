@@ -158,7 +158,7 @@ name = "minecraft-redox-quiescence"
 version = "0.1.0"
 dependencies = [
  "minecraft-redox-core",
- "quiescence-core 0.1.0 (git+https://github.com/codeandsolder/quiescence.git?rev=56125d1)",
+ "quiescence-core",
  "quiescence-runtime",
  "serde",
  "serde_json",
@@ -204,11 +204,6 @@ dependencies = [
 [[package]]
 name = "quiescence-core"
 version = "0.1.0"
-source = "git+https://github.com/codeandsolder/quiescence.git?rev=56125d1#56125d10b0995395f9b7bd0c59e158e22a72e2e5"
-
-[[package]]
-name = "quiescence-core"
-version = "0.1.0"
 source = "git+https://github.com/codeandsolder/quiescence.git?rev=c428dc358910ee7a624642690bd38cb4ac02ca06#c428dc358910ee7a624642690bd38cb4ac02ca06"
 
 [[package]]
@@ -216,7 +211,7 @@ name = "quiescence-runtime"
 version = "0.1.0"
 source = "git+https://github.com/codeandsolder/quiescence.git?rev=c428dc358910ee7a624642690bd38cb4ac02ca06#c428dc358910ee7a624642690bd38cb4ac02ca06"
 dependencies = [
- "quiescence-core 0.1.0 (git+https://github.com/codeandsolder/quiescence.git?rev=c428dc358910ee7a624642690bd38cb4ac02ca06)",
+ "quiescence-core",
 ]
 
 [[package]]
