@@ -1869,7 +1869,9 @@ mod tests {
 
         let first = port.submit_now(0, invocation(7))?;
         assert_eq!(port.pending_payload_count()?, 1);
-        assert_eq!(graph.process_interactions(&inbox)?, 1);
+        let imported = graph.process_interactions(&inbox)?;
+        assert_eq!(imported.accepted, 1);
+        assert!(imported.rejected.is_empty());
         assert_eq!(graph.value_atom(world_state)?, 7);
         assert_eq!(port.pending_payload_count()?, 0);
         assert!(matches!(
@@ -1878,7 +1880,9 @@ mod tests {
         ));
 
         let future = port.submit_at(SimTime::from_millis(20), 0, invocation(9))?;
-        assert_eq!(graph.process_interactions(&inbox)?, 1);
+        let imported = graph.process_interactions(&inbox)?;
+        assert_eq!(imported.accepted, 1);
+        assert!(imported.rejected.is_empty());
         assert_eq!(graph.value_atom(world_state)?, 7);
         assert_eq!(port.pending_payload_count()?, 1);
         graph.advance_to(SimTime::from_millis(20))?;
@@ -1951,7 +1955,9 @@ mod tests {
         assert_eq!(port.pending_payload_count()?, 1);
         assert_eq!(graph.value_atom(world_state)?, 0);
         port.retry_now(token, 0)?;
-        assert_eq!(graph.process_interactions(&inbox)?, 1);
+        let imported = graph.process_interactions(&inbox)?;
+        assert_eq!(imported.accepted, 1);
+        assert!(imported.rejected.is_empty());
         assert_eq!(graph.value_atom(world_state)?, 11);
         assert_eq!(port.pending_payload_count()?, 0);
         assert_eq!(attempts.load(Ordering::Relaxed), 2);
