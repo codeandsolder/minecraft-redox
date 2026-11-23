@@ -1950,7 +1950,10 @@ mod tests {
         let token = port.submit_now(0, invocation)?;
         assert!(matches!(
             graph.process_interactions(&inbox),
-            Err(RuntimeError::ReactionEvaluation { .. })
+            Err(RuntimeError::InteractionProcessing { import, source })
+                if import.accepted == 1
+                    && import.rejected.is_empty()
+                    && matches!(*source, RuntimeError::ReactionEvaluation { .. })
         ));
         assert_eq!(port.pending_payload_count()?, 1);
         assert_eq!(graph.value_atom(world_state)?, 0);
