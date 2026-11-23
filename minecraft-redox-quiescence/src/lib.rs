@@ -1950,7 +1950,7 @@ mod tests {
             }],
             ..ReactionHostPreparation::default()
         });
-        let token = port.submit_now(0, invocation)?;
+        port.submit_now(0, invocation)?;
         assert!(matches!(
             graph.process_interactions(&inbox),
             Err(RuntimeError::InteractionProcessing { import, source })
