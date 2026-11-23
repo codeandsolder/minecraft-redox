@@ -15,7 +15,7 @@ permissions:
 jobs:
   rust:
     name: Native nightly tests
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@e39ba876b351c5ea4bc01ac906305729b2fe7565 # main
     with:
       rust-components: "clippy rustfmt"
       rustflags: "-C target-cpu=x86-64-v2"
