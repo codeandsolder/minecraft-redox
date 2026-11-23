@@ -468,7 +468,7 @@ impl TransactionDraft for DemandTransactionDraft<'_> {
     }
 }
 
-type HostPreparer = dyn for<'a> Fn(&EvalContext<'a>) -> Result<ReactionHostPreparation, EvalError>
+type HostPreparer = dyn for<'a> Fn(&mut EvalContext<'a>) -> Result<ReactionHostPreparation, EvalError>
     + Send
     + Sync
     + 'static;
@@ -741,7 +741,7 @@ impl TransactionReactionAdapter {
     #[must_use = "the configured evaluator retains the host preparation function"]
     pub fn with_host_preparer<F>(mut self, preparer: F) -> Self
     where
-        F: for<'a> Fn(&EvalContext<'a>) -> Result<ReactionHostPreparation, EvalError>
+        F: for<'a> Fn(&mut EvalContext<'a>) -> Result<ReactionHostPreparation, EvalError>
             + Send
             + Sync
             + 'static,
@@ -804,7 +804,7 @@ impl TransactionReactionAdapter {
     /// transaction state, or transaction execution failures. Ordinary graph read errors propagate.
     pub fn execute(
         &self,
-        context: &EvalContext<'_>,
+        context: &mut EvalContext<'_>,
     ) -> Result<TransactionReactionResult, EvalError> {
         let preparation = self.host_preparer.as_ref().map_or_else(
             || Ok(ReactionHostPreparation::default()),
@@ -828,7 +828,7 @@ impl TransactionReactionAdapter {
     /// errors, schedule lowering errors, and host-publication errors as `EvalError`.
     pub fn execute_invocation(
         &self,
-        context: &EvalContext<'_>,
+        context: &mut EvalContext<'_>,
         invocation: &TransactionInvocation,
     ) -> Result<TransactionReactionResult, EvalError> {
         let mut preparation = self.host_preparer.as_ref().map_or_else(
@@ -946,7 +946,7 @@ fn merge_preparation(
 
 fn execute_prepared_transaction(
     adapter: &TransactionReactionAdapter,
-    context: &EvalContext<'_>,
+    context: &mut EvalContext<'_>,
     preparation: &ReactionHostPreparation,
     invocation: InvocationBindings<'_>,
 ) -> Result<TransactionReactionResult, EvalError> {
