@@ -38,7 +38,7 @@ pub enum RecipeLoweringBlockerKind {
 }
 
 impl RecipeLoweringBlockerKind {
-    #[must_use]
+    #[must_use = "the returned text identifies the recipe field in the target schema"]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Fluids => "fluids",

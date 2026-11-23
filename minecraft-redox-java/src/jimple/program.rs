@@ -584,7 +584,7 @@ impl JimpleProgramEffectSummary {
     /// value may also come from another bound semantic source such as an entity payload. The
     /// component binding itself defines the field semantics; executable lowering remains
     /// fail-closed if the receiver cannot be represented in the transaction IR.
-    #[must_use]
+    #[must_use = "the returned bindings identify modeled value-component updates"]
     pub fn bind_value_component_updates(
         &self,
         store_bindings: &[JimpleIndexedStoreBinding],
@@ -858,7 +858,7 @@ impl JimpleProgramEffectSummary {
     ///
     /// Bindings are semantic rather than permissive: receiver/argument shape must match the
     /// configured operation, and ambiguous duplicate bindings fail closed for that call.
-    #[must_use]
+    #[must_use = "the returned candidates identify bound pure value operations"]
     pub fn bind_pure_value_operations(
         &self,
         bindings: &[JimplePureValueBinding],
@@ -1415,7 +1415,7 @@ pub struct ProgramExecution {
 }
 
 impl JimpleProgram {
-    #[must_use]
+    #[must_use = "the returned program owns the supplied methods"]
     pub const fn new(methods: Vec<JimpleMethod>) -> Self {
         Self { methods }
     }
@@ -1424,7 +1424,7 @@ impl JimpleProgram {
         self.methods.extend(methods);
     }
 
-    #[must_use]
+    #[must_use = "the returned method matches the requested signature when present"]
     pub fn method(&self, signature: &JimpleMethodSignature) -> Option<&JimpleMethod> {
         self.methods
             .iter()
@@ -2391,7 +2391,7 @@ impl JimpleProgram {
 }
 
 impl ProgramExecution {
-    #[must_use]
+    #[must_use = "the returned snapshot describes the requested static map when present"]
     pub fn static_map(&self, owner: &str, name: &str) -> Option<&AbstractMapSnapshot> {
         let value = self.static_fields.iter().find_map(|entry| {
             (entry.field.owner == owner && entry.field.name == name).then_some(&entry.value)
@@ -2402,12 +2402,12 @@ impl ProgramExecution {
         self.maps.iter().find(|map| map.object_id == *id)
     }
 
-    #[must_use]
+    #[must_use = "the returned snapshot describes the requested abstract object when present"]
     pub fn object(&self, id: u64) -> Option<&AbstractObjectSnapshot> {
         self.objects.iter().find(|object| object.id == id)
     }
 
-    #[must_use]
+    #[must_use = "the returned signatures identify static fields referring to the object"]
     pub fn static_object_fields(&self, object_id: u64) -> Vec<&super::JimpleFieldSignature> {
         self.static_fields
             .iter()
@@ -2418,7 +2418,7 @@ impl ProgramExecution {
             .collect()
     }
 
-    #[must_use]
+    #[must_use = "the returned value describes the requested static field when present"]
     pub fn static_field_value(&self, owner: &str, name: &str) -> Option<&AbstractValue> {
         self.static_fields
             .iter()
@@ -2426,7 +2426,7 @@ impl ProgramExecution {
             .map(|entry| &entry.value)
     }
 
-    #[must_use]
+    #[must_use = "the returned value describes the matching map entry when present"]
     pub fn static_map_lookup(
         &self,
         map_owner: &str,

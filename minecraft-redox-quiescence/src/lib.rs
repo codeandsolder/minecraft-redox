@@ -81,7 +81,7 @@ pub struct SnapshotInterner {
 }
 
 impl SnapshotInterner {
-    #[must_use]
+    #[must_use = "the returned interner owns canonical store snapshots"]
     pub fn new() -> Self {
         Self::default()
     }
@@ -111,18 +111,18 @@ impl SnapshotInterner {
         Ok(id)
     }
 
-    #[must_use]
+    #[must_use = "the returned snapshot identifies the requested canonical store state"]
     pub fn get(&self, id: u64) -> Option<&CanonicalStoreSnapshot> {
         let index = usize::try_from(id).ok()?.checked_sub(1)?;
         self.snapshots.get(index)
     }
 
-    #[must_use]
+    #[must_use = "the returned count describes interned snapshots"]
     pub const fn len(&self) -> usize {
         self.snapshots.len()
     }
 
-    #[must_use]
+    #[must_use = "the returned status indicates whether any snapshots are interned"]
     pub const fn is_empty(&self) -> bool {
         self.snapshots.is_empty()
     }
@@ -223,7 +223,7 @@ pub struct TransactionInvocation {
 }
 
 impl TransactionInvocation {
-    #[must_use]
+    #[must_use = "the returned invocation contains the reaction arguments"]
     pub fn new(arguments: Vec<ReactionArgument>) -> Self {
         Self {
             arguments,
@@ -231,13 +231,13 @@ impl TransactionInvocation {
         }
     }
 
-    #[must_use]
+    #[must_use = "the configured invocation is returned rather than mutating the original"]
     pub fn with_receiver(mut self, receiver: ReactionArgument) -> Self {
         self.receiver = Some(receiver);
         self
     }
 
-    #[must_use]
+    #[must_use = "the prepared invocation is returned rather than mutating the original"]
     pub fn with_preparation(mut self, preparation: ReactionHostPreparation) -> Self {
         self.preparation = preparation;
         self
@@ -688,7 +688,7 @@ pub struct TransactionReactionResult {
 impl TransactionReactionResult {
     /// Convert committed writes plus source schedule requests into one graph transition whose
     /// keyed callbacks target `callback_reaction` rather than re-running the producer reaction.
-    #[must_use]
+    #[must_use = "the returned reaction output describes the callback's scheduled effects"]
     pub fn into_reaction_output_for_callback(
         self,
         callback_reaction: ReactionId,
@@ -711,7 +711,7 @@ impl TransactionReactionResult {
 }
 
 impl TransactionReactionAdapter {
-    #[must_use]
+    #[must_use = "the returned evaluator owns the program, interner and store bindings"]
     pub fn new(
         program: Arc<TransactionProgram>,
         interner: Arc<Mutex<SnapshotInterner>>,
@@ -735,7 +735,7 @@ impl TransactionReactionAdapter {
         }
     }
 
-    #[must_use]
+    #[must_use = "the configured evaluator retains the host preparation function"]
     pub fn with_host_preparer<F>(mut self, preparer: F) -> Self
     where
         F: for<'a> Fn(&EvalContext<'a>) -> Result<ReactionHostPreparation, EvalError>
@@ -747,7 +747,7 @@ impl TransactionReactionAdapter {
         self
     }
 
-    #[must_use]
+    #[must_use = "the configured evaluator retains the host-call publication function"]
     pub fn with_host_call_publisher<F>(mut self, publisher: F) -> Self
     where
         F: Fn(&MemoryTransactionPerformedHostCall) -> Result<Vec<StateWrite>, EvalError>
@@ -759,13 +759,13 @@ impl TransactionReactionAdapter {
         self
     }
 
-    #[must_use]
+    #[must_use = "the configured evaluator retains the schedule time unit"]
     pub const fn with_schedule_unit(mut self, unit: SimDuration) -> Self {
         self.schedule_unit = Some(unit);
         self
     }
 
-    #[must_use]
+    #[must_use = "the configured evaluator retains the schedule identity component"]
     pub fn with_schedule_identity_component(mut self, component: impl Into<String>) -> Self {
         self.schedule_identity_component = Some(component.into());
         self
@@ -785,7 +785,7 @@ impl TransactionReactionAdapter {
             .ok_or_else(|| EvalError::Message(format!("unknown schedule key {key}")))
     }
 
-    #[must_use]
+    #[must_use = "the returned reference identifies the shared snapshot interner"]
     pub const fn interner(&self) -> &Arc<Mutex<SnapshotInterner>> {
         &self.interner
     }

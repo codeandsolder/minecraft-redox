@@ -122,7 +122,7 @@ pub struct MaterialRecovery {
     pub oracles: Vec<SourceOrigin>,
 }
 
-#[must_use]
+#[must_use = "the returned lowering result describes recovered target materials"]
 pub fn lower_materials(
     analysis: &JavaAnalysis,
     recovery: &GtnhRecovery,
@@ -190,7 +190,7 @@ pub struct GtnhSummary {
 }
 
 impl GtnhSummary {
-    #[must_use]
+    #[must_use = "the combined analysis is returned rather than mutating either input"]
     pub fn merged(mut self, other: Self) -> Self {
         self.files += other.files;
         self.parse_error_files += other.parse_error_files;
@@ -407,12 +407,12 @@ fn merge_counts(target: &mut BTreeMap<String, usize>, source: BTreeMap<String, u
     }
 }
 
-#[must_use]
+#[must_use = "the returned recovery describes the extracted GregTech content"]
 pub fn recover(analysis: &JavaAnalysis) -> GtnhRecovery {
     recover_internal(analysis, None)
 }
 
-#[must_use]
+#[must_use = "the returned recovery incorporates cross-file project analysis"]
 pub fn recover_with_project(analysis: &JavaAnalysis, project: &JavaProjectIndex) -> GtnhRecovery {
     recover_internal(analysis, Some(project))
 }

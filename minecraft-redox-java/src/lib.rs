@@ -115,7 +115,7 @@ pub struct JavaBindings {
 }
 
 impl JavaBindings {
-    #[must_use]
+    #[must_use = "the returned reference contains the resolved Java name"]
     pub fn resolve_reference(&self, reference: &str) -> String {
         let reference = reference.trim();
         if !is_java_reference(reference) {
@@ -223,7 +223,7 @@ pub struct JavaMethod {
 }
 
 impl JavaMethod {
-    #[must_use]
+    #[must_use = "the returned identifier distinguishes the Java method"]
     pub fn stable_id(&self) -> String {
         let parameters = self
             .parameters
@@ -240,7 +240,7 @@ impl JavaMethod {
         format!("{}#{}({parameters})", self.owner, self.name)
     }
 
-    #[must_use]
+    #[must_use = "the returned decision determines whether the method accepts the specified arity"]
     pub fn accepts_arity(&self, arity: usize) -> bool {
         match self.parameters.last() {
             Some(parameter) if parameter.varargs => {
@@ -250,7 +250,7 @@ impl JavaMethod {
         }
     }
 
-    #[must_use]
+    #[must_use = "the returned bindings associate arguments with parameters when compatible"]
     pub fn argument_bindings(
         &self,
         arguments: &[JavaExpression],
@@ -323,7 +323,7 @@ pub struct JavaProjectIndex {
 }
 
 impl JavaProjectIndex {
-    #[must_use]
+    #[must_use = "the returned kind classifies the requested Java owner when known"]
     pub fn type_kind(&self, owner: &str) -> Option<JavaTypeKind> {
         self.type_kinds_by_owner.get(owner).copied()
     }
@@ -365,7 +365,7 @@ impl JavaProjectIndex {
         }
     }
 
-    #[must_use]
+    #[must_use = "the merged project index is returned rather than mutating either input"]
     pub fn merged(mut self, other: Self) -> Self {
         let method_offset = self.methods.len();
         self.methods.extend(other.methods);
@@ -401,17 +401,17 @@ impl JavaProjectIndex {
         self
     }
 
-    #[must_use]
+    #[must_use = "the returned bindings describe the requested source file"]
     pub fn bindings_for_path(&self, path: &str) -> Option<&JavaBindings> {
         self.bindings_by_path.get(path)
     }
 
-    #[must_use]
+    #[must_use = "the returned count describes indexed methods"]
     pub const fn method_count(&self) -> usize {
         self.methods.len()
     }
 
-    #[must_use]
+    #[must_use = "the returned argument identifies the resolved generic supertype parameter"]
     pub fn generic_supertype_argument(
         &self,
         owner: &str,
@@ -458,7 +458,7 @@ impl JavaProjectIndex {
         None
     }
 
-    #[must_use]
+    #[must_use = "the returned method resolves the local call when unambiguous"]
     pub fn resolve_local_method(
         &self,
         path: &str,
@@ -474,12 +474,12 @@ impl JavaProjectIndex {
         )
     }
 
-    #[must_use]
+    #[must_use = "the returned method resolves the requested call when unambiguous"]
     pub fn resolve_method(&self, owner: &str, name: &str, arity: usize) -> Option<&JavaMethod> {
         self.resolve_method_filtered(owner, name, arity, MethodFilter::Any)
     }
 
-    #[must_use]
+    #[must_use = "the returned method resolves the requested static call when unambiguous"]
     pub fn resolve_static_method(
         &self,
         owner: &str,
@@ -489,7 +489,7 @@ impl JavaProjectIndex {
         self.resolve_method_filtered(owner, name, arity, MethodFilter::Static)
     }
 
-    #[must_use]
+    #[must_use = "the returned method resolves the requested instance call when unambiguous"]
     pub fn resolve_instance_method(
         &self,
         owner: &str,
@@ -626,7 +626,7 @@ impl JavaProjectIndex {
         score
     }
 
-    #[must_use]
+    #[must_use = "the returned ordinal identifies the enum constant when known"]
     pub fn enum_constant_ordinal(&self, owner: &str, name: &str) -> Option<usize> {
         let owner = self.normalize_owner_name(owner, None);
         if self.type_kinds_by_owner.get(&owner) != Some(&JavaTypeKind::Enum) {
@@ -651,7 +651,7 @@ impl JavaProjectIndex {
         None
     }
 
-    #[must_use]
+    #[must_use = "the returned field resolves the requested reference when unambiguous"]
     pub fn resolve_field(
         &self,
         owner: &str,
@@ -675,7 +675,7 @@ impl JavaProjectIndex {
         Some(field)
     }
 
-    #[must_use]
+    #[must_use = "the returned method resolves the call at the source position"]
     pub fn resolve_call_at<'a>(
         &'a self,
         path: &str,
@@ -805,7 +805,7 @@ impl JavaProjectIndex {
             })
     }
 
-    #[must_use]
+    #[must_use = "the returned type describes the expression at the source position"]
     pub fn expression_type_at(
         &self,
         path: &str,
@@ -1350,7 +1350,7 @@ impl JavaProjectIndex {
             || self.supertypes_by_owner.contains_key(owner)
     }
 
-    #[must_use]
+    #[must_use = "the returned method encloses the source position when indexed"]
     pub fn enclosing_method(&self, path: &str, byte_position: usize) -> Option<&JavaMethod> {
         self.methods_by_path
             .get(path)?
@@ -1376,13 +1376,13 @@ impl JavaProjectIndex {
     }
 
     /// Return the fully-qualified owner of the method/constructor enclosing a use site.
-    #[must_use]
+    #[must_use = "the returned owner encloses the source position when indexed"]
     pub fn enclosing_owner_at(&self, path: &str, byte_position: usize) -> Option<&str> {
         self.enclosing_method(path, byte_position)
             .map(|method| method.owner.as_str())
     }
 
-    #[must_use]
+    #[must_use = "the returned value represents the resolved expression at the source position"]
     pub fn resolve_value_at(
         &self,
         path: &str,
@@ -1440,7 +1440,7 @@ impl JavaProjectIndex {
 
     /// Resolve a field reference at a use site to its fully-qualified owner/member name.
     /// Locals and parameters shadowing the same simple name deliberately return `None`.
-    #[must_use]
+    #[must_use = "the returned name identifies the qualified field reference when resolved"]
     pub fn qualified_field_reference_at(
         &self,
         path: &str,
@@ -1469,7 +1469,7 @@ impl JavaProjectIndex {
 
     /// Return the initializer for the nearest in-scope local when its binding has not
     /// been reassigned or updated between declaration and `byte_position`.
-    #[must_use]
+    #[must_use = "the returned initializer describes a stable local value when found"]
     pub fn stable_local_initializer_at(
         &self,
         path: &str,
@@ -1498,7 +1498,7 @@ impl JavaProjectIndex {
 
     /// Return the finite values iterated by an enhanced-for local when the iterable is a
     /// stable array initializer and the loop variable has not been modified before use.
-    #[must_use]
+    #[must_use = "the returned elements describe the stable iteration values when found"]
     pub fn stable_enhanced_for_elements_at(
         &self,
         path: &str,
@@ -1532,7 +1532,7 @@ impl JavaProjectIndex {
         enhanced_for_array_elements(&iterable)
     }
 
-    #[must_use]
+    #[must_use = "the returned type describes the resolved reference at the source position"]
     pub fn reference_type_at(
         &self,
         path: &str,
@@ -1576,7 +1576,7 @@ impl JavaProjectIndex {
             .max_by_key(|local| local.declaration_byte)
     }
 
-    #[must_use]
+    #[must_use = "the returned type describes the resolved parameter at the source position"]
     pub fn parameter_type_at(
         &self,
         path: &str,
@@ -1727,7 +1727,7 @@ fn resolved_reference_name(expression: &JavaExpression, bindings: &JavaBindings)
     qualified_reference_name(expression).map(|reference| bindings.resolve_reference(&reference))
 }
 
-#[must_use]
+#[must_use = "the returned slice identifies the requested generic type argument"]
 pub fn generic_type_argument(type_name: &str, target_index: usize) -> Option<&str> {
     let mut argument_start = type_name.find('<')? + 1;
     let bytes = type_name.as_bytes();
@@ -2745,7 +2745,7 @@ fn collect_returns(
 ///
 /// A replacement is not recursively rewritten. Lambda bodies are opaque because
 /// their parameter bindings are not yet represented.
-#[must_use]
+#[must_use = "the rewritten expression is returned rather than mutating the input"]
 pub fn rewrite_references(
     expression: &JavaExpression,
     rewrite: &impl Fn(&str) -> Option<JavaExpression>,

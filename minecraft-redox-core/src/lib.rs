@@ -53,7 +53,7 @@ impl ConfidencePermille {
     pub const MAX: u16 = 1000;
 
     /// Returns `None` for values outside 0..=1000.
-    #[must_use]
+    #[must_use = "the returned bounded value indicates whether the input fits"]
     pub const fn new(value: u16) -> Option<Self> {
         if value <= Self::MAX {
             Some(Self(value))
@@ -62,7 +62,7 @@ impl ConfidencePermille {
         }
     }
 
-    #[must_use]
+    #[must_use = "the returned integer is the validated bounded value"]
     pub const fn get(self) -> u16 {
         self.0
     }

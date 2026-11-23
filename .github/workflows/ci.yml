@@ -13,17 +13,13 @@ permissions:
   contents: read
 
 jobs:
-  rust-1-99-shared-sccache:
-    name: Rust 1.99.1 shared sccache
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@eb617b2eb5829b781ffd39ad426cae2e6d8ec842 # main
+  rust:
+    name: Native nightly tests
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
     with:
-      rust-toolchain: "1.99.1"
       rust-components: "clippy rustfmt"
       rustflags: "-C target-cpu=x86-64-v2"
-      command: >-
-        cargo +1.99.1 fmt --all -- --check &&
-        CARGO_BUILD_WARNINGS=deny cargo +1.99.1 clippy --workspace --all-targets --all-features -- -D warnings -A unfulfilled-lint-expectations &&
-        cargo +1.99.1 test --workspace --all-features
+      command: cargo test --locked --workspace --all-features
 
   jimple-exporter:
     name: Jimple exporter

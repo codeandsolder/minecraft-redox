@@ -158,13 +158,13 @@ impl AffineBitSelector {
         Ok(Self { state, spec })
     }
 
-    #[must_use]
+    #[must_use = "the returned value captures the selector's current state"]
     pub const fn state(&self) -> i32 {
         self.state
     }
 
     /// Advance one affine state step and extract three masked bit-slice components.
-    #[must_use]
+    #[must_use = "the returned components contain the generated selection as the state advances"]
     pub fn next_components(&mut self) -> [i32; 3] {
         self.state = self
             .state
