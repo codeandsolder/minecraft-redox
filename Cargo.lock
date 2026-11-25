@@ -204,12 +204,12 @@ dependencies = [
 [[package]]
 name = "quiescence-core"
 version = "0.1.0"
-source = "git+https://github.com/codeandsolder/quiescence.git?rev=c428dc358910ee7a624642690bd38cb4ac02ca06#c428dc358910ee7a624642690bd38cb4ac02ca06"
+source = "git+https://github.com/codeandsolder/quiescence.git?rev=eccd19e7f50a71689372278f129689c8ce233615#eccd19e7f50a71689372278f129689c8ce233615"
 
 [[package]]
 name = "quiescence-runtime"
 version = "0.1.0"
-source = "git+https://github.com/codeandsolder/quiescence.git?rev=c428dc358910ee7a624642690bd38cb4ac02ca06#c428dc358910ee7a624642690bd38cb4ac02ca06"
+source = "git+https://github.com/codeandsolder/quiescence.git?rev=eccd19e7f50a71689372278f129689c8ce233615#eccd19e7f50a71689372278f129689c8ce233615"
 dependencies = [
  "quiescence-core",
 ]
